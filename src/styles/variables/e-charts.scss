@@ -1,0 +1,76 @@
+// 图表颜色变量
+:root {
+  // 阴影颜色  TODO 需要放到base-components全局变量中
+  --box-shadow-1: 0 2px 5px 0 rgb(0 0 0 / 2%);
+
+  // 尖峰相关颜色
+  --spike-color: #f53f3f;
+  --spike-form-color: #fbf0ee;
+
+  // 峰值相关颜色
+  --peak-color: #ff7d00;
+  --peak-form-color: #fef5e7;
+
+  // 平断相关颜色
+  --flat-break-color: #3aa1fe;
+  --flat-break-form-color: #e8f7fe;
+
+  // 低潮相关颜色
+  --low-ebb-color: #7be188;
+  --low-ebb-form-color: #f2f9f2;
+
+  // 深谷相关颜色
+  --deep-valley-color: #008026;
+  --deep-valley-form-color: #ecf3ec;
+
+  // 自定义相关颜色
+  --customize-color: #0fc6c2;
+  --customize-form-color: #edf9f9;
+
+  // 数值气泡颜色
+  --value-bubble-color: rgb(255 255 255 / 90%);
+
+  // 对比曲线颜色
+  --statistical-curve-color: #ff7d00;
+
+  // 统计曲线颜色
+  --contrast-curve-color: #0090ff;
+
+  // 电压曲线颜色
+  --voltage-curve-color: #cb272d;
+
+  // 电池集群在线颜色
+  --battery-cluster-online-color: rgb(0 180 42 / 20%);
+  --battery-cluster-online-color-2: #00b42a;
+
+  // 电池集群离线颜色
+  --battery-cluster-offline-color: rgb(134 144 156 / 20%);
+  --battery-cluster-offline-color-2: #86909c;
+
+  // 充电器曲线颜色
+  --charger-curve-color: #00b42a;
+
+  // 放电器曲线颜色
+  --discharger-curve-color: #2426c0;
+
+  // 一倍装机量
+  --installed-capacity-color-1: #84c49e;
+
+  // 二倍装机量
+  --installed-capacity-color-2: #888ed7;
+
+  // 三倍装机量
+  --installed-capacity-color-3: #6f77d9;
+
+  // 计量电表功率
+  --metering-meter-color: #f53f3f;
+
+  // 关口表功率
+  --gateway-power-color: #669cee;
+
+  // 用户负载
+  --ser-load-color: #33c137;
+
+  // 需量直线
+  --demand-line-color: #fac858;
+}

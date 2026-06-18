@@ -1,0 +1,105 @@
+/**
+ * Element Plus 变量配置（只包含变量定义，不生成实际CSS）
+ */
+
+@use "sass:map";
+@use "element-plus/theme-chalk/src/common/var.scss" with (
+  $colors: (
+    "primary": (
+      "base": #f40
+    ),
+    "success": (
+      "base": #00b42a
+    ),
+    "warning": (
+      "base": #ff7d00
+    ),
+    "danger": (
+      "base": #f53f3f
+    )
+  ),
+  $common-component-size: (
+    "large": 38px,
+    "default": 30px,
+    "small": 28px
+  ),
+  $disabled: (
+    "text-color": var(--text-color-3),
+    "bg-color": var(--fill-color-1),
+    "border-color": var(--border-color-2)
+  ),
+  $table: (
+    "header-bg-color": var(--fill-color-1),
+    "header-text-color": var(--text-color-1),
+    "text-color": var(--text-color-1),
+    "border": 1px solid var(--border-color-1)
+  ),
+  $input: (
+    "border-color": var(--border-color-2),
+    "text-color": var(--text-color-1),
+    "hover-border-color": var(--border-color-3),
+    "placeholder-color": var(--text-color-3),
+    "bg-color": var(--fill-color-5)
+  ),
+  $border-color: (
+    "": var(--border-color-2),
+    // 'light': #e4e7ed,
+    // 'lighter': #ebeef5,
+    // 'extra-light': #f2f6fc,
+    // 'dark': #d4d7de,
+     // 'darker': #cdd0d6
+  ),
+  $text-color: (
+    // 'primary': #303133,
+    // 'regular': #606266,
+    // 'secondary': #909399,
+    "placeholder": var(--text-color-3),
+    // 'disabled': #c0c4cc
+  ),
+  $fill-color: (
+    // '': #f0f2f5,
+    "light": var(--fill-color-1),
+    // 'lighter': #fafafa,
+    // 'extra-light': #fafcff,
+    // 'dark': #ebedf0,
+    // 'darker': #e6e8eb,
+    "blank": var(--fill-color-5)
+  ),
+  $border-color-hover: var(--border-color-3),
+  $button: (
+    "font-weight": 400,
+    "border-color": var(--border-color-2),
+    "bg-color": var(--fill-color-5),
+    "text-color": var(--text-color-1),
+    "disabled-text-color": var(--text-color-4),
+    "disabled-bg-color": var(--fill-color-1),
+    "disabled-border-color": var(--border-color-2),
+    "hover-text-color": var(--primary-color-5),
+    "hover-bg-color": var(--primary-color-1),
+    "hover-border-color": var(--primary-color-2),
+    "active-text-color": var(--primary-color-7),
+    "active-border-color": var(--primary-color-7),
+    "active-bg-color": var(--primary-color-1),
+    "outline-color": var(--primary-color-6)
+  ),
+  $radio: (
+    "font-size": 14px,
+    "text-color": var(--text-color-1),
+    "font-weight": 400,
+    "input-height": 14px,
+    "input-width": 14px,
+    "input-bg-color": var(--fill-color-5),
+    "input-border-color": var(--border-color-2),
+    "input-border-color-hover": var(--border-color-3)
+  ),
+  $checkbox: (
+    "font-size": 14px,
+    "font-weight": 400,
+    "text-color": var(--text-color-1),
+    "input-height": 14px,
+    "input-width": 14px,
+    "bg-color": var(--fill-color-5),
+    "disabled-border-color": var(--border-color-2),
+    "border-radius": var(--corner-radius-2)
+  )
+);

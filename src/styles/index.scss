@@ -1,0 +1,22 @@
+/**
+ * @description 全局样式
+ */
+@use "./variables" as *;
+
+/**
+ * @description 公共样式
+ */
+@use "./common" as *;
+
+/**
+ * @description 工具样式
+ */
+@use "./utils" as *;
+
+// element-plus 按需引入的样式会由 unplugin-vue-components 自动注入
+// element-plus-message-box（需要手动引入，因为js 调用组件 自动引入不会引入这个组件的样式，）
+@use "element-plus/theme-chalk/el-message-box.css";
+@use "element-plus/theme-chalk/el-message.css";
+
+// Element UI 覆盖样式 - 必须放在最后，确保能覆盖 Element Plus 的默认样式
+@use "./element-ui/overwrite";

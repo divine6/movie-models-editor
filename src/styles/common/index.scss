@@ -1,0 +1,29 @@
+// 添加站点弹窗样式
+.add-sit-view-drawer {
+  .el-overlay {
+    transition: none !important;
+    .el-drawer {
+      box-sizing: content-box;
+      margin: 0;
+      overflow: hidden;
+      border-radius: 0;
+      .el-drawer__header {
+        padding: 10px 16px;
+        .el-drawer__title {
+          height: 38px;
+          line-height: 38px;
+        }
+      }
+      .el-drawer__body {
+        padding: 0 !important;
+        .content {
+          height: 100%;
+          background: #f2f3f5;
+
+          // background-image: radial-gradient(rgb(198 198 198 / 100%) 5%, transparent 0);
+          background-size: 22px 22px;
+        }
+      }
+    }
+  }
+}

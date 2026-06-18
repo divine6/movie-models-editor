@@ -1,0 +1,15 @@
+node_modules
+dist
+dist-*
+*.local
+.DS_Store
+*.log
+stats.html
+.vscode/*
+!.vscode/extensions.json
+.idea
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?

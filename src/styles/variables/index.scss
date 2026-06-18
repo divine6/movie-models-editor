@@ -1,0 +1,58 @@
+@use "./e-charts.scss" as *;
+
+/***
+ * 全局自定义的SCSS 变量
+ * 全局自定义的CSS 变量
+ */
+$custom-color: var(--el-color-primary);
+$box-shadow-1: 0 2px 5px 0 rgb(0 0 0 / 2%);
+
+// ==================== 业务常用变量（映射 base-components 设计 Token） ====================
+
+// 间距
+$spacing-xs: var(--gap-2);
+$spacing-sm: var(--gap-3);
+$spacing-md: var(--gap-5);
+$spacing-lg: var(--gap-8);
+$spacing-xl: var(--gap-12);
+
+// 文字颜色
+$text-color-1: var(--text-color-1);
+$text-color-2: var(--text-color-2);
+$text-color-3: var(--text-color-3);
+$text-color-4: var(--text-color-4);
+$text-color-5: var(--text-color-5);
+
+// 填充色
+$fill-color-1: var(--fill-color-1);
+$fill-color-2: var(--fill-color-2);
+$fill-color-3: var(--fill-color-3);
+$fill-color-4: var(--fill-color-4);
+$fill-color-5: var(--fill-color-5);
+$fill-color-6: var(--fill-color-6);
+$fill-color-7: var(--fill-color-7);
+$fill-color-8: var(--fill-color-8);
+
+// 边框色
+$border-color-1: var(--border-color-1);
+$border-color-2: var(--border-color-2);
+$border-color-3: var(--border-color-3);
+
+// 圆角
+$corner-radius-2: var(--corner-radius-2);
+$corner-radius-4: var(--corner-radius-4);
+$corner-radius-8: var(--corner-radius-8);
+$corner-radius-10: var(--corner-radius-10);
+
+// 字号
+$font-size-sm: var(--font-size-sm, 12px);
+$font-size-md: var(--font-size-md, 14px);
+$font-size-lg: var(--font-size-lg, 16px);
+$font-size-xl: var(--font-size-xl, 20px);
+
+// 语义色
+$primary-color: var(--el-color-primary);
+$danger-color: var(--el-color-danger);
+$warning-color: var(--el-color-warning);
+$info-color: var(--el-color-info);
+$success-color: var(--el-color-success);

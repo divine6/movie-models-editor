@@ -1,0 +1,18 @@
+.el-main {
+  position: relative;
+  z-index: 5;
+  box-sizing: border-box;
+  padding: 0;
+  padding-bottom: var(--gap-5);
+  margin: 0 var(--gap-5);
+  overflow-x: hidden;
+  border-radius: var(--corner-radius-5);
+}
+.el-footer {
+  height: auto;
+  padding: 0;
+}
+.el-main:has(.data-perm-mgt-page) {
+  background: transparent;
+  border-radius: 0;
+}

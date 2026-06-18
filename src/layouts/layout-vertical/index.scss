@@ -1,0 +1,147 @@
+.layout {
+  background-color: #f2f3f5;
+
+  &--full {
+    background-color: var(--fill-color-1);
+
+    .layout-main {
+      width: 100%;
+    }
+
+    :deep(.el-main) {
+      margin: 0;
+      padding: 0;
+      border-radius: 0;
+    }
+  }
+  &-menu-wraper {
+    z-index: 2;
+    box-sizing: border-box;
+    height: 100%;
+    padding: var(--gap-5);
+    padding-right: 0;
+    .menu-logo {
+      img {
+        width: 179px;
+        height: 20px;
+      }
+    }
+    .footer {
+      overflow: hidden;
+      font-family: "PingFang SC";
+      font-size: 14px;
+      font-style: normal;
+      font-weight: 400;
+      line-height: 22px;
+      color: var(--text-color-4);
+      text-align: center;
+      text-overflow: ellipsis;
+    }
+    :deep(.menu-container) {
+      z-index: 2;
+      background-color: var(--fill-color-6);
+      backdrop-filter: blur(20px);
+      border: 1px solid var(--border-color-6);
+      border-radius: var(--corner-radius-5);
+    }
+  }
+}
+.circle {
+  position: fixed;
+  top: 0;
+  left: 0;
+  z-index: 1;
+  width: 600px;
+  height: 600px;
+  pointer-events: none;
+  background: rgb(156 227 255 / 50%);
+  filter: blur(100px);
+  border-radius: 50%;
+  transition: transform 0.5s ease-out;
+  transform: translate(-50%, -50%);
+}
+.el-container {
+  width: 100%;
+  height: 100%;
+  .el-header {
+    box-sizing: border-box;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    height: 60px;
+    padding: var(--gap-5) 15px;
+    .left {
+      display: flex;
+      .icon-box {
+        width: 40px;
+        height: 40px;
+        line-height: 40px;
+        text-align: center;
+        cursor: pointer;
+        background-color: var(--fill-color-5);
+        border-radius: 50%;
+        box-shadow: 0 2px 5px 0 rgb(0 0 0 / 2%);
+        .icon {
+          margin-top: -4px;
+        }
+      }
+    }
+  }
+}
+
+/* 预览容器 - 从左到右弹出 */
+.preview-container {
+  position: fixed;
+  top: 50px; // todo
+  left: 0;
+  z-index: 9999;
+  height: calc(100vh - 50px);
+  overflow: hidden;
+  background: var(--fill-color-7);
+  backdrop-filter: blur(20px);
+  border: var(--border-width-1) solid var(--border-color-6);
+  border-radius: var(--corner-radius-5);
+  box-shadow: 0 0 200px 0 rgb(0 0 0 / 10%);
+  transition: transform 0.4s ease;
+  transform: translateX(-100%);
+  .menu-logo {
+    img {
+      width: 179px;
+      height: 20px;
+    }
+  }
+  .footer {
+    overflow: hidden;
+    font-family: "PingFang SC";
+    font-size: 14px;
+    font-style: normal;
+    font-weight: 400;
+    line-height: 22px;
+    color: var(--text-color-4);
+    text-align: center;
+    text-overflow: ellipsis;
+  }
+  .menu-container {
+    width: auto;
+    opacity: 1;
+    .menu-logo,
+    .menu-footer,
+    .all-functions {
+      background-color: var(--fill-color-5);
+    }
+    .base-menu {
+      background-color: var(--fill-color-5);
+      .el-menu-item:hover {
+        background-color: var(--fill-color-5);
+      }
+    }
+  }
+  .tempBox {
+    height: 10px;
+
+    // background-color: transparent;
+  }
+  &.show {
+    transform: translateX(0);
+  }
+}
