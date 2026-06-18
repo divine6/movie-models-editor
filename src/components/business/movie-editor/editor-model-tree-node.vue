@@ -4,10 +4,12 @@
       class="model-tree-node"
       :class="{
         selected: editor.selModelNodeId === node.id,
+        hovered: editor.isModelNodeHovered(node.modelId, node.id),
         'is-mesh': node.objectType === 'mesh',
         'is-bone': node.objectType === 'bone'
       }"
       :style="{ paddingLeft: `${depth * 14 + 6}px` }"
+      @mouseenter="editor.hoverModelInList(node.modelId, node.id)"
       @click.stop="onSelect"
     >
       <button

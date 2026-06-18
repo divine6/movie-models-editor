@@ -17,6 +17,7 @@ import { DRACOLoader } from "three/addons/loaders/DRACOLoader.js";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { MeshoptDecoder } from "three/examples/jsm/libs/meshopt_decoder.module.js";
 import { EffectComposer } from "three/addons/postprocessing/EffectComposer.js";
+import { OutlinePass } from "three/addons/postprocessing/OutlinePass.js";
 import { OutputPass } from "three/addons/postprocessing/OutputPass.js";
 import { RenderPass } from "three/addons/postprocessing/RenderPass.js";
 import { ShaderPass } from "three/addons/postprocessing/ShaderPass.js";
@@ -52,12 +53,7 @@ import { useRoute, useRouter } from "vue-router";
 
 import { exportPlayer } from "@/composables/usePlayerExport";
 import { resumeProjectPersist, suspendProjectPersist } from "@/utils/projectPersist";
-import {
-  flattenChapterTree,
-  getDescendantChapterIds,
-  getChapterParentOptions as buildChapterParentOptions,
-  wouldCreateChapterCycle
-} from "@/utils/chapterTree";
+import { flattenChapterTree, getDescendantChapterIds, getRootChapters } from "@/utils/chapterTree";
 import {
   type Chapter,
   type Model,
@@ -72,6 +68,7 @@ import { useModelStore } from "@/stores/modules/model";
 import { useProjectStore } from "@/stores/modules/project";
 import { useSubtitleStore } from "@/stores/modules/subtitle";
 import {
+  CHAPTER_DETECTION,
   CHAPTER_CAMERA_TRANSITION_SEC,
   CHAPTER_SPLIT_INTERVAL,
   DEFAULT_CAMERA,
@@ -111,6 +108,8 @@ export function useMovieEditor() {
   const selectedChapterId = ref<string | null>(null);
   const selModelId = ref<string | null>(null);
   const selModelNodeId = ref<string | null>(null);
+  const hoverModelId = ref<string | null>(null);
+  const hoverModelNodeId = ref<string | null>(null);
   const modelHierarchies = reactive<Record<string, ModelHierarchyNode[]>>({});
   const hierarchyRevision = ref(0);
   let lastSelModelId: string | null = null;
@@ -128,7 +127,8 @@ export function useMovieEditor() {
   const videoFps = ref(0);
 
   // Forms
-  const chForm = reactive({ name: "", startTime: 0, endTime: 0, parentId: undefined as string | undefined });
+  const chForm = reactive({ name: "", startTime: 0, endTime: 0 });
+  const MIN_CHAPTER_DURATION = CHAPTER_DETECTION.MIN_CHAPTER_DURATION;
   const subForm = reactive({
     text: "",
     startTime: 0,
@@ -291,6 +291,7 @@ export function useMovieEditor() {
   const videoHeight = computed(() => currProj.value?.videoHeight || 0);
   const chapters = computed(() => currProj.value?.chapters || []);
   const sortedChapters = computed(() => [...chapters.value].sort((a, b) => a.startTime - b.startTime));
+  const timelineChapters = computed(() => getRootChapters(chapters.value));
   const chapterTreeList = computed(() => flattenChapterTree(chapters.value));
   const hasChapters = computed(() => chapters.value.length > 0);
   const currentChapterIdx = computed(() => findChIdx(currentTime.value));
@@ -303,20 +304,15 @@ export function useMovieEditor() {
     const dur = currProj.value?.videoDuration || duration.value;
     if (dur <= 0) return false;
     if (chapters.value.length === 0) return true;
-
-    const sorted = [...chapters.value].sort((a, b) => a.startTime - b.startTime);
-    const tail = sorted[sorted.length - 1];
-    if (!tail) return true;
-
-    const interval = CHAPTER_SPLIT_INTERVAL;
-    // 未覆盖到视频结尾，可继续添加
-    if (tail.endTime < dur - 0.001) return true;
-    // 已覆盖全片，仅当最后一段仍可切出 10s 时可添加
-    return tail.endTime - tail.startTime > interval + 0.001;
+    return !!getNextChapterRange(undefined);
   });
   const models = computed(() => currProj.value?.models || []);
   const subtitles = computed(() => currProj.value?.subtitles || []);
   const selectedChapter = computed(() => chapters.value.find(c => c.id === selectedChapterId.value));
+  const selectedChapterTimeBounds = computed(() => {
+    const ch = selectedChapter.value;
+    return ch ? getChapterTimeInputBounds(ch) : { startMin: 0, startMax: 0, endMin: 0, endMax: duration.value || 0 };
+  });
   const selModel = computed(() => models.value.find(m => m.id === selModelId.value));
   const selModelNode = computed(() => {
     hierarchyRevision.value;
@@ -362,23 +358,35 @@ export function useMovieEditor() {
   let hueSatPass: ShaderPass;
   let brightContrastPass: ShaderPass;
   let envMap: THREE.Texture | null = null;
-  let selectionHelper: THREE.Object3D | null = null;
+  let outlinePass: OutlinePass;
+  let hoverOutlinePass: OutlinePass;
   const raycaster = new THREE.Raycaster();
   const pickPointer = new THREE.Vector2();
   const SELECTION_COLOR = 0x409eff;
-  /** 屏幕空间最小可点击区域（像素），保证远处/小模型也能点中 */
-  const MIN_MODEL_PICK_PX = 56;
-  const MODEL_PICK_PADDING_PX = 10;
-  const _pickBox = new THREE.Box3();
-  const _pickIntersect = new THREE.Vector3();
-  const _pickProjected = new THREE.Vector3();
-  const _pickBoxCorners = Array.from({ length: 8 }, () => new THREE.Vector3());
+  const HOVER_EDGE_COLOR = 0x66b3ff;
+  const HIDDEN_EDGE_COLOR = 0x1a3a5f;
+  const _pickNormal = new THREE.Vector3();
+  const _pickView = new THREE.Vector3();
   const _focusCenter = new THREE.Vector3();
   const _focusSize = new THREE.Vector3();
   const _focusOffset = new THREE.Vector3();
   let viewportPickState: { x: number; y: number; time: number } | null = null;
   let onCanvasPointerDown: ((e: PointerEvent) => void) | null = null;
   let onCanvasPointerUp: ((e: PointerEvent) => void) | null = null;
+  let onCanvasPointerMove: ((e: PointerEvent) => void) | null = null;
+  let onCanvasPointerLeave: (() => void) | null = null;
+  let lastViewportPointer: { x: number; y: number } | null = null;
+  let pendingHoverPointer: { x: number; y: number } | null = null;
+  let hoverPickRaf = 0;
+  let viewportInteracting = false;
+  let pickableMeshCache: THREE.Mesh[] = [];
+  let pickableMeshCacheKey = "";
+  let orbitDragVisualsSuspended = false;
+  let cameraAnimating = false;
+  let lastHoverPickAt = { x: 0, y: 0 };
+  const HOVER_PICK_MOVE_PX = 4;
+  const ORBIT_DRAG_SUSPEND_PX = 8;
+  let onControlsInteractionEnd: (() => void) | null = null;
 
   function init3D() {
     if (!viewportEl.value || !canvasEl.value) return;
@@ -410,6 +418,7 @@ export function useMovieEditor() {
     controls.minDistance = 2;
     controls.maxDistance = 30;
     controls.maxPolarAngle = Math.PI / 2;
+    bindControlsInteraction();
 
     // 光照（初始值与 DEFAULT_SCENE_SETTINGS 一致，loadAllSettings 后会再同步）
     ambientLight = new THREE.AmbientLight(0xffffff, DEFAULT_SCENE_SETTINGS.ambIntensity);
@@ -438,8 +447,9 @@ export function useMovieEditor() {
       applySettings();
       applyGrid();
       if (shadowEnabled.value) applyShadow();
+      // composer 常驻：渲染路径永不切换，避免选中/悬停时画面闪烁
+      initComposer();
       if (bloomIntensity.value > 0 || ppContrast.value !== 0 || ppSaturation.value !== 0) {
-        if (!composer) initComposer();
         toggleBloom();
         toggleColor();
       }
@@ -472,24 +482,50 @@ export function useMovieEditor() {
     const canvas = canvasEl.value;
     if (!canvas) return;
 
+    canvas.style.touchAction = "none";
+
     onCanvasPointerDown = (e: PointerEvent) => {
-      if (e.button !== 0) return;
+      if (e.button !== 0 || e.isPrimary === false) return;
+      orbitDragVisualsSuspended = false;
       viewportPickState = { x: e.clientX, y: e.clientY, time: performance.now() };
     };
 
     onCanvasPointerUp = (e: PointerEvent) => {
-      if (e.button !== 0 || !viewportPickState) return;
+      if (e.button !== 0 || e.isPrimary === false || !viewportPickState) return;
       const dx = e.clientX - viewportPickState.x;
       const dy = e.clientY - viewportPickState.y;
       const elapsed = performance.now() - viewportPickState.time;
+      const wasDrag = Math.hypot(dx, dy) > 10 || elapsed > 600;
       viewportPickState = null;
-      // 拖拽旋转视角时不触发选中
-      if (Math.hypot(dx, dy) > 10 || elapsed > 600) return;
-      pickModelAtViewport(e.clientX, e.clientY);
+      if (!wasDrag) {
+        pickModelAtViewport(e.clientX, e.clientY);
+      }
+    };
+
+    onCanvasPointerMove = (e: PointerEvent) => {
+      if (e.isPrimary === false) return;
+      lastViewportPointer = { x: e.clientX, y: e.clientY };
+      if (viewportPickState && !orbitDragVisualsSuspended) {
+        const dx = e.clientX - viewportPickState.x;
+        const dy = e.clientY - viewportPickState.y;
+        if (Math.hypot(dx, dy) >= ORBIT_DRAG_SUSPEND_PX) {
+          beginOrbitVisualSuspend();
+        }
+      }
+      if (!orbitDragVisualsSuspended) {
+        scheduleHoverPick(e.clientX, e.clientY);
+      }
+    };
+
+    onCanvasPointerLeave = () => {
+      lastViewportPointer = null;
+      clearHoverTarget();
     };
 
     canvas.addEventListener("pointerdown", onCanvasPointerDown);
     canvas.addEventListener("pointerup", onCanvasPointerUp);
+    canvas.addEventListener("pointermove", onCanvasPointerMove);
+    if (onCanvasPointerLeave) canvas.addEventListener("pointerleave", onCanvasPointerLeave);
   }
 
   function unbindViewportPicking() {
@@ -497,9 +533,77 @@ export function useMovieEditor() {
     if (!canvas) return;
     if (onCanvasPointerDown) canvas.removeEventListener("pointerdown", onCanvasPointerDown);
     if (onCanvasPointerUp) canvas.removeEventListener("pointerup", onCanvasPointerUp);
+    if (onCanvasPointerMove) canvas.removeEventListener("pointermove", onCanvasPointerMove);
+    if (onCanvasPointerLeave) canvas.removeEventListener("pointerleave", onCanvasPointerLeave);
     onCanvasPointerDown = null;
     onCanvasPointerUp = null;
+    onCanvasPointerMove = null;
+    onCanvasPointerLeave = null;
     viewportPickState = null;
+    lastViewportPointer = null;
+    pendingHoverPointer = null;
+    viewportInteracting = false;
+    orbitDragVisualsSuspended = false;
+    cameraAnimating = false;
+    if (hoverPickRaf) {
+      cancelAnimationFrame(hoverPickRaf);
+      hoverPickRaf = 0;
+    }
+    invalidatePickMeshCache();
+    clearHoverTarget();
+  }
+
+  function invalidatePickMeshCache() {
+    pickableMeshCacheKey = "";
+    pickableMeshCache = [];
+  }
+
+  function beginOrbitVisualSuspend() {
+    if (orbitDragVisualsSuspended) return;
+    orbitDragVisualsSuspended = true;
+    viewportInteracting = true;
+    pendingHoverPointer = null;
+    if (hoverPickRaf) {
+      cancelAnimationFrame(hoverPickRaf);
+      hoverPickRaf = 0;
+    }
+    clearHoverTarget();
+  }
+
+  function endOrbitVisualSuspend() {
+    viewportInteracting = false;
+    orbitDragVisualsSuspended = false;
+  }
+
+  function bindControlsInteraction() {
+    if (!controls) return;
+    onControlsInteractionEnd = () => {
+      endOrbitVisualSuspend();
+    };
+    controls.addEventListener("end", onControlsInteractionEnd);
+  }
+
+  function unbindControlsInteraction() {
+    if (!controls) return;
+    if (onControlsInteractionEnd) controls.removeEventListener("end", onControlsInteractionEnd);
+    onControlsInteractionEnd = null;
+  }
+
+  function scheduleHoverPick(clientX: number, clientY: number) {
+    if (viewportInteracting || cameraAnimating || camTrans || isPreviewMode.value) return;
+    const moved = Math.hypot(clientX - lastHoverPickAt.x, clientY - lastHoverPickAt.y);
+    if (moved < HOVER_PICK_MOVE_PX && hoverModelId.value) return;
+
+    pendingHoverPointer = { x: clientX, y: clientY };
+    if (hoverPickRaf) return;
+    hoverPickRaf = requestAnimationFrame(() => {
+      hoverPickRaf = 0;
+      if (!pendingHoverPointer || viewportInteracting || cameraAnimating || camTrans || isPreviewMode.value) return;
+      const { x, y } = pendingHoverPointer;
+      pendingHoverPointer = null;
+      lastHoverPickAt = { x, y };
+      updateHoverHighlight(x, y);
+    });
   }
 
   let SETTINGS_KEY = "movie-editor-scene-settings";
@@ -693,9 +797,10 @@ export function useMovieEditor() {
 
   function initComposer() {
     if (composer) return;
+    const size = new THREE.Vector2(renderer.domElement.width, renderer.domElement.height);
     composer = new EffectComposer(renderer);
     composer.addPass(new RenderPass(scene, camera));
-    bloomPass = new UnrealBloomPass(new THREE.Vector2(renderer.domElement.width, renderer.domElement.height), 0, 0, 0);
+    bloomPass = new UnrealBloomPass(size, 0, 0, 0);
     composer.addPass(bloomPass);
     colorPass = new ShaderPass(ColorCorrectionShader);
     composer.addPass(colorPass);
@@ -703,7 +808,45 @@ export function useMovieEditor() {
     composer.addPass(hueSatPass);
     brightContrastPass = new ShaderPass(BrightnessContrastShader);
     composer.addPass(brightContrastPass);
+
+    // 选中轮廓（蓝色实线）
+    outlinePass = new OutlinePass(size, scene, camera);
+    outlinePass.visibleEdgeColor.set(SELECTION_COLOR);
+    outlinePass.hiddenEdgeColor.set(HIDDEN_EDGE_COLOR);
+    outlinePass.edgeStrength = 3.5;
+    outlinePass.edgeThickness = 1.5;
+    outlinePass.edgeGlow = 0;
+    outlinePass.pulsePeriod = 0;
+    composer.addPass(outlinePass);
+
+    // 悬停轮廓（浅蓝）
+    hoverOutlinePass = new OutlinePass(size, scene, camera);
+    hoverOutlinePass.visibleEdgeColor.set(HOVER_EDGE_COLOR);
+    hoverOutlinePass.hiddenEdgeColor.set(HIDDEN_EDGE_COLOR);
+    hoverOutlinePass.edgeStrength = 2.5;
+    hoverOutlinePass.edgeThickness = 1;
+    hoverOutlinePass.edgeGlow = 0;
+    hoverOutlinePass.pulsePeriod = 0;
+    composer.addPass(hoverOutlinePass);
+
     composer.addPass(new OutputPass());
+  }
+
+  function collectOutlineMeshes(objects: THREE.Object3D[]): THREE.Object3D[] {
+    const result: THREE.Object3D[] = [];
+    const seen = new Set<THREE.Object3D>();
+    for (const root of objects) {
+      root.traverse(child => {
+        if (seen.has(child)) return;
+        if (child.userData?.isEdgeLine || child.userData?.isSelectionHelper) return;
+        if (pickOnlyVisible.value && !isObjectVisibleChain(child)) return;
+        if ((child as THREE.Mesh).isMesh && child.visible !== false) {
+          seen.add(child);
+          result.push(child);
+        }
+      });
+    }
+    return result;
   }
 
   function applyMatToCurModel() {
@@ -833,9 +976,11 @@ export function useMovieEditor() {
         camera.fov = camTrans.tf;
         camera.updateProjectionMatrix();
         camTrans = null;
+        cameraAnimating = false;
       }
     }
     controls.update();
+
     const dt = 0.016;
     mixers.forEach(m => m.update(dt));
 
@@ -875,9 +1020,8 @@ export function useMovieEditor() {
     // The old video-time sync code was removed because it could not reliably track video time
     // and did not follow pivot center settings correctly.
 
-    let useComposer = composer && (bloomIntensity.value > 0 || ppContrast.value !== 0 || ppSaturation.value !== 0);
     syncTransformVisualOverlays();
-    if (useComposer) {
+    if (composer) {
       applyPostProcessing();
       composer.render();
     } else {
@@ -889,6 +1033,8 @@ export function useMovieEditor() {
   let camTrans: any = null;
 
   function animCam(pos: number[], tgt: number[], fov: number, dur = CHAPTER_CAMERA_TRANSITION_SEC) {
+    cameraAnimating = true;
+    clearHoverTarget();
     camTrans = {
       sp: camera.position.clone(),
       st: controls.target.clone(),
@@ -903,6 +1049,7 @@ export function useMovieEditor() {
 
   function snapCam(pos: number[], tgt: number[], fov: number) {
     camTrans = null;
+    cameraAnimating = false;
     camera.position.set(pos[0], pos[1], pos[2]);
     controls.target.set(tgt[0], tgt[1], tgt[2]);
     camera.fov = fov;
@@ -933,6 +1080,7 @@ export function useMovieEditor() {
       const cfg = chapterModelCfg(ch, m.id);
       if (cfg) applyMConfig(m, cfg); // 只有存在配置时才应用，否则保持当前状态
     });
+    invalidatePickMeshCache();
   }
 
   function getChapterCameraTransitionSec(ch: Chapter) {
@@ -990,6 +1138,7 @@ export function useMovieEditor() {
     }
     if (selModel.value?.id === m.id) applyMatToModel(m.id);
     if (selModelId.value === m.id) updateSelectionHighlight();
+    invalidatePickMeshCache();
     if (shadowEnabled.value) {
       root.traverse(function (c) {
         if (c.isMesh) {
@@ -1029,6 +1178,7 @@ export function useMovieEditor() {
 
   function togglePickOnlyVisible() {
     pickOnlyVisible.value = !pickOnlyVisible.value;
+    invalidatePickMeshCache();
   }
 
   function findObject3DByNodeId(modelId: string, nodeId: string): THREE.Object3D | null {
@@ -1353,64 +1503,117 @@ export function useMovieEditor() {
     scene.remove(o);
     disposeObject3D(o);
     meshes.delete(mid);
+    invalidatePickMeshCache();
     const model = models.value.find(m => m.id === mid);
     if (model?.url?.startsWith("blob:")) URL.revokeObjectURL(model.url);
   }
 
   function clearSelectionHighlight() {
-    if (!selectionHelper) return;
-    scene.remove(selectionHelper);
-    selectionHelper.geometry.dispose();
-    (selectionHelper.material as THREE.Material).dispose();
-    selectionHelper = null;
+    if (outlinePass) outlinePass.selectedObjects = [];
+  }
+
+  function clearHoverHighlight() {
+    if (hoverOutlinePass) hoverOutlinePass.selectedObjects = [];
+  }
+
+  function clearHoverTarget() {
+    hoverModelId.value = null;
+    hoverModelNodeId.value = null;
+    clearHoverHighlight();
+  }
+
+  function setHoverTarget(
+    modelId: string | null,
+    nodeId?: string | null,
+    hitObject?: THREE.Object3D | null
+  ) {
+    if (!modelId) {
+      clearHoverTarget();
+      return;
+    }
+    const resolvedNodeId = nodeId ? resolveSelectedNodeId(modelId, nodeId) : null;
+    const sameAsSelection =
+      modelId === selModelId.value && (resolvedNodeId ?? null) === (selModelNodeId.value ?? null);
+
+    if (hoverModelId.value === modelId && hoverModelNodeId.value === resolvedNodeId) {
+      if (!sameAsSelection && !viewportInteracting) {
+        applyHoverVisualMeshes(modelId, resolvedNodeId, hitObject);
+      }
+      return;
+    }
+
+    hoverModelId.value = modelId;
+    hoverModelNodeId.value = resolvedNodeId;
+
+    if (sameAsSelection) {
+      clearHoverHighlight();
+      return;
+    }
+
+    applyHoverVisualMeshes(modelId, resolvedNodeId, hitObject);
+  }
+
+  function applyHoverVisualMeshes(
+    modelId: string,
+    resolvedNodeId: string | null,
+    hitObject?: THREE.Object3D | null
+  ) {
+    if (viewportInteracting || cameraAnimating || camTrans) return;
+    if (!hoverOutlinePass) {
+      clearHoverHighlight();
+      return;
+    }
+    let meshes: THREE.Object3D[] = [];
+    if (hitObject && (hitObject as THREE.Mesh).isMesh) {
+      meshes = collectOutlineMeshes([hitObject]);
+    } else {
+      meshes = collectOutlineMeshes(getNodeObjects(modelId, resolvedNodeId));
+    }
+    hoverOutlinePass.selectedObjects = meshes;
+  }
+
+  function hoverModelInList(modelId: string, nodeId?: string | null) {
+    if (isPreviewMode.value) return;
+    setHoverTarget(modelId, nodeId ?? null);
+  }
+
+  function clearHoverModelInList() {
+    clearHoverTarget();
+  }
+
+  function isModelCardHovered(modelId: string): boolean {
+    return hoverModelId.value === modelId && !hoverModelNodeId.value;
+  }
+
+  function isModelNodeHovered(modelId: string, nodeId: string): boolean {
+    if (hoverModelId.value !== modelId || !hoverModelNodeId.value) return false;
+    if (hoverModelNodeId.value === nodeId) return true;
+    const node = findHierarchyNode(getModelHierarchy(modelId), nodeId);
+    return node?.mergedNodeIds?.includes(hoverModelNodeId.value) ?? false;
   }
 
   function updateSelectionHighlight() {
-    clearSelectionHighlight();
-    const objs = getNodeObjects();
-    if (!objs.length) return;
-    if (objs.length === 1) {
-      selectionHelper = new THREE.BoxHelper(objs[0], SELECTION_COLOR);
-    } else {
-      const box = new THREE.Box3();
-      objs.forEach(o => {
-        o.updateMatrixWorld(true);
-        box.expandByObject(o);
-      });
-      selectionHelper = new THREE.Box3Helper(box, new THREE.Color(SELECTION_COLOR));
+    if (!outlinePass) return;
+    if (!selModelId.value) {
+      outlinePass.selectedObjects = [];
+      return;
     }
-    selectionHelper.userData.isSelectionHelper = true;
-    scene.add(selectionHelper);
+    outlinePass.selectedObjects = collectOutlineMeshes(getNodeObjects());
+  }
+
+  function updateHoverHighlight(clientX: number, clientY: number) {
+    if (viewportInteracting || viewportPickState || cameraAnimating || camTrans || isPreviewMode.value) return;
+    const result = raycastAt(clientX, clientY);
+    if (!result) {
+      clearHoverTarget();
+      return;
+    }
+    setHoverTarget(result.modelId, result.nodeId, result.hitObject);
   }
 
   function syncTransformVisualOverlays() {
-    refreshSelectionHighlight();
     if (selModelId.value && pivotHelpers.has(selModelId.value)) {
       updateActivePivotHelper(selModelId.value);
-    }
-  }
-
-  function refreshSelectionHighlight() {
-    if (!selectionHelper || !selModelId.value) return;
-    const objs = getNodeObjects();
-    if (!objs.length) {
-      clearSelectionHighlight();
-      return;
-    }
-    if (objs.length === 1) {
-      objs[0].updateMatrixWorld(true);
-      (selectionHelper as THREE.BoxHelper).update?.();
-    } else {
-      const box = new THREE.Box3();
-      objs.forEach(o => {
-        o.updateMatrixWorld(true);
-        box.expandByObject(o);
-      });
-      if (selectionHelper instanceof THREE.Box3Helper) {
-        selectionHelper.box.copy(box);
-      } else {
-        updateSelectionHighlight();
-      }
     }
   }
 
@@ -1440,177 +1643,130 @@ export function useMovieEditor() {
     if (isPickExemptObject(obj)) return null;
 
     let modelId: string | null = null;
-    let nodeId: string | null = null;
     let current: THREE.Object3D | null = obj;
     while (current) {
-      if (current.userData?.modelId) modelId = current.userData.modelId as string;
-      if (current.userData?.nodeId) nodeId = current.userData.nodeId as string;
+      if (current.userData?.modelId) {
+        modelId = current.userData.modelId as string;
+        break;
+      }
       current = current.parent;
     }
     if (!modelId || !meshes.get(modelId)?.visible) return null;
-
-    // Respect pickOnlyVisible: skip if any ancestor is hidden
     if (pickOnlyVisible.value && !isObjectVisibleChain(obj)) return null;
 
+    let nodeId: string | null = null;
     if (obj.userData?.mergedNodeId) {
       nodeId = obj.userData.mergedNodeId as string;
-    } else if (obj.userData?.nodeId && !isPickExemptObject(obj)) {
+    } else if (obj.userData?.nodeId) {
       nodeId = obj.userData.nodeId as string;
+    } else {
+      current = obj.parent;
+      while (current) {
+        if (current.userData?.mergedNodeId) {
+          nodeId = current.userData.mergedNodeId as string;
+          break;
+        }
+        if (current.userData?.nodeId) {
+          nodeId = current.userData.nodeId as string;
+          break;
+        }
+        current = current.parent;
+      }
     }
     return { modelId, nodeId };
   }
 
-  function fillPickBoxCorners(box: THREE.Box3) {
-    const { min, max } = box;
-    const c = _pickBoxCorners;
-    c[0].set(min.x, min.y, min.z);
-    c[1].set(min.x, min.y, max.z);
-    c[2].set(min.x, max.y, min.z);
-    c[3].set(min.x, max.y, max.z);
-    c[4].set(max.x, min.y, min.z);
-    c[5].set(max.x, min.y, max.z);
-    c[6].set(max.x, max.y, min.z);
-    c[7].set(max.x, max.y, max.z);
+  function isMeshPickable(modelId: string, mesh: THREE.Mesh): boolean {
+    const root = meshes.get(modelId);
+    if (!root?.visible) return false;
+    if (pickOnlyVisible.value && !isObjectVisibleChain(mesh)) return false;
+    const ch = getActiveChapter();
+    const cfg = ch ? chapterModelCfg(ch, modelId) : null;
+    if (pickOnlyVisible.value && cfg && !cfg.visible) return false;
+    return true;
   }
 
-  function projectModelScreenRect(
-    root: THREE.Object3D,
-    viewportRect: DOMRect
-  ): { minX: number; minY: number; maxX: number; maxY: number; centerDist: number } | null {
-    root.updateMatrixWorld(true);
-    _pickBox.setFromObject(root);
-    if (_pickBox.isEmpty()) {
-      root.getWorldPosition(_focusCenter);
-      _pickProjected.copy(_focusCenter).project(camera);
-      if (_pickProjected.z > 1) return null;
-      const sx = (_pickProjected.x * 0.5 + 0.5) * viewportRect.width;
-      const sy = (-_pickProjected.y * 0.5 + 0.5) * viewportRect.height;
-      const half = MIN_MODEL_PICK_PX / 2;
-      return {
-        minX: sx - half,
-        maxX: sx + half,
-        minY: sy - half,
-        maxY: sy + half,
-        centerDist: camera.position.distanceTo(_focusCenter)
-      };
-    }
+  function collectPickableMeshes(): THREE.Mesh[] {
+    const key = `${meshes.size}:${hierarchyRevision.value}:${pickOnlyVisible.value}:${selectedChapterId.value}`;
+    if (key === pickableMeshCacheKey) return pickableMeshCache;
 
-    fillPickBoxCorners(_pickBox);
-    let minX = Infinity;
-    let minY = Infinity;
-    let maxX = -Infinity;
-    let maxY = -Infinity;
-    let visibleCount = 0;
-
-    for (const corner of _pickBoxCorners) {
-      _pickProjected.copy(corner).project(camera);
-      if (_pickProjected.z > 1) continue;
-      visibleCount++;
-      const sx = (_pickProjected.x * 0.5 + 0.5) * viewportRect.width;
-      const sy = (-_pickProjected.y * 0.5 + 0.5) * viewportRect.height;
-      minX = Math.min(minX, sx);
-      maxX = Math.max(maxX, sx);
-      minY = Math.min(minY, sy);
-      maxY = Math.max(maxY, sy);
-    }
-
-    if (visibleCount === 0) {
-      _pickBox.getCenter(_focusCenter);
-      _pickProjected.copy(_focusCenter).project(camera);
-      if (_pickProjected.z > 1) return null;
-      const sx = (_pickProjected.x * 0.5 + 0.5) * viewportRect.width;
-      const sy = (-_pickProjected.y * 0.5 + 0.5) * viewportRect.height;
-      minX = maxX = sx;
-      minY = maxY = sy;
-    }
-
-    const cx = (minX + maxX) / 2;
-    const cy = (minY + maxY) / 2;
-    const w = Math.max(maxX - minX, MIN_MODEL_PICK_PX);
-    const h = Math.max(maxY - minY, MIN_MODEL_PICK_PX);
-
-    _pickBox.getCenter(_focusCenter);
-    return {
-      minX: cx - w / 2 - MODEL_PICK_PADDING_PX,
-      maxX: cx + w / 2 + MODEL_PICK_PADDING_PX,
-      minY: cy - h / 2 - MODEL_PICK_PADDING_PX,
-      maxY: cy + h / 2 + MODEL_PICK_PADDING_PX,
-      centerDist: camera.position.distanceTo(_focusCenter)
-    };
-  }
-
-  function raycastModelTarget(clientX: number, clientY: number): { modelId: string; nodeId: string | null } | null {
-    if (!viewportEl.value || !camera) return null;
-    const rect = viewportEl.value.getBoundingClientRect();
-    if (rect.width <= 0 || rect.height <= 0) return null;
-
-    const clickX = clientX - rect.left;
-    const clickY = clientY - rect.top;
-
-    pickPointer.x = (clickX / rect.width) * 2 - 1;
-    pickPointer.y = -(clickY / rect.height) * 2 + 1;
-    raycaster.setFromCamera(pickPointer, camera);
-    raycaster.params.Line.threshold = 1.2;
-    raycaster.params.Points.threshold = 0.5;
-
-    let roots = Array.from(meshes.entries()).filter(([, root]) => root.visible);
-    if (pickOnlyVisible.value) {
-      roots = roots.filter(([, root]) => root.visible);
-    }
-    if (roots.length === 0) return null;
-
-    const meshHits = raycaster.intersectObjects(
-      roots.map(([, root]) => root),
-      true
-    );
-    for (const hit of meshHits) {
-      // Skip invisible hits when the toggle is on
-      if (pickOnlyVisible.value && !isObjectVisibleChain(hit.object)) continue;
-      const target = resolvePickTarget(hit.object);
-      if (target) return target;
-    }
-
-    const MIN_SUB_PICK_PX = 36;
-    let best: { modelId: string; nodeId: string | null; area: number; centerDist: number } | null = null;
-
-    for (const [modelId, root] of roots) {
-      const candidates: THREE.Object3D[] = [];
-      root.traverse(child => {
-        if (isPickExemptObject(child)) return;
-        if (pickOnlyVisible.value && !child.visible) return;
-        if ((child as THREE.Mesh).isMesh || child.userData?.nodeId) {
-          candidates.push(child);
-        }
+    const result: THREE.Mesh[] = [];
+    for (const [modelId, root] of meshes) {
+      if (!root.visible) continue;
+      root.traverse(obj => {
+        if (isPickExemptObject(obj)) return;
+        const mesh = obj as THREE.Mesh;
+        if (!mesh.isMesh) return;
+        if (!isMeshPickable(modelId, mesh)) return;
+        result.push(mesh);
       });
-      if (candidates.length === 0) candidates.push(root);
+    }
+    pickableMeshCache = result;
+    pickableMeshCacheKey = key;
+    return result;
+  }
 
-      for (const candidate of candidates) {
-        if (pickOnlyVisible.value && !isObjectVisibleChain(candidate)) continue;
-        const screenRect = projectModelScreenRect(candidate, rect);
-        if (!screenRect) continue;
-        if (
-          clickX < screenRect.minX ||
-          clickX > screenRect.maxX ||
-          clickY < screenRect.minY ||
-          clickY > screenRect.maxY
-        ) {
-          continue;
-        }
-        const w = Math.max(screenRect.maxX - screenRect.minX, MIN_SUB_PICK_PX);
-        const h = Math.max(screenRect.maxY - screenRect.minY, MIN_SUB_PICK_PX);
-        const area = w * h;
-        const nodeId =
-          (candidate.userData?.mergedNodeId as string | undefined) ??
-          (candidate.userData?.nodeId as string | undefined) ??
-          null;
-        if (!best || area < best.area || (area === best.area && screenRect.centerDist < best.centerDist)) {
-          best = { modelId, nodeId, area, centerDist: screenRect.centerDist };
-        }
+  function isFrontFaceHit(hit: THREE.Intersection): boolean {
+    if (!hit.face) return true;
+    _pickNormal.copy(hit.face.normal).transformDirection(hit.object.matrixWorld);
+    _pickView.subVectors(camera.position, hit.point).normalize();
+    return _pickNormal.dot(_pickView) > 0.02;
+  }
+
+  function intersectPickableMeshes(pickMeshes: THREE.Mesh[]): THREE.Intersection[] {
+    const outlineHidden: THREE.Mesh[] = [];
+    for (const mesh of pickMeshes) {
+      if (!mesh.visible && mesh.userData.pickHiddenForOutline) {
+        mesh.visible = true;
+        outlineHidden.push(mesh);
       }
     }
 
-    if (!best) return null;
-    return { modelId: best.modelId, nodeId: best.nodeId };
+    camera.updateMatrixWorld(true);
+    scene.updateMatrixWorld(true);
+    const hits = raycaster.intersectObjects(pickMeshes, false);
+
+    for (const mesh of outlineHidden) {
+      mesh.visible = false;
+    }
+    return hits;
+  }
+
+  type PickTargetResult = { modelId: string; nodeId: string | null; hitObject: THREE.Object3D };
+
+  function raycastAt(clientX: number, clientY: number): PickTargetResult | null {
+    if (!renderer || !camera) return null;
+    const rect = renderer.domElement.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return null;
+
+    const localX = clientX - rect.left;
+    const localY = clientY - rect.top;
+    if (localX < 0 || localY < 0 || localX > rect.width || localY > rect.height) return null;
+
+    pickPointer.x = (localX / rect.width) * 2 - 1;
+    pickPointer.y = -(localY / rect.height) * 2 + 1;
+    raycaster.setFromCamera(pickPointer, camera);
+    raycaster.params.Line.threshold = 0;
+    raycaster.params.Points.threshold = 0;
+
+    const pickMeshes = collectPickableMeshes();
+    if (pickMeshes.length === 0) return null;
+
+    const meshHits = intersectPickableMeshes(pickMeshes);
+    for (const hit of meshHits) {
+      const mesh = hit.object as THREE.Mesh;
+      if (!mesh.isMesh) continue;
+      if (!isFrontFaceHit(hit)) continue;
+      const target = resolvePickTarget(mesh);
+      if (target) return { ...target, hitObject: mesh };
+    }
+    return null;
+  }
+
+  function raycastModelTarget(clientX: number, clientY: number): { modelId: string; nodeId: string | null } | null {
+    const result = raycastAt(clientX, clientY);
+    if (!result) return null;
+    return { modelId: result.modelId, nodeId: result.nodeId };
   }
 
   function raycastModelId(clientX: number, clientY: number): string | null {
@@ -1661,10 +1817,12 @@ export function useMovieEditor() {
   }
 
   function pickModelAtViewport(clientX: number, clientY: number): boolean {
+    controls?.update();
     const target = raycastModelTarget(clientX, clientY);
     if (!target) return false;
     const model = models.value.find(m => m.id === target.modelId);
     if (!model) return false;
+    clearHoverTarget();
     selectModel(model, { focusCamera: true, nodeId: target.nodeId });
     rightTab.value = "model";
     scrollSelectedModelIntoView();
@@ -1713,9 +1871,12 @@ export function useMovieEditor() {
   const SEEK_EVENT_TIMEOUT_MS = 800;
 
   function resolveChapter(ch: Chapter) {
-    const idx = sortedChapters.value.findIndex(c => c.id === ch.id);
-    if (idx < 0) return null;
-    return { chapter: sortedChapters.value[idx], idx };
+    const chapter = chapters.value.find(c => c.id === ch.id);
+    if (!chapter) return null;
+    const timelineIdx = chapter.parentId
+      ? timelineChapters.value.findIndex(c => c.id === chapter.parentId)
+      : timelineChapters.value.findIndex(c => c.id === chapter.id);
+    return { chapter, idx: timelineIdx >= 0 ? timelineIdx : 0 };
   }
 
   function focusChapter(chapter: Chapter, idx: number) {
@@ -1811,10 +1972,11 @@ export function useMovieEditor() {
     }
   }
 
-  function syncPausedChapterAnimation(v: HTMLVideoElement, ci: number) {
-    if (!v.paused || ci < 0) return;
+  function syncPausedChapterAnimation(v: HTMLVideoElement, _ci: number) {
+    if (!v.paused) return;
+    const ch = getPlaybackChapterAtTime(v.currentTime);
+    if (!ch) return;
     stopChapterAnimation();
-    const ch = sortedChapters.value[ci];
     applyChapterAnimationAtElapsed(ch, getChapterAnimElapsed(ch, v.currentTime));
   }
 
@@ -1829,18 +1991,210 @@ export function useMovieEditor() {
 
   // ── Ticker ──
   function findChIdx(t: number) {
-    return sortedChapters.value.findIndex(c => t >= c.startTime - CHAPTER_TIME_EPS && t < c.endTime);
+    return timelineChapters.value.findIndex(c => t >= c.startTime - CHAPTER_TIME_EPS && t < c.endTime);
   }
 
   function chapterAtTime(t: number): Chapter | null {
-    const hit = sortedChapters.value.find(c => t >= c.startTime && t < c.endTime);
+    const hit = timelineChapters.value.find(c => t >= c.startTime && t < c.endTime);
     if (hit) return hit;
     let last: Chapter | null = null;
-    for (const ch of sortedChapters.value) {
+    for (const ch of timelineChapters.value) {
       if (ch.startTime <= t + CHAPTER_TIME_EPS) last = ch;
       else break;
     }
-    return last ?? sortedChapters.value[0] ?? null;
+    return last ?? timelineChapters.value[0] ?? null;
+  }
+
+  function getPlaybackChapterAtTime(t: number): Chapter | null {
+    const selected = chapters.value.find(c => c.id === selectedChapterId.value);
+    if (selected && t >= selected.startTime - CHAPTER_TIME_EPS && t < selected.endTime) {
+      return selected;
+    }
+    const ci = findChIdx(t);
+    return ci >= 0 ? timelineChapters.value[ci] : null;
+  }
+
+  function getTimelineChapterIndex(ch: Chapter): number {
+    if (!ch.parentId) return timelineChapters.value.findIndex(c => c.id === ch.id);
+    return timelineChapters.value.findIndex(c => c.id === ch.parentId);
+  }
+
+  function isChapterInPlaybackRange(ch: Chapter, t: number): boolean {
+    return t >= ch.startTime - CHAPTER_TIME_EPS && t < ch.endTime;
+  }
+
+  function clampNumber(value: number, min: number, max: number) {
+    if (max < min) return min;
+    return Math.min(Math.max(value, min), max);
+  }
+
+  function getChapterScope(parentId?: string) {
+    const parent = parentId ? chapters.value.find(ch => ch.id === parentId) : null;
+    return {
+      parent,
+      startTime: parent?.startTime ?? 0,
+      endTime: parent?.endTime ?? (currProj.value?.videoDuration || duration.value)
+    };
+  }
+
+  function getSiblingChapters(parentId?: string, excludeId?: string) {
+    return chapters.value
+      .filter(ch => (ch.parentId || undefined) === (parentId || undefined) && ch.id !== excludeId)
+      .sort((a, b) => a.startTime - b.startTime || a.endTime - b.endTime);
+  }
+
+  function getSortedChapterChildren(chapterId: string) {
+    return chapters.value
+      .filter(ch => ch.parentId === chapterId)
+      .sort((a, b) => a.startTime - b.startTime || a.endTime - b.endTime);
+  }
+
+  function getDefaultChapterSegmentDuration(rangeDuration: number) {
+    if (rangeDuration < MIN_CHAPTER_DURATION * 2 - CHAPTER_TIME_EPS) return 0;
+    if (rangeDuration <= CHAPTER_SPLIT_INTERVAL + CHAPTER_TIME_EPS) return rangeDuration / 2;
+    return CHAPTER_SPLIT_INTERVAL;
+  }
+
+  function getProtectedChildEnd(ch: Chapter) {
+    const children = getSortedChapterChildren(ch.id);
+    if (children.length === 0) return ch.startTime;
+    return Math.max(...children.map(child => child.endTime));
+  }
+
+  function getNextChapterRange(parentId?: string): { startTime: number; endTime: number; splitChapter?: Chapter } | null {
+    const scope = getChapterScope(parentId);
+    const scopeDuration = scope.endTime - scope.startTime;
+    if (scopeDuration < MIN_CHAPTER_DURATION * 2 - CHAPTER_TIME_EPS) return null;
+
+    const siblings = getSiblingChapters(parentId);
+    if (siblings.length === 0) {
+      const segmentDuration = getDefaultChapterSegmentDuration(scopeDuration);
+      if (segmentDuration <= 0) return null;
+      return {
+        startTime: scope.startTime,
+        endTime: Math.min(scope.endTime, scope.startTime + segmentDuration)
+      };
+    }
+
+    let cursor = scope.startTime;
+    for (const sibling of siblings) {
+      const siblingStart = clampNumber(sibling.startTime, scope.startTime, scope.endTime);
+      if (siblingStart - cursor >= MIN_CHAPTER_DURATION - CHAPTER_TIME_EPS) {
+        const gapDuration = siblingStart - cursor;
+        const segmentDuration = Math.min(gapDuration, CHAPTER_SPLIT_INTERVAL);
+        return {
+          startTime: cursor,
+          endTime: cursor + segmentDuration
+        };
+      }
+      cursor = Math.max(cursor, clampNumber(sibling.endTime, scope.startTime, scope.endTime));
+    }
+
+    if (scope.endTime - cursor >= MIN_CHAPTER_DURATION - CHAPTER_TIME_EPS) {
+      const gapDuration = scope.endTime - cursor;
+      const segmentDuration = Math.min(gapDuration, CHAPTER_SPLIT_INTERVAL);
+      return {
+        startTime: cursor,
+        endTime: cursor + segmentDuration
+      };
+    }
+
+    const splitTarget = [...siblings].sort((a, b) => b.endTime - a.endTime)[0];
+    if (!splitTarget) return null;
+
+    const protectedEnd = getProtectedChildEnd(splitTarget);
+    const targetDuration = splitTarget.endTime - splitTarget.startTime;
+    const preferredDuration = getDefaultChapterSegmentDuration(targetDuration);
+    if (preferredDuration <= 0) return null;
+    if (protectedEnd > splitTarget.endTime - MIN_CHAPTER_DURATION + CHAPTER_TIME_EPS) return null;
+
+    const splitAt = clampNumber(
+      Math.max(splitTarget.startTime + preferredDuration, protectedEnd),
+      splitTarget.startTime + MIN_CHAPTER_DURATION,
+      splitTarget.endTime - MIN_CHAPTER_DURATION
+    );
+
+    if (splitAt <= splitTarget.startTime + CHAPTER_TIME_EPS || splitAt >= splitTarget.endTime - CHAPTER_TIME_EPS) {
+      return null;
+    }
+
+    return {
+      startTime: splitAt,
+      endTime: splitTarget.endTime,
+      splitChapter: splitTarget
+    };
+  }
+
+  function getChapterTimeInputBounds(ch: Chapter) {
+    const scope = getChapterScope(ch.parentId);
+    const siblings = getSiblingChapters(ch.parentId);
+    const index = siblings.findIndex(item => item.id === ch.id);
+    const prev = index > 0 ? siblings[index - 1] : null;
+    const next = index >= 0 && index < siblings.length - 1 ? siblings[index + 1] : null;
+    const children = getSortedChapterChildren(ch.id);
+    const firstChildStart = children.length > 0 ? children[0].startTime : Number.POSITIVE_INFINITY;
+    const lastChildEnd = children.length > 0 ? Math.max(...children.map(child => child.endTime)) : Number.NEGATIVE_INFINITY;
+
+    const startMin = prev?.endTime ?? scope.startTime;
+    const endMax = next?.startTime ?? scope.endTime;
+    const startMax = Math.max(startMin, Math.min(ch.endTime - MIN_CHAPTER_DURATION, endMax - MIN_CHAPTER_DURATION, firstChildStart));
+    const endMin = Math.min(endMax, Math.max(ch.startTime + MIN_CHAPTER_DURATION, startMin + MIN_CHAPTER_DURATION, lastChildEnd));
+
+    return { startMin, startMax, endMin, endMax };
+  }
+
+  function normalizeChapterFormRange(ch: Chapter) {
+    const bounds = getChapterTimeInputBounds(ch);
+    let startTime = clampNumber(chForm.startTime, bounds.startMin, bounds.startMax);
+    let endTime = clampNumber(chForm.endTime, Math.max(bounds.endMin, startTime + MIN_CHAPTER_DURATION), bounds.endMax);
+
+    if (endTime - startTime < MIN_CHAPTER_DURATION) {
+      startTime = clampNumber(endTime - MIN_CHAPTER_DURATION, bounds.startMin, bounds.startMax);
+      endTime = clampNumber(startTime + MIN_CHAPTER_DURATION, bounds.endMin, bounds.endMax);
+    }
+
+    return { startTime, endTime };
+  }
+
+  function normalizeChapterSiblingRanges(parentId: string | undefined, scopeStart: number, scopeEnd: number) {
+    const siblings = getSiblingChapters(parentId);
+    if (siblings.length === 0) return;
+
+    const availableDuration = scopeEnd - scopeStart;
+    if (availableDuration < MIN_CHAPTER_DURATION - CHAPTER_TIME_EPS) return;
+
+    let cursor = scopeStart;
+    siblings.forEach((sibling, index) => {
+      const remainingSlots = siblings.length - index - 1;
+      const latestEnd = scopeEnd - remainingSlots * MIN_CHAPTER_DURATION;
+      if (latestEnd - cursor < MIN_CHAPTER_DURATION - CHAPTER_TIME_EPS) return;
+
+      let desiredDuration = Math.max(sibling.endTime - sibling.startTime, MIN_CHAPTER_DURATION);
+      const isSingleFullRangeChild =
+        !!parentId &&
+        siblings.length === 1 &&
+        sibling.startTime <= scopeStart + CHAPTER_TIME_EPS &&
+        sibling.endTime >= scopeEnd - CHAPTER_TIME_EPS &&
+        availableDuration >= MIN_CHAPTER_DURATION * 2 - CHAPTER_TIME_EPS;
+
+      if (isSingleFullRangeChild) {
+        desiredDuration = getDefaultChapterSegmentDuration(availableDuration) || desiredDuration;
+      }
+
+      const endTime = clampNumber(cursor + desiredDuration, cursor + MIN_CHAPTER_DURATION, latestEnd);
+      if (Math.abs(sibling.startTime - cursor) > CHAPTER_TIME_EPS || Math.abs(sibling.endTime - endTime) > CHAPTER_TIME_EPS) {
+        chStore.updateChapter(sibling, { startTime: cursor, endTime });
+      }
+
+      normalizeChapterSiblingRanges(sibling.id, cursor, endTime);
+      cursor = endTime;
+    });
+  }
+
+  function normalizeProjectChapterRanges() {
+    const dur = currProj.value?.videoDuration || duration.value;
+    if (!currProj.value || dur <= 0 || chapters.value.length === 0) return;
+    normalizeChapterSiblingRanges(undefined, 0, dur);
   }
 
   function onMeta(e: Event) {
@@ -1891,8 +2245,8 @@ export function useMovieEditor() {
       chapterPlayTarget.value = null;
 
       if (chapterAutoNext.value) {
-        const ci = sortedChapters.value.findIndex(ch => ch.id === playTarget.id);
-        const next = ci >= 0 ? sortedChapters.value[ci + 1] : null;
+        const ci = getTimelineChapterIndex(playTarget);
+        const next = ci >= 0 ? timelineChapters.value[ci + 1] : null;
         if (next) {
           // 继续顺序播放下一节点
           void startChapterPlayback(next);
@@ -1914,8 +2268,10 @@ export function useMovieEditor() {
     if (ci !== playingIdx.value) {
       playingIdx.value = ci;
       if (ci >= 0) {
-        const ch = sortedChapters.value[ci];
-        if (ch.id !== selectedChapterId.value) {
+        const ch = timelineChapters.value[ci];
+        const selected = chapters.value.find(c => c.id === selectedChapterId.value);
+        const keepChildSelection = !!(selected?.parentId && isChapterInPlaybackRange(selected, v.currentTime));
+        if (!keepChildSelection && ch.id !== selectedChapterId.value) {
           _chAnimLock = false;
           selectedChapterId.value = ch.id;
           applyChapter(ch);
@@ -1994,7 +2350,7 @@ export function useMovieEditor() {
   };
   const pct = (v: number) => (duration.value > 0 ? (v / duration.value) * 100 : 0);
   const fillScale = (i: number) => {
-    const ch = sortedChapters.value[i];
+    const ch = timelineChapters.value[i];
     if (!ch || !duration.value) return 0;
     if (currentTime.value >= ch.endTime) return 1;
     if (currentTime.value > ch.startTime) return (currentTime.value - ch.startTime) / (ch.endTime - ch.startTime);
@@ -2757,7 +3113,6 @@ export function useMovieEditor() {
     let np = [mesh.position.x, mesh.position.y, mesh.position.z];
     if (mode === "start") seg.startPos = np;
     else seg.endPos = np;
-    refreshSelectionHighlight();
     updateActivePivotHelper(selModel.value.id);
   }
   function liveSeg(seg: any, mode: "start" | "end" = editingSegMode.value) {
@@ -2771,7 +3126,6 @@ export function useMovieEditor() {
     for (const o of objs) {
       applyPivotRotation(o, pos, rot, seg.pivot || "center", scale);
     }
-    refreshSelectionHighlight();
     updateActivePivotHelper(m.id);
   }
 
@@ -2893,7 +3247,10 @@ export function useMovieEditor() {
     toRemove.forEach(c => c.parent?.remove(c));
 
     obj.traverse(c => {
-      if (c instanceof THREE.Mesh && !c.userData?.isEdgeLine) c.visible = true;
+      if (c instanceof THREE.Mesh && !c.userData?.isEdgeLine) {
+        c.visible = true;
+        delete c.userData.pickHiddenForOutline;
+      }
     });
 
     if (!cfg.visible) {
@@ -2918,6 +3275,7 @@ export function useMovieEditor() {
 
         if (cfg.outline && !cfg.highlight) {
           c.visible = false;
+          c.userData.pickHiddenForOutline = true;
           const line = new THREE.LineSegments(
             edges,
             new THREE.LineBasicMaterial({ color: 0x888888, transparent: true, opacity: 0.5 })
@@ -2943,6 +3301,7 @@ export function useMovieEditor() {
         /* ignore */
       }
     }
+    invalidatePickMeshCache();
   }
 
   function rebuildOutline(m: Model, cfg?: ModelConfig | null) {
@@ -3002,17 +3361,17 @@ export function useMovieEditor() {
     if (ci > 0) {
       prevIdx = ci - 1;
     } else if (ci === -1) {
-      for (let i = sortedChapters.value.length - 1; i >= 0; i--) {
-        if (sortedChapters.value[i].startTime < t - CHAPTER_TIME_EPS) {
+      for (let i = timelineChapters.value.length - 1; i >= 0; i--) {
+        if (timelineChapters.value[i].startTime < t - CHAPTER_TIME_EPS) {
           prevIdx = i;
           break;
         }
       }
     }
     if (prevIdx >= 0) {
-      void startChapterPlayback(sortedChapters.value[prevIdx]);
-    } else if (sortedChapters.value.length > 0) {
-      void startChapterPlayback(sortedChapters.value[0]);
+      void startChapterPlayback(timelineChapters.value[prevIdx]);
+    } else if (timelineChapters.value.length > 0) {
+      void startChapterPlayback(timelineChapters.value[0]);
     } else {
       videoEl.value.currentTime = 0;
       currentTime.value = 0;
@@ -3024,13 +3383,13 @@ export function useMovieEditor() {
     const t = videoEl.value.currentTime;
     const ci = findChIdx(t);
     let nextIdx = -1;
-    if (ci >= 0 && ci < sortedChapters.value.length - 1) {
+    if (ci >= 0 && ci < timelineChapters.value.length - 1) {
       nextIdx = ci + 1;
     } else if (ci === -1) {
-      nextIdx = sortedChapters.value.findIndex(c => c.startTime > t + CHAPTER_TIME_EPS);
+      nextIdx = timelineChapters.value.findIndex(c => c.startTime > t + CHAPTER_TIME_EPS);
     }
     if (nextIdx < 0) return;
-    void startChapterPlayback(sortedChapters.value[nextIdx]);
+    void startChapterPlayback(timelineChapters.value[nextIdx]);
   }
 
   function toggleLoop() {
@@ -3090,9 +3449,8 @@ export function useMovieEditor() {
   function syncCurrentChapterAnimationFromVideo() {
     const video = videoEl.value;
     if (!video) return;
-    const ci = findChIdx(video.currentTime);
-    if (ci < 0) return;
-    const ch = sortedChapters.value[ci];
+    const ch = getPlaybackChapterAtTime(video.currentTime);
+    if (!ch) return;
     applyChapterAnimationAtElapsed(ch, getChapterAnimElapsed(ch, video.currentTime));
   }
 
@@ -3112,9 +3470,8 @@ export function useMovieEditor() {
   function ensureVideoSyncedChapterAnimation() {
     const video = videoEl.value;
     if (!video || video.paused) return false;
-    const ci = findChIdx(video.currentTime);
-    if (ci < 0) return false;
-    const ch = sortedChapters.value[ci];
+    const ch = getPlaybackChapterAtTime(video.currentTime);
+    if (!ch) return false;
     if (!chapterHasAnimation(ch)) return false;
     if (_chAnimLock && chAnimChapterId === ch.id && !chAnimWallclock) return true;
     return startVideoSyncedChapterAnimation(ch);
@@ -3141,13 +3498,11 @@ export function useMovieEditor() {
         return;
       }
 
-      const ci = findChIdx(video.currentTime);
-      if (ci < 0) {
+      const activeCh = getPlaybackChapterAtTime(video.currentTime);
+      if (!activeCh) {
         chAnimRafId = requestAnimationFrame(tick);
         return;
       }
-
-      const activeCh = sortedChapters.value[ci];
       chAnimChapterId = activeCh.id;
       if (chapterHasAnimation(activeCh)) {
         applyChapterAnimationAtElapsed(activeCh, getChapterAnimElapsed(activeCh, video.currentTime));
@@ -3292,7 +3647,6 @@ export function useMovieEditor() {
     chForm.name = ch.name;
     chForm.startTime = ch.startTime;
     chForm.endTime = ch.endTime;
-    chForm.parentId = ch.parentId;
     camP[0] = ch.camera.position[0];
     camP[1] = ch.camera.position[1];
     camP[2] = ch.camera.position[2];
@@ -3309,8 +3663,7 @@ export function useMovieEditor() {
     return {
       name: chForm.name,
       startTime: chForm.startTime,
-      endTime: chForm.endTime,
-      parentId: chForm.parentId
+      endTime: chForm.endTime
     };
   }
 
@@ -3318,7 +3671,6 @@ export function useMovieEditor() {
     chForm.name = snapshot.name;
     chForm.startTime = snapshot.startTime;
     chForm.endTime = snapshot.endTime;
-    chForm.parentId = snapshot.parentId;
   }
 
   function getCameraFormSnapshot() {
@@ -3375,9 +3727,8 @@ export function useMovieEditor() {
     const video = videoEl.value;
     const playing = !!(video && !video.paused);
     const t = video?.currentTime ?? currentTime.value;
-    const ci = findChIdx(t);
     // 播放中：按视频所在节点展示；非播放：按当前选中/激活节点展示
-    const chapter = playing ? (ci >= 0 ? sortedChapters.value[ci] : null) : getActiveChapter();
+    const chapter = playing ? getPlaybackChapterAtTime(t) : getActiveChapter();
     const chapterId = chapter?.id ?? null;
 
     const editingModel = !playing ? selModel.value : null;
@@ -3607,39 +3958,70 @@ export function useMovieEditor() {
     }
 
     const proj = currProj.value;
-    const interval = CHAPTER_SPLIT_INTERVAL;
 
-    if (proj.chapters.length === 0) {
+    if (timelineChapters.value.length === 0) {
       ensureDefaultChapter(dur);
-    }
-
-    const sorted = [...proj.chapters].sort((a, b) => a.startTime - b.startTime);
-    const tail = sorted[sorted.length - 1];
-    if (!tail) return;
-
-    if (tail.endTime < dur - 0.001) {
-      chStore.updateChapter(tail, { endTime: dur });
-    }
-
-    const tailDur = tail.endTime - tail.startTime;
-    if (tailDur <= interval + 0.001) {
-      toastShow(`最后一段不足 ${interval} 秒，无法再添加`, "warning");
+      toastShow("已添加节点 1");
       return;
     }
 
-    const splitAt = tail.startTime + interval;
-    const oldEnd = tail.endTime;
+    const nextRange = getNextChapterRange(undefined);
+    if (!nextRange) {
+      toastShow("视频时间已无可用区间，无法再添加节点", "warning");
+      return;
+    }
 
-    chStore.updateChapter(tail, { endTime: splitAt });
+    if (nextRange.splitChapter) {
+      chStore.updateChapter(nextRange.splitChapter, { endTime: nextRange.startTime });
+    }
 
-    const newCh = chStore.createChapter(proj.id, `节点 ${sorted.length + 1}`, splitAt, oldEnd);
+    const rootCount = timelineChapters.value.length;
+    const newCh = chStore.createChapter(proj.id, `节点 ${rootCount + 1}`, nextRange.startTime, nextRange.endTime);
     proj.chapters.push(newCh);
 
     selectedChapterId.value = newCh.id;
     syncChapterForm(newCh);
     applyChapter(newCh);
     syncModelSelectionForChapter(newCh);
-    toastShow(`已添加节点 ${sorted.length + 1}`);
+    toastShow(`已添加节点 ${rootCount + 1}`);
+  }
+
+  function addChildChapter(parent: Chapter) {
+    if (!currProj.value) return;
+
+    const nextRange = getNextChapterRange(parent.id);
+    if (!nextRange) {
+      toastShow("父节点时间范围内已无可用区间，无法再添加子节点", "warning");
+      return;
+    }
+
+    if (nextRange.splitChapter) {
+      chStore.updateChapter(nextRange.splitChapter, { endTime: nextRange.startTime });
+    }
+
+    const children = getSortedChapterChildren(parent.id);
+    const childIndex = children.length + 1;
+    const newCh = chStore.createChapter(
+      currProj.value.id,
+      `${parent.name} - 子节点 ${childIndex}`,
+      nextRange.startTime,
+      nextRange.endTime,
+      parent.id
+    );
+    newCh.camera = JSON.parse(JSON.stringify(parent.camera));
+    newCh.modelConfigs = JSON.parse(JSON.stringify(parent.modelConfigs || {}));
+
+    currProj.value.chapters.push(newCh);
+    selectedChapterId.value = newCh.id;
+    syncChapterForm(newCh);
+    applyChapter(newCh);
+    syncModelSelectionForChapter(newCh);
+    chapterFormRevision.value++;
+    toastShow(`已添加子节点 ${childIndex}`);
+  }
+
+  function canAddChildChapter(parent: Chapter) {
+    return !!getNextChapterRange(parent.id);
   }
 
   function getChapterChildren(chapterId: string): Chapter[] {
@@ -3650,25 +4032,12 @@ export function useMovieEditor() {
     return getDescendantChapterIds(chapters.value, chapterId);
   }
 
-  function getChapterParentOptions(chapterId: string): Chapter[] {
-    return buildChapterParentOptions(chapters.value, chapterId);
-  }
-
-  function setChapterParent(chapterId: string, parentId: string | null | undefined) {
-    const ch = chapters.value.find(c => c.id === chapterId);
-    if (!ch) return;
-
-    const nextParentId = parentId || undefined;
-    if (nextParentId === ch.parentId) return;
-
-    if (nextParentId && wouldCreateChapterCycle(chapters.value, chapterId, nextParentId)) {
-      toastShow("不能将节点设为自己子级的父节点", "warning");
-      syncChapterForm(ch);
-      return;
-    }
-
-    chStore.updateChapter(ch, { parentId: nextParentId });
-    chapterFormRevision.value++;
+  function isChapterPlaying(ch: Chapter): boolean {
+    if (!isPlaying.value) return false;
+    if (selectedChapterId.value === ch.id) return true;
+    const ci = currentChapterIdx.value;
+    if (ci < 0) return false;
+    return timelineChapters.value[ci]?.id === ch.id;
   }
 
   function chCmd(c: string, ch: Chapter) {
@@ -3681,7 +4050,13 @@ export function useMovieEditor() {
         break;
       case "dup":
         {
-          const clone = chStore.createChapter(ch.projectId, ch.name + " (副本)", ch.startTime, ch.endTime);
+          const clone = chStore.createChapter(
+            ch.projectId,
+            ch.name + " (副本)",
+            ch.startTime,
+            ch.endTime,
+            ch.parentId
+          );
           Object.assign(clone.camera, ch.camera);
           clone.modelConfigs = JSON.parse(JSON.stringify(ch.modelConfigs));
           currProj.value?.chapters.push(clone);
@@ -3692,14 +4067,9 @@ export function useMovieEditor() {
         ElMessageBox.confirm(`删除"${ch.name}"？`, "确认", { type: "warning" })
           .then(() => {
             if (currProj.value) {
-              const newParent = ch.parentId;
-              for (const child of currProj.value.chapters) {
-                if (child.parentId === ch.id) {
-                  chStore.updateChapter(child, { parentId: newParent });
-                }
-              }
-              currProj.value.chapters = currProj.value.chapters.filter(c => c.id !== ch.id);
-              if (selectedChapterId.value === ch.id) {
+              const deleteIds = new Set([ch.id, ...getAllDescendantChapterIds(ch.id)]);
+              currProj.value.chapters = currProj.value.chapters.filter(c => !deleteIds.has(c.id));
+              if (selectedChapterId.value && deleteIds.has(selectedChapterId.value)) {
                 selectedChapterId.value = null;
               }
             }
@@ -3712,29 +4082,31 @@ export function useMovieEditor() {
   function saveChF() {
     if (chapterNavLock.value) return;
     if (selectedChapter.value) {
-      const parentId = chForm.parentId || undefined;
-      if (parentId && wouldCreateChapterCycle(chapters.value, selectedChapter.value.id, parentId)) {
-        toastShow("不能将节点设为自己子级的父节点", "warning");
-        syncChapterForm(selectedChapter.value);
-        return;
-      }
-      chStore.updateChapter(selectedChapter.value, {
+      const ch = selectedChapter.value;
+      const { startTime, endTime } = normalizeChapterFormRange(ch);
+
+      chStore.updateChapter(ch, {
         name: chForm.name,
-        startTime: chForm.startTime,
-        endTime: chForm.endTime,
-        parentId
+        startTime,
+        endTime
       });
+      if (startTime !== chForm.startTime || endTime !== chForm.endTime) {
+        syncChapterForm(ch);
+      } else {
+        chapterFormRevision.value++;
+      }
     }
   }
 
   function saveChapterFull() {
     if (!selectedChapter.value) return;
-    // Save chapter + capture model configs
-    chStore.updateChapter(selectedChapter.value, {
+    const ch = selectedChapter.value;
+    const { startTime, endTime } = normalizeChapterFormRange(ch);
+
+    chStore.updateChapter(ch, {
       name: chForm.name,
-      startTime: chForm.startTime,
-      endTime: chForm.endTime,
-      parentId: chForm.parentId || undefined
+      startTime,
+      endTime
     });
     selectedChapter.value.camera.position = [...camP] as [number, number, number];
     selectedChapter.value.camera.target = [...camT] as [number, number, number];
@@ -3783,9 +4155,9 @@ export function useMovieEditor() {
     ElMessageBox.confirm(`删除"${selectedChapter.value.name}"？`, "确认", { type: "warning" })
       .then(() => {
         if (currProj.value) {
-          const i = currProj.value.chapters.findIndex(c => c.id === selectedChapter.value!.id);
-          if (i !== -1) currProj.value.chapters.splice(i, 1);
-          selectedChapterId.value = null;
+          const deleteIds = new Set([selectedChapter.value!.id, ...getAllDescendantChapterIds(selectedChapter.value!.id)]);
+          currProj.value.chapters = currProj.value.chapters.filter(c => !deleteIds.has(c.id));
+          if (selectedChapterId.value && deleteIds.has(selectedChapterId.value)) selectedChapterId.value = null;
         }
         toastShow("节点已删除");
       })
@@ -3883,15 +4255,34 @@ export function useMovieEditor() {
     const nodeId = opts?.nodeId ?? null;
     const resolvedNodeId = nodeId ? resolveSelectedNodeId(m.id, nodeId) : null;
     const applySelection = () => {
-      setSelectedModelId(m.id, true);
+      if (selModelId.value && selModelId.value !== m.id) {
+        hidePivotHelpers(selModelId.value);
+      }
+      selModelId.value = m.id;
+      lastSelModelId = m.id;
       selModelNodeId.value = resolvedNodeId;
-      updateSelectionHighlight();
-      if (focusCamera) focusCameraOnSelection();
+      syncModelForm(getActiveChapter());
+
+      const applyVisuals = () => updateSelectionHighlight();
+      if (focusCamera) {
+        requestAnimationFrame(() => {
+          applyVisuals();
+          const obj = getSelectedObject3D();
+          if (obj) focusCameraOnObject(obj);
+        });
+      } else {
+        applyVisuals();
+      }
     };
 
     if (selModelId.value === m.id && selModelNodeId.value === resolvedNodeId) {
       syncModelForm(getActiveChapter());
-      if (focusCamera) focusCameraOnSelection();
+      if (focusCamera) {
+        requestAnimationFrame(() => {
+          const obj = getSelectedObject3D();
+          if (obj) focusCameraOnObject(obj);
+        });
+      }
       return;
     }
     if (animDirty.value) {
@@ -4196,13 +4587,11 @@ export function useMovieEditor() {
         }
         cfg.posOffset = [mOff[0], mOff[1], mOff[2]];
       }
-      refreshSelectionHighlight();
     } else if (field === "scale") {
       for (const target of targets) {
         target.scale.setScalar(mScl.value);
       }
       cfg.scale = mScl.value;
-      refreshSelectionHighlight();
     } else if (field === "rotation") {
       for (const target of targets) {
         target.rotation.set(
@@ -4211,7 +4600,6 @@ export function useMovieEditor() {
           THREE.MathUtils.degToRad(mRot[2])
         );
       }
-      refreshSelectionHighlight();
     }
   }
 
@@ -4317,7 +4705,7 @@ export function useMovieEditor() {
     syncVideoAudioState();
     if (isPreviewMode.value) {
       if (videoEl.value && chapters.value.length > 0) {
-        void startChapterPlayback(sortedChapters.value[0]);
+        void startChapterPlayback(timelineChapters.value[0]);
       }
     }
     setTimeout(handleResize, 100);
@@ -4352,6 +4740,7 @@ export function useMovieEditor() {
     camera.aspect = w / h;
     camera.updateProjectionMatrix();
     renderer.setSize(w, h);
+    if (composer) composer.setSize(w, h);
   }
 
   watch(isPreviewMode, () => {
@@ -4420,6 +4809,7 @@ export function useMovieEditor() {
       duration.value = currProj.value?.videoDuration || 0;
       if (duration.value > 0) {
         ensureDefaultChapter(duration.value);
+        normalizeProjectChapterRanges();
       }
     }
 
@@ -4446,7 +4836,10 @@ export function useMovieEditor() {
   onUnmounted(() => {
     cancelAnimationFrame(afid);
     unbindViewportPicking();
+    unbindControlsInteraction();
+    clearHoverHighlight();
     clearSelectionHighlight();
+    composer?.dispose?.();
     meshes.forEach((_, id) => rmMesh(id));
     disposeViewportEnvironment(envMap);
     envMap = null;
@@ -4514,6 +4907,12 @@ export function useMovieEditor() {
     chapterNavLock,
     selModelId,
     selModelNodeId,
+    hoverModelId,
+    hoverModelNodeId,
+    hoverModelInList,
+    clearHoverModelInList,
+    isModelCardHovered,
+    isModelNodeHovered,
     selModelNode,
     hierarchyRevision,
     getModelHierarchy,
@@ -4615,10 +5014,12 @@ export function useMovieEditor() {
     videoHeight,
     chapters,
     sortedChapters,
+    timelineChapters,
     chapterTreeList,
     models,
     subtitles,
     selectedChapter,
+    selectedChapterTimeBounds,
     selModel,
     chapterModels,
     modelDisplayName,
@@ -4660,10 +5061,11 @@ export function useMovieEditor() {
     selectChapter,
     playChapter,
     addChapter,
+    addChildChapter,
+    canAddChildChapter,
     getChapterChildren,
     getAllDescendantChapterIds,
-    getChapterParentOptions,
-    setChapterParent,
+    isChapterPlaying,
     chCmd,
     saveChF,
     saveChapterFull,

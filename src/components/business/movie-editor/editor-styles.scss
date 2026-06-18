@@ -1058,6 +1058,17 @@
     background: var(--primary-color-1);
   }
 
+  &.hovered:not(.selected) {
+    border-color: var(--primary-color-5);
+    background: var(--primary-color-1);
+    box-shadow: 0 0 0 1px var(--primary-color-2);
+  }
+
+  &.hovered-child:not(.selected) {
+    border-color: var(--primary-color-4);
+    background: color-mix(in srgb, var(--primary-color-1) 60%, var(--fill-color-5));
+  }
+
   .model-dot {
     width: 7px;
     height: 7px;
@@ -1137,6 +1148,12 @@
   &.selected {
     background: var(--primary-color-1);
     border-color: var(--primary-color-6);
+  }
+
+  &.hovered:not(.selected) {
+    background: var(--primary-color-1);
+    border-color: var(--primary-color-5);
+    box-shadow: inset 2px 0 0 var(--primary-color-5);
   }
 
   &.is-mesh .tree-node-icon {
@@ -2223,6 +2240,13 @@
     &--2 {
       grid-template-columns: repeat(2, minmax(0, 1fr));
     }
+  }
+
+  .chapter-time-hint {
+    margin: 0;
+    font-size: 12px;
+    color: var(--text-color-3);
+    line-height: 1.4;
   }
 
   .chapter-info-section {

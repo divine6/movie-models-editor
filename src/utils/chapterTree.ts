@@ -5,6 +5,11 @@ export interface ChapterTreeItem {
   depth: number;
 }
 
+/** 顶层节点（无 parentId），按开始时间排序，用于时间轴与播放 */
+export function getRootChapters(chapters: Chapter[]): Chapter[] {
+  return chapters.filter(ch => !ch.parentId).sort((a, b) => a.startTime - b.startTime);
+}
+
 /** 将扁平节点列表按 parentId 展开为树形顺序（用于 UI 展示） */
 export function flattenChapterTree(chapters: Chapter[], parentId?: string, depth = 0): ChapterTreeItem[] {
   const children = chapters
@@ -28,24 +33,4 @@ export function getDescendantChapterIds(chapters: Chapter[], chapterId: string):
     result.push(...getDescendantChapterIds(chapters, child.id));
   }
   return result;
-}
-
-/** 设置 parentId 是否会产生环 */
-export function wouldCreateChapterCycle(chapters: Chapter[], chapterId: string, parentId: string): boolean {
-  if (parentId === chapterId) return true;
-  let current: string | undefined = parentId;
-  const visited = new Set<string>();
-  while (current) {
-    if (current === chapterId) return true;
-    if (visited.has(current)) return true;
-    visited.add(current);
-    current = chapters.find(ch => ch.id === current)?.parentId;
-  }
-  return false;
-}
-
-/** 可作为父节点的候选列表（排除自身及子孙） */
-export function getChapterParentOptions(chapters: Chapter[], chapterId: string): Chapter[] {
-  const invalid = new Set([chapterId, ...getDescendantChapterIds(chapters, chapterId)]);
-  return chapters.filter(ch => !invalid.has(ch.id)).sort((a, b) => a.startTime - b.startTime);
 }

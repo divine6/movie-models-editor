@@ -99,7 +99,7 @@
       <div :ref="editor.bindRef('trackEl')" class="progress-track progress-track--chapters" @click="editor.seekTrack">
         <div class="prog-segs">
           <div
-            v-for="(ch, i) in editor.sortedChapters"
+            v-for="(ch, i) in editor.timelineChapters"
             :key="ch.id"
             class="prog-seg-wrap"
             :style="{ flex: `${editor.chapterSegmentFlex(ch)} 1 0%` }"

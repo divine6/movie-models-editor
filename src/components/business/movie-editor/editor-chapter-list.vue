@@ -30,7 +30,7 @@
             class="ch-item"
             :class="{
               active: editor.selectedChapterId === item.chapter.id,
-              playing: editor.sortedChapters[editor.currentChapterIdx]?.id === item.chapter.id,
+              playing: editor.isChapterPlaying(item.chapter),
               'is-child': !!item.chapter.parentId
             }"
             :style="{ paddingLeft: 12 + item.depth * 18 + 'px' }"
@@ -47,6 +47,16 @@
               </div>
             </span>
             <span v-if="!editor.isPreviewMode" class="ch-item-actions" @click.stop>
+              <el-tooltip :content="$t('OpWeb.Editor.AddChildChapter', '添加子节点')" placement="top">
+                <el-button
+                  text
+                  type="primary"
+                  :disabled="!editor.canAddChildChapter(item.chapter)"
+                  @click="editor.addChildChapter(item.chapter)"
+                >
+                  ＋
+                </el-button>
+              </el-tooltip>
               <el-tooltip :content="$t('OpWeb.Common.Play', '播放')" placement="top">
                 <el-button text type="primary" @click="editor.startChapterPlayback(item.chapter)">
                   <el-icon><VideoPlay /></el-icon>

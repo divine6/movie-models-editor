@@ -11,8 +11,8 @@
             <label class="chapter-field-label">{{ $t("OpWeb.Editor.StartTime", "开始时间") }}</label>
             <el-input-number
               v-model="chapterForm.startTime"
-              :min="0"
-              :max="editor.duration"
+              :min="editor.selectedChapterTimeBounds.startMin"
+              :max="editor.selectedChapterTimeBounds.startMax"
               :step="0.1"
               :controls="false"
               size="small"
@@ -22,31 +22,17 @@
             <label class="chapter-field-label">{{ $t("OpWeb.Editor.EndTime", "结束时间") }}</label>
             <el-input-number
               v-model="chapterForm.endTime"
-              :min="0"
-              :max="editor.duration"
+              :min="editor.selectedChapterTimeBounds.endMin"
+              :max="editor.selectedChapterTimeBounds.endMax"
               :step="0.1"
               :controls="false"
               size="small"
             />
           </div>
         </div>
-        <div class="chapter-form-field">
-          <label class="chapter-field-label">{{ $t("OpWeb.Editor.ParentChapter", "父节点") }}</label>
-          <el-select
-            v-model="chapterForm.parentId"
-            clearable
-            filterable
-            size="small"
-            :placeholder="$t('OpWeb.Editor.NoParentChapter', '无（顶层节点）')"
-          >
-            <el-option
-              v-for="opt in parentOptions"
-              :key="opt.id"
-              :label="opt.name"
-              :value="opt.id"
-            />
-          </el-select>
-        </div>
+        <p v-if="isChildChapter" class="chapter-time-hint">
+          {{ $t("OpWeb.Editor.ChildChapterTimeHint", "子节点时间限制在父节点范围内，且不能与同级节点重叠") }}
+        </p>
       </div>
 
       <div class="detail-section chapter-camera-section">
@@ -140,8 +126,7 @@ const $t = useTranslate();
 const chapterForm = reactive({
   name: "",
   startTime: 0,
-  endTime: 0,
-  parentId: undefined as string | undefined
+  endTime: 0
 });
 
 const cameraForm = reactive({
@@ -164,11 +149,7 @@ const activeChapter = computed(() => {
   return editor.chapters.find(ch => ch.id === chapterId) ?? null;
 });
 
-const parentOptions = computed(() => {
-  const ch = activeChapter.value;
-  if (!ch) return [];
-  return editor.getChapterParentOptions(ch.id);
-});
+const isChildChapter = computed(() => !!activeChapter.value?.parentId);
 
 const syncForms = () => {
   const ch = activeChapter.value;
@@ -179,8 +160,7 @@ const syncForms = () => {
   Object.assign(chapterForm, {
     name: ch.name,
     startTime: ch.startTime,
-    endTime: ch.endTime,
-    parentId: ch.parentId
+    endTime: ch.endTime
   });
   Object.assign(cameraForm, {
     posX: ch.camera.position[0],

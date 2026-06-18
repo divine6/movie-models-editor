@@ -79,11 +79,20 @@
             </div>
           </div>
 
-          <div class="model-list" :class="{ 'is-empty': editor.chapterModels.length === 0 }">
+          <div
+            class="model-list"
+            :class="{ 'is-empty': editor.chapterModels.length === 0 }"
+            @mouseleave="editor.clearHoverModelInList"
+          >
             <div v-for="m in editor.chapterModels" :key="m.id" class="model-tree-root">
               <div
                 class="model-card"
-                :class="{ selected: editor.selModelId === m.id && !editor.selModelNodeId }"
+                :class="{
+                  selected: editor.selModelId === m.id && !editor.selModelNodeId,
+                  hovered: editor.isModelCardHovered(m.id),
+                  'hovered-child': editor.hoverModelId === m.id && !!editor.hoverModelNodeId
+                }"
+                @mouseenter="editor.hoverModelInList(m.id, null)"
                 @click="editor.selectModel(m, { focusCamera: true, nodeId: null })"
               >
                 <span class="model-dot" :style="{ background: m.color }" />
