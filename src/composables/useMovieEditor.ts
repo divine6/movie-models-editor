@@ -15,6 +15,7 @@ import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { DRACOLoader } from "three/addons/loaders/DRACOLoader.js";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+import { RGBELoader } from "three/addons/loaders/RGBELoader.js";
 import { MeshoptDecoder } from "three/examples/jsm/libs/meshopt_decoder.module.js";
 import { EffectComposer } from "three/addons/postprocessing/EffectComposer.js";
 import { OutlinePass } from "three/addons/postprocessing/OutlinePass.js";
@@ -24,6 +25,27 @@ import { ShaderPass } from "three/addons/postprocessing/ShaderPass.js";
 import { UnrealBloomPass } from "three/addons/postprocessing/UnrealBloomPass.js";
 import { BrightnessContrastShader } from "three/addons/shaders/BrightnessContrastShader.js";
 import { HueSaturationShader } from "three/addons/shaders/HueSaturationShader.js";
+
+/** 色调映射选项（与 Three.js renderer.toneMapping 对应） */
+export const TONE_MAPPING_OPTIONS = [
+  { value: "NoToneMapping", label: "None" },
+  { value: "LinearToneMapping", label: "Linear" },
+  { value: "ReinhardToneMapping", label: "Reinhard" },
+  { value: "CineonToneMapping", label: "Cineon" },
+  { value: "ACESFilmicToneMapping", label: "ACES Filmic" },
+  { value: "AgXToneMapping", label: "AgX" },
+  { value: "NeutralToneMapping", label: "Neutral" }
+] as const;
+
+const TONE_MAPPING_MAP: Record<string, THREE.ToneMapping> = {
+  NoToneMapping: THREE.NoToneMapping,
+  LinearToneMapping: THREE.LinearToneMapping,
+  ReinhardToneMapping: THREE.ReinhardToneMapping,
+  CineonToneMapping: THREE.CineonToneMapping,
+  ACESFilmicToneMapping: THREE.ACESFilmicToneMapping,
+  AgXToneMapping: THREE.AgXToneMapping,
+  NeutralToneMapping: THREE.NeutralToneMapping
+};
 
 /** 色彩校正着色器（曝光） */
 const ColorCorrectionShader = {
@@ -226,8 +248,14 @@ export function useMovieEditor() {
     ppExposure: SCENE_TONE_MAPPING_EXPOSURE,
     ppContrast: 0,
     ppSaturation: 0,
+    toneMapping: "ACESFilmicToneMapping",
     envIntensityVal: 1,
+    envMapUrl: null as string | null,
+    envMapIsHdr: false,
     bgColorVal: SCENE_VIEWPORT_BG,
+    fogEnabled: true,
+    fogNear: 4,
+    fogFar: 32,
     shadowEnabled: false,
     shadowIntensity: 1,
     shadowMapSize: 2048,
@@ -260,9 +288,17 @@ export function useMovieEditor() {
   const ppExposure = ref(DEFAULT_SCENE_SETTINGS.ppExposure);
   const ppContrast = ref(DEFAULT_SCENE_SETTINGS.ppContrast);
   const ppSaturation = ref(DEFAULT_SCENE_SETTINGS.ppSaturation);
+  const toneMapping = ref(DEFAULT_SCENE_SETTINGS.toneMapping);
   // Environment
   const envIntensityVal = ref(DEFAULT_SCENE_SETTINGS.envIntensityVal);
+  const envMapUrl = ref<string | null>(DEFAULT_SCENE_SETTINGS.envMapUrl);
+  const envMapIsHdr = ref(DEFAULT_SCENE_SETTINGS.envMapIsHdr);
   const bgColorVal = ref(DEFAULT_SCENE_SETTINGS.bgColorVal);
+  const fogEnabled = ref(DEFAULT_SCENE_SETTINGS.fogEnabled);
+  const fogNear = ref(DEFAULT_SCENE_SETTINGS.fogNear);
+  const fogFar = ref(DEFAULT_SCENE_SETTINGS.fogFar);
+  let saveSettingsTimer: ReturnType<typeof setTimeout> | null = null;
+  const envMapPreview = ref("");
   const shadowEnabled = ref(DEFAULT_SCENE_SETTINGS.shadowEnabled);
   const shadowIntensity = ref(DEFAULT_SCENE_SETTINGS.shadowIntensity);
   const shadowMapSize = ref(DEFAULT_SCENE_SETTINGS.shadowMapSize);
@@ -372,6 +408,9 @@ export function useMovieEditor() {
   let hueSatPass: ShaderPass;
   let brightContrastPass: ShaderPass;
   let envMap: THREE.Texture | null = null;
+  let envMapSourceUrl: string | null = null;
+  const textureLoader = new THREE.TextureLoader();
+  const rgbeLoader = new RGBELoader();
   let outlinePass: OutlinePass;
   let hoverOutlinePass: OutlinePass;
   const raycaster = new THREE.Raycaster();
@@ -449,11 +488,15 @@ export function useMovieEditor() {
 
     dirLight = new THREE.DirectionalLight(0xffffff, DEFAULT_SCENE_SETTINGS.dirIntensity);
     dirLight.position.set(...DEFAULT_SCENE_SETTINGS.dirPos);
+    dirLight.target.position.set(0, 0, 0);
     scene.add(dirLight);
+    scene.add(dirLight.target);
 
     fillLight = new THREE.DirectionalLight(0x88bbff, DEFAULT_SCENE_SETTINGS.fillIntensity);
     fillLight.position.set(...DEFAULT_SCENE_SETTINGS.fillPos);
+    fillLight.target.position.set(0, 0, 0);
     scene.add(fillLight);
+    scene.add(fillLight.target);
     // mainLight.castShadow = true;
     // mainLight.shadow.mapSize.width = 2048;
     // mainLight.shadow.mapSize.height = 2048;
@@ -469,6 +512,7 @@ export function useMovieEditor() {
       loadAllSettings();
       applySettings();
       applyGrid();
+      applyFog();
       if (shadowEnabled.value) applyShadow();
       // composer 常驻：渲染路径永不切换，避免选中/悬停时画面闪烁
       initComposer();
@@ -490,6 +534,9 @@ export function useMovieEditor() {
       envMap = createViewportEnvironment(renderer);
       scene.environment = envMap;
       scene.environmentIntensity = envIntensityVal.value;
+      if (envMapUrl.value) {
+        loadEnvironmentMapFromUrl(envMapUrl.value, envMapIsHdr.value);
+      }
     } catch (e) {
       console.warn("Viewport environment init failed", e);
     }
@@ -700,7 +747,15 @@ export function useMovieEditor() {
     return desired;
   }
 
-  function syncSceneFogAndOrbitLimits() {
+  function scheduleSaveSettings() {
+    if (saveSettingsTimer) clearTimeout(saveSettingsTimer);
+    saveSettingsTimer = setTimeout(() => {
+      saveSettingsTimer = null;
+      saveAllSettings();
+    }, 280);
+  }
+
+  function syncSceneOrbitLimits() {
     if (!scene || !controls) return;
 
     const box = new THREE.Box3();
@@ -717,17 +772,8 @@ export function useMovieEditor() {
       maxOrbit = Math.min(maxOrbit, Math.max(extent * 3.6, 12));
     }
 
-    const fogNear = Math.max(minOrbit * 2, SCENE_FOG_NEAR);
-    const minVis = SCENE_FOG_MIN_VISIBILITY_AT_MAX_ORBIT;
-    const fogFar = Math.max((maxOrbit - minVis * fogNear) / (1 - minVis), fogNear + 10, SCENE_FOG_FAR);
-
     controls.minDistance = minOrbit;
     controls.maxDistance = maxOrbit;
-
-    if (scene.fog instanceof THREE.Fog) {
-      scene.fog.near = fogNear;
-      scene.fog.far = fogFar;
-    }
 
     if (camera) {
       const target = controls.target;
@@ -740,6 +786,11 @@ export function useMovieEditor() {
         camera.updateProjectionMatrix();
       }
     }
+  }
+
+  /** @deprecated use syncSceneOrbitLimits */
+  function syncSceneFogAndOrbitLimits() {
+    syncSceneOrbitLimits();
   }
 
   function adaptPresentationViewport() {
@@ -776,7 +827,8 @@ export function useMovieEditor() {
       const newPos: [number, number, number] = [center.x + dir.x, center.y + dir.y, center.z + dir.z];
       snapCam(newPos, [center.x, center.y, center.z], camera.fov);
     }
-    syncSceneFogAndOrbitLimits();
+    syncSceneOrbitLimits();
+    applyFog();
     controls.update();
   }
 
@@ -832,8 +884,14 @@ export function useMovieEditor() {
         ppExposure: ppExposure.value,
         ppContrast: ppContrast.value,
         ppSaturation: ppSaturation.value,
+        toneMapping: toneMapping.value,
         envIntensityVal: envIntensityVal.value,
+        envMapUrl: envMapUrl.value,
+        envMapIsHdr: envMapIsHdr.value,
         bgColorVal: bgColorVal.value,
+        fogEnabled: fogEnabled.value,
+        fogNear: fogNear.value,
+        fogFar: fogFar.value,
         shadowEnabled: shadowEnabled.value,
         shadowIntensity: shadowIntensity.value,
         shadowMapSize: shadowMapSize.value,
@@ -878,7 +936,13 @@ export function useMovieEditor() {
       if (d.ppExposure !== undefined) ppExposure.value = d.ppExposure;
       if (d.ppContrast !== undefined) ppContrast.value = d.ppContrast;
       if (d.ppSaturation !== undefined) ppSaturation.value = d.ppSaturation;
+      if (d.toneMapping) toneMapping.value = d.toneMapping;
       if (d.envIntensityVal !== undefined) envIntensityVal.value = d.envIntensityVal;
+      if (d.envMapUrl !== undefined) envMapUrl.value = d.envMapUrl;
+      if (d.envMapIsHdr !== undefined) envMapIsHdr.value = d.envMapIsHdr;
+      if (d.fogEnabled !== undefined) fogEnabled.value = d.fogEnabled;
+      if (d.fogNear !== undefined) fogNear.value = d.fogNear;
+      if (d.fogFar !== undefined) fogFar.value = d.fogFar;
       if (d.bgColorVal) {
         const normalized = String(d.bgColorVal).toLowerCase();
         bgColorVal.value =
@@ -924,7 +988,13 @@ export function useMovieEditor() {
     ppExposure.value = d.ppExposure;
     ppContrast.value = d.ppContrast;
     ppSaturation.value = d.ppSaturation;
+    toneMapping.value = d.toneMapping;
     envIntensityVal.value = d.envIntensityVal;
+    envMapUrl.value = d.envMapUrl;
+    envMapIsHdr.value = d.envMapIsHdr;
+    fogEnabled.value = d.fogEnabled;
+    fogNear.value = d.fogNear;
+    fogFar.value = d.fogFar;
     bgColorVal.value = d.bgColorVal;
     shadowEnabled.value = d.shadowEnabled;
     shadowIntensity.value = d.shadowIntensity;
@@ -942,61 +1012,229 @@ export function useMovieEditor() {
     toggleColor();
     applyShadow();
     applyGrid();
-    applyEnv();
-    applyMatToCurModel();
+    void resetEnvironmentMap();
+    applyFog();
+    if (selModel.value) syncMaterialUiFromModel();
     toastShow("场景参数已重置");
   }
 
-  function syncViewportFog() {
-    if (!scene?.fog || !(scene.fog instanceof THREE.Fog)) return;
+  function loadEnvironmentMapFromUrl(url: string, isHdr: boolean) {
+    if (!renderer || !scene) return;
+    envMapPreview.value = isHdr ? "" : url;
+    envMapSourceUrl = url;
+    const onLoaded = (texture: THREE.Texture) => {
+      disposeViewportEnvironment(envMap);
+      envMap = buildEnvMapFromTexture(texture);
+      scene.environment = envMap;
+      scene.environmentIntensity = envIntensityVal.value;
+    };
+    const onError = () => {
+      console.warn("Environment map load failed", url);
+    };
+    if (isHdr) {
+      rgbeLoader.load(url, onLoaded, undefined, onError);
+    } else {
+      textureLoader.load(url, onLoaded, undefined, onError);
+    }
+  }
+
+  function applyToneMapping() {
+    if (!renderer) return;
+    renderer.toneMapping = TONE_MAPPING_MAP[toneMapping.value] ?? THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = ppExposure.value;
+    scheduleSaveSettings();
+  }
+
+  function applyFog() {
+    if (!scene) return;
     const bg = new THREE.Color(bgColorVal.value);
-    scene.fog.color.copy(bg);
-    syncSceneFogAndOrbitLimits();
+    scene.background = bg;
+    renderer?.setClearColor(bg, 1);
+
+    if (!fogEnabled.value) {
+      scene.fog = null;
+      scheduleSaveSettings();
+      return;
+    }
+
+    if (!(scene.fog instanceof THREE.Fog)) {
+      scene.fog = new THREE.Fog(bg.getHex(), fogNear.value, fogFar.value);
+    } else {
+      scene.fog.color.copy(bg);
+      scene.fog.near = fogNear.value;
+      scene.fog.far = Math.max(fogFar.value, fogNear.value + 0.5);
+    }
+
+    meshes.forEach(group => {
+      group.traverse(child => {
+        const mesh = child as THREE.Mesh;
+        if (!mesh.isMesh || !mesh.material) return;
+        const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+        mats.forEach(mat => {
+          (mat as THREE.Material).fog = true;
+        });
+      });
+    });
+
+    if (gridHelper) {
+      gridHelper.traverse(child => {
+        const line = child as THREE.LineSegments;
+        if (line.material) {
+          const mats = Array.isArray(line.material) ? line.material : [line.material];
+          mats.forEach(mat => {
+            (mat as THREE.Material).fog = true;
+          });
+        }
+      });
+    }
+
+    scheduleSaveSettings();
+  }
+
+  async function resetEnvironmentMap() {
+    envMapUrl.value = null;
+    envMapIsHdr.value = false;
+    envMapPreview.value = "";
+    if (envMapSourceUrl?.startsWith("blob:")) URL.revokeObjectURL(envMapSourceUrl);
+    envMapSourceUrl = null;
+    if (!renderer) return;
+    disposeViewportEnvironment(envMap);
+    envMap = createViewportEnvironment(renderer);
+    scene.environment = envMap;
+    scene.environmentIntensity = envIntensityVal.value;
+    saveAllSettings();
+  }
+
+  function buildEnvMapFromTexture(texture: THREE.Texture): THREE.Texture {
+    if (!renderer) return texture;
+    texture.mapping = THREE.EquirectangularReflectionMapping;
+    const isHdr = texture.type === THREE.HalfFloatType || texture.type === THREE.FloatType;
+    if (!isHdr) {
+      texture.colorSpace = THREE.SRGBColorSpace;
+    }
+    const pmrem = new THREE.PMREMGenerator(renderer);
+    pmrem.compileEquirectangularShader();
+    const env = pmrem.fromEquirectangular(texture).texture;
+    pmrem.dispose();
+    texture.dispose();
+    return env;
+  }
+
+  async function applyEnvironmentMapFile(file: File) {
+    if (!renderer || !scene) return;
+    const isHdr = /\.hdr$/i.test(file.name);
+    const url = URL.createObjectURL(file);
+    if (envMapSourceUrl?.startsWith("blob:")) URL.revokeObjectURL(envMapSourceUrl);
+    envMapSourceUrl = url;
+    envMapUrl.value = url;
+    envMapIsHdr.value = isHdr;
+    envMapPreview.value = isHdr ? "" : url;
+    const onLoaded = (texture: THREE.Texture) => {
+      disposeViewportEnvironment(envMap);
+      envMap = buildEnvMapFromTexture(texture);
+      scene.environment = envMap;
+      scene.environmentIntensity = envIntensityVal.value;
+      scheduleSaveSettings();
+    };
+    const onError = () => {
+      toastShow("环境贴图加载失败", "error");
+    };
+
+    return new Promise<void>((resolve, reject) => {
+      if (isHdr) {
+        rgbeLoader.load(
+          url,
+          texture => {
+            onLoaded(texture);
+            resolve();
+          },
+          undefined,
+          err => {
+            onError();
+            reject(err);
+          }
+        );
+      } else {
+        textureLoader.load(
+          url,
+          texture => {
+            onLoaded(texture);
+            resolve();
+          },
+          undefined,
+          err => {
+            onError();
+            reject(err);
+          }
+        );
+      }
+    });
+  }
+
+  function clearEnvironmentMap() {
+    void resetEnvironmentMap();
+  }
+
+  function syncMaterialUiFromModel() {
+    const model = selModel.value;
+    if (!model) return;
+    const root = meshes.get(model.id);
+    if (!root) return;
+
+    let found = false;
+    root.traverse(child => {
+      if (found) return;
+      const mesh = child as THREE.Mesh;
+      if (!mesh.isMesh || !mesh.material) return;
+      const mat = (Array.isArray(mesh.material) ? mesh.material[0] : mesh.material) as THREE.MeshStandardMaterial;
+      if (!mat?.isMeshStandardMaterial) return;
+      if (mat.roughness !== undefined) matRoughness.value = mat.roughness;
+      if (mat.metalness !== undefined) matMetalness.value = mat.metalness;
+      if (mat.normalScale) matNormalStr.value = mat.normalScale.x;
+      if (mat.emissiveIntensity !== undefined) matEmissiveInt.value = mat.emissiveIntensity;
+      else matEmissiveInt.value = 0;
+      if (mat.aoMapIntensity !== undefined) matAoInt.value = mat.aoMapIntensity;
+      else matAoInt.value = mat.aoMap ? 1 : 0;
+      found = true;
+    });
+  }
+
+  function syncViewportFog() {
+    if (!scene) return;
+    applyFog();
   }
 
   function applySettings() {
-    if (!scene || !renderer) return;
-    saveAllSettings();
-    // Lighting
+    if (!scene || !renderer || !ambientLight || !dirLight || !fillLight) return;
     ambientLight.intensity = ambIntensity.value;
     dirLight.intensity = dirIntensity.value;
     dirLight.position.set(dirPos[0], dirPos[1], dirPos[2]);
     fillLight.intensity = fillIntensity.value;
     fillLight.position.set(fillPos[0], fillPos[1], fillPos[2]);
-    // Background & fog（颜色必须一致才有雾效）
-    const bg = new THREE.Color(bgColorVal.value);
-    scene.background = bg;
-    renderer.setClearColor(bg, 1);
-    syncViewportFog();
-    // Renderer tone mapping
-    renderer.toneMappingExposure = ppExposure.value;
+    applyToneMapping();
+    applyFog();
+    scheduleSaveSettings();
   }
 
   function applyMatToModel(modelId: string) {
-    let mesh = meshes.get(modelId);
-    if (!mesh) return;
-    saveAllSettings();
-    mesh.traverse(function (child: any) {
-      if (child.isMesh && child.material) {
-        let mats = Array.isArray(child.material) ? child.material : [child.material];
-        mats.forEach(function (m: any) {
-          if (matColor.value) {
-            if (!m.userData._origColor) m.userData._origColor = m.color ? m.color.getHex() : 0xffffff;
-            m.color.set(matColor.value);
-          }
-          if (m.roughness !== undefined) m.roughness = matRoughness.value;
-          if (m.metalness !== undefined) m.metalness = matMetalness.value;
-          if (m.normalScale) m.normalScale.setScalar(matNormalStr.value);
-          if (m.emissive !== undefined) {
-            m.emissiveIntensity = matEmissiveInt.value;
-            if (matEmissiveInt.value > 0 && (!m.emissive || m.emissive.getHex() === 0)) {
-              m.emissive = new THREE.Color(0xffffff);
-            }
-          }
-          if (m.aoMap && m.aoMapIntensity !== undefined) m.aoMapIntensity = matAoInt.value;
-        });
-      }
+    const root = meshes.get(modelId);
+    if (!root) return;
+    root.traverse(child => {
+      const mesh = child as THREE.Mesh;
+      if (!mesh.isMesh || !mesh.material) return;
+      const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+      mats.forEach(mat => {
+        const m = mat as THREE.MeshStandardMaterial;
+        if (!m.isMeshStandardMaterial) return;
+        if (m.roughness !== undefined) m.roughness = matRoughness.value;
+        if (m.metalness !== undefined) m.metalness = matMetalness.value;
+        if (m.normalScale) m.normalScale.setScalar(matNormalStr.value);
+        if (m.emissiveIntensity !== undefined) m.emissiveIntensity = matEmissiveInt.value;
+        if (m.aoMapIntensity !== undefined) m.aoMapIntensity = matAoInt.value;
+        m.needsUpdate = true;
+      });
     });
+    scheduleSaveSettings();
   }
 
   function initComposer() {
@@ -1059,17 +1297,16 @@ export function useMovieEditor() {
 
   function toggleBloom() {
     if (bloomIntensity.value > 0 && !composer) initComposer();
-    saveAllSettings();
     if (composer) {
       bloomPass.strength = bloomIntensity.value;
       bloomPass.threshold = bloomThreshold.value;
       bloomPass.radius = bloomRadius.value;
     }
+    scheduleSaveSettings();
   }
 
   function toggleColor() {
     if (!composer) initComposer();
-    saveAllSettings();
     if (composer) {
       if (hueSatPass.uniforms) {
         hueSatPass.uniforms.saturation.value = ppSaturation.value;
@@ -1078,10 +1315,10 @@ export function useMovieEditor() {
         brightContrastPass.uniforms.contrast.value = ppContrast.value;
       }
     }
+    scheduleSaveSettings();
   }
 
   function applyGrid() {
-    saveAllSettings();
     if (gridHelper) {
       scene.remove(gridHelper);
       disposeViewportGrid(gridHelper);
@@ -1090,17 +1327,17 @@ export function useMovieEditor() {
     gridHelper.position.set(0, gridHeight.value, 0);
     gridHelper.visible = gridVisible.value;
     scene.add(gridHelper);
-    syncViewportFog();
-    if (renderer && scene && camera) renderer.render(scene, camera);
+    applyFog();
+    scheduleSaveSettings();
   }
 
   function applyEnv() {
+    if (!scene) return;
     scene.environmentIntensity = envIntensityVal.value;
-    saveAllSettings();
+    scheduleSaveSettings();
   }
 
   function applyShadow() {
-    saveAllSettings();
     renderer.shadowMap.enabled = shadowEnabled.value;
     switch (shadowType.value) {
       case "basic":
@@ -1154,6 +1391,7 @@ export function useMovieEditor() {
         }
       });
     });
+    scheduleSaveSettings();
     renderer.render(scene, camera);
   }
 
@@ -1416,7 +1654,7 @@ export function useMovieEditor() {
     if (gltf.animations.length > 0 && !importingModel.value) {
       attachModelMixer(m.id, root, gltf.animations);
     }
-    if (selModel.value?.id === m.id) applyMatToModel(m.id);
+    if (selModel.value?.id === m.id) syncMaterialUiFromModel();
     if (selModelId.value === m.id) updateSelectionHighlight();
     invalidatePickMeshCache();
     if (shadowEnabled.value) {
@@ -1427,7 +1665,8 @@ export function useMovieEditor() {
         }
       });
     }
-    syncSceneFogAndOrbitLimits();
+    syncSceneOrbitLimits();
+    applyFog();
   }
 
   function registerModelHierarchy(modelId: string, root: THREE.Object3D, modelDisplayName?: string) {
@@ -5388,8 +5627,13 @@ export function useMovieEditor() {
     updateSelectionHighlight();
     if (selModelId.value) {
       syncModelForm(getActiveChapter());
+      syncMaterialUiFromModel();
       modelFormRevision.value++;
     }
+  });
+
+  watch(selModelId, id => {
+    if (id) syncMaterialUiFromModel();
   });
 
   watch(rightTab, tab => {
@@ -5657,8 +5901,14 @@ export function useMovieEditor() {
     ppExposure,
     ppContrast,
     ppSaturation,
+    toneMapping,
     envIntensityVal,
+    envMapUrl,
+    envMapPreview,
     bgColorVal,
+    fogEnabled,
+    fogNear,
+    fogFar,
     shadowEnabled,
     shadowIntensity,
     shadowMapSize,
@@ -5780,14 +6030,20 @@ export function useMovieEditor() {
     onVideoEnd,
     onVideoErr,
     applySettings,
+    applyToneMapping,
+    applyFog,
     resetSceneSettings,
     applyMatToCurModel,
+    syncMaterialUiFromModel,
+    applyEnvironmentMapFile,
+    clearEnvironmentMap,
     toggleBloom,
     toggleColor,
     applyGrid,
     applyEnv,
     applyShadow,
     EASING_LIST,
-    CURVE_LABELS
+    CURVE_LABELS,
+    TONE_MAPPING_OPTIONS
   });
 }
