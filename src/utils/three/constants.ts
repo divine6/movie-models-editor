@@ -10,10 +10,13 @@ export const CHAPTER_TAG_COLOR = "#2426c0";
 /** Primitive 模型类型配置（内置几何体已移除，仅保留类型供历史数据兼容） */
 export const PRIMITIVE_TYPES: PrimitiveTypeConfig[] = [];
 
+/** 模型默认根节点位置（Y 由加载时贴地计算） */
+export const DEFAULT_MODEL_BASE_POSITION = [0, 0, 0] as [number, number, number];
+
 /** 默认相机配置 */
 export const DEFAULT_CAMERA = {
   position: [6, 4, 8] as [number, number, number],
-  target: [0, 0.5, 0] as [number, number, number],
+  target: [0, 0, 0] as [number, number, number],
   fov: 50,
   transitionSec: 0.5
 };
@@ -54,9 +57,12 @@ export const SCENE_GRID_COLOR = 0x5c5c5c;
 export const SCENE_GRID_SIZE = 20;
 export const SCENE_GRID_DIVISIONS = 40;
 
-/** 雾效距离（Ferrari 示例：near 10, far 15） */
+/** 雾效默认距离（加载模型后会按场景范围动态调整） */
 export const SCENE_FOG_NEAR = 10;
-export const SCENE_FOG_FAR = 15;
+export const SCENE_FOG_FAR = 28;
+
+/** 最远轨道距离时，模型至少保留的可见度（0–1，越大越清晰） */
+export const SCENE_FOG_MIN_VISIBILITY_AT_MAX_ORBIT = 0.35;
 
 /** 色调映射曝光（Ferrari 示例 0.85） */
 export const SCENE_TONE_MAPPING_EXPOSURE = 0.85;

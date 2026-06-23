@@ -51,6 +51,17 @@ const ColorCorrectionShader = {
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 
+import {
+  buildScenePreviewLink,
+  fetchModelSet,
+  fetchScene,
+  rewireEditorFrontendHost,
+  rewireEditorServerHost,
+  resolveAssetUrl,
+  saveScene as saveSceneToBackend,
+  updateScene as updateSceneOnBackend,
+  uploadSceneVideo
+} from "@/api/modules/editor-server";
 import { exportPlayer } from "@/composables/usePlayerExport";
 import { resumeProjectPersist, suspendProjectPersist } from "@/utils/projectPersist";
 import { flattenChapterTree, getDescendantChapterIds, getRootChapters } from "@/utils/chapterTree";
@@ -72,9 +83,11 @@ import {
   CHAPTER_CAMERA_TRANSITION_SEC,
   CHAPTER_SPLIT_INTERVAL,
   DEFAULT_CAMERA,
+  DEFAULT_MODEL_BASE_POSITION,
   MODEL_CAMERA_FOCUS_SEC,
   PIVOT_HELPER_RADIUS,
   SCENE_FOG_FAR,
+  SCENE_FOG_MIN_VISIBILITY_AT_MAX_ORBIT,
   SCENE_FOG_NEAR,
   SCENE_GRID_DIVISIONS,
   SCENE_GRID_SIZE,
@@ -123,8 +136,19 @@ export function useMovieEditor() {
   const displaySubtitle = ref(false);
   const tooltipText = ref("");
   const isPreviewMode = ref(false);
+  const viewOnly = ref((route.query.mode as string) === "view" && !!(route.query.code as string));
+  const routeGateLoading = ref(!!(route.query.code as string));
   const rightTab = ref("model");
   const videoFps = ref(0);
+  const modelSetCode = ref<string | null>(null);
+  const pendingModelSetCode = ref<string | null>(null);
+  const modelSetModelsLoaded = ref(false);
+  const sceneCode = ref<string | null>(null);
+  const shareLink = ref("");
+  const savingScene = ref(false);
+  const sceneListVersion = ref(0);
+  const editSceneCompanyName = ref("");
+  const editSceneToolName = ref("");
 
   // Forms
   const chForm = reactive({ name: "", startTime: 0, endTime: 0 });
@@ -272,19 +296,9 @@ export function useMovieEditor() {
   // Computed
   const currProj = computed(() => pStore.currentProject);
   const hasVideo = computed(() => !!currProj.value?.videoSrc);
-  // Track model panel visibility for camera adjustment
-  let prevHasVideo = false;
   watch(hasVideo, function (v) {
-    if (!scene || !controls) return;
-    if (v && !prevHasVideo) {
-      camera.position.x += 2.8;
-      controls.update();
-    } else if (!v && prevHasVideo) {
-      camera.position.x -= 2.8;
-      controls.update();
-    }
-    prevHasVideo = v;
     if (v) syncVideoElementSrc();
+    if (v) void tryLoadPendingModelSet();
   });
   const videoSrc = computed(() => currProj.value?.videoSrc || "");
   const videoWidth = computed(() => currProj.value?.videoWidth || 0);
@@ -370,6 +384,13 @@ export function useMovieEditor() {
   const _focusCenter = new THREE.Vector3();
   const _focusSize = new THREE.Vector3();
   const _focusOffset = new THREE.Vector3();
+  const _orbitPivotCenter = new THREE.Vector3();
+  const _defaultCamViewDir = new THREE.Vector3(
+    DEFAULT_CAMERA.position[0] - DEFAULT_CAMERA.target[0],
+    DEFAULT_CAMERA.position[1] - DEFAULT_CAMERA.target[1],
+    DEFAULT_CAMERA.position[2] - DEFAULT_CAMERA.target[2]
+  ).normalize();
+  let viewCameraBaseFov: number | null = null;
   let viewportPickState: { x: number; y: number; time: number } | null = null;
   let onCanvasPointerDown: ((e: PointerEvent) => void) | null = null;
   let onCanvasPointerUp: ((e: PointerEvent) => void) | null = null;
@@ -387,6 +408,7 @@ export function useMovieEditor() {
   const HOVER_PICK_MOVE_PX = 4;
   const ORBIT_DRAG_SUSPEND_PX = 8;
   let onControlsInteractionEnd: (() => void) | null = null;
+  let onCanvasContextMenu: ((e: Event) => void) | null = null;
 
   function init3D() {
     if (!viewportEl.value || !canvasEl.value) return;
@@ -415,6 +437,7 @@ export function useMovieEditor() {
     controls.target.set(...DEFAULT_CAMERA.target);
     controls.enableDamping = true;
     controls.dampingFactor = 0.08;
+    controls.enablePan = false;
     controls.minDistance = 2;
     controls.maxDistance = 30;
     controls.maxPolarAngle = Math.PI / 2;
@@ -457,10 +480,6 @@ export function useMovieEditor() {
     } catch (e) {
       console.warn("Settings restore error", e);
     }
-    if (hasVideo.value && controls) {
-      camera.position.x += 2.8;
-      controls.update();
-    }
     gltfLoader = new GLTFLoader();
     dracoLoader = new DRACOLoader();
     dracoLoader.setDecoderPath("/draco/");
@@ -485,12 +504,14 @@ export function useMovieEditor() {
     canvas.style.touchAction = "none";
 
     onCanvasPointerDown = (e: PointerEvent) => {
+      if (viewOnly.value || isPreviewMode.value) return;
       if (e.button !== 0 || e.isPrimary === false) return;
       orbitDragVisualsSuspended = false;
       viewportPickState = { x: e.clientX, y: e.clientY, time: performance.now() };
     };
 
     onCanvasPointerUp = (e: PointerEvent) => {
+      if (viewOnly.value || isPreviewMode.value) return;
       if (e.button !== 0 || e.isPrimary === false || !viewportPickState) return;
       const dx = e.clientX - viewportPickState.x;
       const dy = e.clientY - viewportPickState.y;
@@ -503,6 +524,7 @@ export function useMovieEditor() {
     };
 
     onCanvasPointerMove = (e: PointerEvent) => {
+      if (viewOnly.value || isPreviewMode.value) return;
       if (e.isPrimary === false) return;
       lastViewportPointer = { x: e.clientX, y: e.clientY };
       if (viewportPickState && !orbitDragVisualsSuspended) {
@@ -517,6 +539,10 @@ export function useMovieEditor() {
       }
     };
 
+    onCanvasContextMenu = (e: Event) => {
+      e.preventDefault();
+    };
+
     onCanvasPointerLeave = () => {
       lastViewportPointer = null;
       clearHoverTarget();
@@ -525,6 +551,7 @@ export function useMovieEditor() {
     canvas.addEventListener("pointerdown", onCanvasPointerDown);
     canvas.addEventListener("pointerup", onCanvasPointerUp);
     canvas.addEventListener("pointermove", onCanvasPointerMove);
+    canvas.addEventListener("contextmenu", onCanvasContextMenu);
     if (onCanvasPointerLeave) canvas.addEventListener("pointerleave", onCanvasPointerLeave);
   }
 
@@ -534,10 +561,12 @@ export function useMovieEditor() {
     if (onCanvasPointerDown) canvas.removeEventListener("pointerdown", onCanvasPointerDown);
     if (onCanvasPointerUp) canvas.removeEventListener("pointerup", onCanvasPointerUp);
     if (onCanvasPointerMove) canvas.removeEventListener("pointermove", onCanvasPointerMove);
+    if (onCanvasContextMenu) canvas.removeEventListener("contextmenu", onCanvasContextMenu);
     if (onCanvasPointerLeave) canvas.removeEventListener("pointerleave", onCanvasPointerLeave);
     onCanvasPointerDown = null;
     onCanvasPointerUp = null;
     onCanvasPointerMove = null;
+    onCanvasContextMenu = null;
     onCanvasPointerLeave = null;
     viewportPickState = null;
     lastViewportPointer = null;
@@ -559,6 +588,7 @@ export function useMovieEditor() {
   }
 
   function beginOrbitVisualSuspend() {
+    if (viewOnly.value || isPreviewMode.value) return;
     if (orbitDragVisualsSuspended) return;
     orbitDragVisualsSuspended = true;
     viewportInteracting = true;
@@ -573,6 +603,181 @@ export function useMovieEditor() {
   function endOrbitVisualSuspend() {
     viewportInteracting = false;
     orbitDragVisualsSuspended = false;
+  }
+
+  function getSceneModelCenter(out = _orbitPivotCenter): THREE.Vector3 | null {
+    const box = new THREE.Box3();
+    meshes.forEach(group => box.expandByObject(group));
+    if (box.isEmpty()) return null;
+    box.getCenter(out);
+    return out;
+  }
+
+  function alignLoadedModelToGround(m: Model, root: THREE.Object3D): [number, number, number] {
+    const bpX = m.basePosition?.[0] ?? DEFAULT_MODEL_BASE_POSITION[0];
+    const bpZ = m.basePosition?.[2] ?? DEFAULT_MODEL_BASE_POSITION[2];
+
+    root.position.set(bpX, 0, bpZ);
+    root.updateMatrixWorld(true);
+
+    const box = new THREE.Box3().setFromObject(root);
+    if (box.isEmpty()) {
+      const basePos: [number, number, number] = [bpX, 0, bpZ];
+      m.basePosition = basePos;
+      mStore.setModelGroundY(m, 0);
+      return basePos;
+    }
+
+    const groundY = gridHeight.value - box.min.y;
+    mStore.setModelGroundY(m, groundY);
+    const basePos: [number, number, number] = [bpX, groundY, bpZ];
+    root.position.set(basePos[0], basePos[1], basePos[2]);
+    m.basePosition = basePos;
+    return basePos;
+  }
+
+  function isDefaultChapterCamera(ch: Chapter) {
+    const p = ch.camera.position;
+    const t = ch.camera.target;
+    const dp = DEFAULT_CAMERA.position;
+    const dt = DEFAULT_CAMERA.target;
+    const eps = 0.001;
+    const positionMatches =
+      Math.abs(p[0] - dp[0]) < eps && Math.abs(p[1] - dp[1]) < eps && Math.abs(p[2] - dp[2]) < eps;
+    const targetMatchesDefault =
+      Math.abs(t[0] - dt[0]) < eps && Math.abs(t[1] - dt[1]) < eps && Math.abs(t[2] - dt[2]) < eps;
+    const targetMatchesLegacy = Math.abs(t[0]) < eps && Math.abs(t[1] - 0.5) < eps && Math.abs(t[2]) < eps;
+    return positionMatches && (targetMatchesDefault || targetMatchesLegacy) && ch.camera.fov === DEFAULT_CAMERA.fov;
+  }
+
+  function frameCameraOnSceneModels(dur = CHAPTER_CAMERA_TRANSITION_SEC, chapter?: Chapter | null) {
+    if (!controls || meshes.size === 0) return false;
+
+    const box = new THREE.Box3();
+    meshes.forEach(group => box.expandByObject(group));
+    if (box.isEmpty()) return false;
+
+    box.getCenter(_focusCenter);
+    box.getSize(_focusSize);
+    const maxDim = Math.max(_focusSize.x, _focusSize.y, _focusSize.z, 0.4);
+    const distance = getPresentationCameraDistance(maxDim);
+
+    _focusOffset.copy(_defaultCamViewDir).multiplyScalar(distance);
+
+    const newPos: [number, number, number] = [
+      _focusCenter.x + _focusOffset.x,
+      Math.max(_focusCenter.y + _focusOffset.y, _focusCenter.y + maxDim * 0.25),
+      _focusCenter.z + _focusOffset.z
+    ];
+    const target: [number, number, number] = [_focusCenter.x, _focusCenter.y, _focusCenter.z];
+    const fov = camera.fov;
+
+    animCam(newPos, target, fov, dur);
+    if (chapter) {
+      chStore.setChapterCamera(chapter, newPos, target, fov);
+    }
+    return true;
+  }
+
+  function setPageTitle(title: string) {
+    const name = title.trim();
+    if (name) document.title = name;
+  }
+
+  function getPresentationCameraDistance(maxDim: number) {
+    const w = viewportEl.value?.clientWidth ?? 800;
+    let mul = 2.2;
+    if (viewOnly.value || isPreviewMode.value) {
+      if (w <= 480) mul = 3.0;
+      else if (w <= 768) mul = 2.6;
+      else mul = 2.4;
+    }
+    const minDist = w <= 480 ? 3.2 : 2.5;
+    let desired = Math.max(maxDim * mul, minDist);
+    if (controls?.maxDistance) {
+      desired = Math.min(desired, controls.maxDistance * 0.88);
+    }
+    return desired;
+  }
+
+  function syncSceneFogAndOrbitLimits() {
+    if (!scene || !controls) return;
+
+    const box = new THREE.Box3();
+    meshes.forEach(group => box.expandByObject(group));
+    let extent = 3;
+    if (!box.isEmpty()) {
+      box.getSize(_focusSize);
+      extent = Math.max(_focusSize.x, _focusSize.y, _focusSize.z, 1);
+    }
+
+    const minOrbit = Math.max(extent * 0.55, 1.5);
+    let maxOrbit = Math.max(extent * 4.2, 14);
+    if (viewOnly.value || isPreviewMode.value) {
+      maxOrbit = Math.min(maxOrbit, Math.max(extent * 3.6, 12));
+    }
+
+    const fogNear = Math.max(minOrbit * 2, SCENE_FOG_NEAR);
+    const minVis = SCENE_FOG_MIN_VISIBILITY_AT_MAX_ORBIT;
+    const fogFar = Math.max((maxOrbit - minVis * fogNear) / (1 - minVis), fogNear + 10, SCENE_FOG_FAR);
+
+    controls.minDistance = minOrbit;
+    controls.maxDistance = maxOrbit;
+
+    if (scene.fog instanceof THREE.Fog) {
+      scene.fog.near = fogNear;
+      scene.fog.far = fogFar;
+    }
+
+    if (camera) {
+      const target = controls.target;
+      const dist = camera.position.distanceTo(target);
+      if (dist > maxOrbit) {
+        const dir = camera.position.clone().sub(target);
+        if (dir.lengthSq() < 1e-6) dir.copy(_defaultCamViewDir);
+        dir.normalize().multiplyScalar(maxOrbit);
+        camera.position.copy(target).add(dir);
+        camera.updateProjectionMatrix();
+      }
+    }
+  }
+
+  function adaptPresentationViewport() {
+    if (!camera || !controls) return;
+    if (!viewOnly.value && !isPreviewMode.value) return;
+    const w = viewportEl.value?.clientWidth ?? 0;
+    if (w <= 0) return;
+    if (viewCameraBaseFov === null) viewCameraBaseFov = camera.fov;
+    const base = viewCameraBaseFov;
+    let fov = base;
+    if (w <= 480) fov = Math.min(72, base + 18);
+    else if (w <= 768) fov = Math.min(64, base + 10);
+    if (Math.abs(camera.fov - fov) > 0.5) {
+      camera.fov = fov;
+      camera.updateProjectionMatrix();
+    }
+
+    const center = getSceneModelCenter();
+    if (!center || meshes.size === 0) {
+      controls.update();
+      return;
+    }
+
+    const box = new THREE.Box3();
+    meshes.forEach(group => box.expandByObject(group));
+    box.getSize(_focusSize);
+    const maxDim = Math.max(_focusSize.x, _focusSize.y, _focusSize.z, 0.4);
+    const minDist = getPresentationCameraDistance(maxDim);
+    const currentDist = camera.position.distanceTo(controls.target);
+    if (currentDist < minDist * 0.92) {
+      const dir = camera.position.clone().sub(controls.target);
+      if (dir.lengthSq() < 1e-6) dir.copy(_defaultCamViewDir);
+      dir.normalize().multiplyScalar(minDist);
+      const newPos: [number, number, number] = [center.x + dir.x, center.y + dir.y, center.z + dir.z];
+      snapCam(newPos, [center.x, center.y, center.z], camera.fov);
+    }
+    syncSceneFogAndOrbitLimits();
+    controls.update();
   }
 
   function bindControlsInteraction() {
@@ -746,8 +951,7 @@ export function useMovieEditor() {
     if (!scene?.fog || !(scene.fog instanceof THREE.Fog)) return;
     const bg = new THREE.Color(bgColorVal.value);
     scene.fog.color.copy(bg);
-    scene.fog.near = SCENE_FOG_NEAR;
-    scene.fog.far = SCENE_FOG_FAR;
+    syncSceneFogAndOrbitLimits();
   }
 
   function applySettings() {
@@ -1071,14 +1275,71 @@ export function useMovieEditor() {
 
   function chapterModelCfg(ch: Chapter, modelId: string) {
     const raw = ch.modelConfigs?.[modelId];
-    if (!raw) return null; // 无配置则保持原状（参考 MovieModelEditor 策略）
+    if (!raw) return null;
     return { ...defaultModelCfg(), ...raw };
+  }
+
+  function resetObject3DToDefaultState(m: Model, obj: THREE.Object3D, isRoot: boolean) {
+    const def = createDefaultModelConfig();
+    if (isRoot) {
+      const bp = obj.userData.basePos || m.basePosition || DEFAULT_MODEL_BASE_POSITION;
+      obj.position.set(bp[0], bp[1], bp[2]);
+      obj.rotation.set(0, 0, 0);
+      obj.scale.setScalar(1);
+    } else {
+      const bp = obj.userData.baseLocalPos || [0, 0, 0];
+      const br = obj.userData.baseLocalRot || [0, 0, 0];
+      const bs = obj.userData.baseLocalScale ?? 1;
+      obj.position.set(bp[0], bp[1], bp[2]);
+      obj.rotation.set(br[0], br[1], br[2]);
+      obj.scale.setScalar(bs);
+    }
+    rebuildOutlineForObject(m, obj, def);
+  }
+
+  function resetModelTreeToDefault(m: Model) {
+    const root = meshes.get(m.id);
+    if (!root) return;
+    resetObject3DToDefaultState(m, root, true);
+    root.traverse(child => {
+      if (child === root) return;
+      if (child.userData?.isEdgeLine || child.userData?.isSelectionHelper) return;
+      if (!child.userData?.nodeId) return;
+      resetObject3DToDefaultState(m, child, false);
+    });
+  }
+
+  function isNodeConfiguredInChapter(cfg: ModelConfig, modelId: string, nodeId: string): boolean {
+    if (!cfg.nodeConfigs) return false;
+    const displayId = resolveDisplayNodeId(getModelHierarchy(modelId), nodeId);
+    return !!(cfg.nodeConfigs[displayId] || cfg.nodeConfigs[nodeId]);
   }
 
   function applyChapterModelVisibility(ch: Chapter) {
     models.value.forEach(m => {
+      const root = meshes.get(m.id);
+      if (!root) return;
       const cfg = chapterModelCfg(ch, m.id);
-      if (cfg) applyMConfig(m, cfg); // 只有存在配置时才应用，否则保持当前状态
+      if (!cfg) {
+        resetModelTreeToDefault(m);
+        return;
+      }
+      applyConfigToObject(m, root, cfg, true);
+      root.traverse(child => {
+        if (child === root) return;
+        if (child.userData?.isEdgeLine || child.userData?.isSelectionHelper) return;
+        const nodeId = child.userData?.nodeId as string | undefined;
+        if (nodeId && !isNodeConfiguredInChapter(cfg, m.id, nodeId)) {
+          resetObject3DToDefaultState(m, child, false);
+        }
+      });
+      if (cfg.nodeConfigs) {
+        for (const [nodeId, nodeCfg] of Object.entries(cfg.nodeConfigs)) {
+          for (const obj of collectObjectsForNodeId(root, nodeId)) {
+            applyConfigToObject(m, obj, { ...defaultModelCfg(), ...nodeCfg }, false);
+          }
+        }
+      }
     });
     invalidatePickMeshCache();
   }
@@ -1088,14 +1349,32 @@ export function useMovieEditor() {
     return typeof sec === "number" && sec > 0 ? sec : CHAPTER_CAMERA_TRANSITION_SEC;
   }
 
+  function resolveChapterCameraFrame(ch: Chapter) {
+    const center = getSceneModelCenter();
+    if (!center) {
+      return { position: ch.camera.position, target: ch.camera.target };
+    }
+    const pos = ch.camera.position;
+    const tgt = ch.camera.target;
+    return {
+      position: [pos[0] - tgt[0] + center.x, pos[1] - tgt[1] + center.y, pos[2] - tgt[2] + center.z] as [
+        number,
+        number,
+        number
+      ],
+      target: [center.x, center.y, center.z] as [number, number, number]
+    };
+  }
+
   function applyChapter(ch: Chapter) {
     applyChapterModelVisibility(ch);
-    animCam(
-      ch.camera.position,
-      ch.camera.target,
-      ch.camera.fov,
-      getChapterCameraTransitionSec(ch)
-    );
+    const frame = resolveChapterCameraFrame(ch);
+    const dur = getChapterCameraTransitionSec(ch);
+    if (viewOnly.value || isPreviewMode.value) {
+      snapCam(frame.position, frame.target, ch.camera.fov);
+    } else {
+      animCam(frame.position, frame.target, ch.camera.fov, dur);
+    }
   }
 
   // ── Model helpers ──
@@ -1123,9 +1402,10 @@ export function useMovieEditor() {
   function onGLTFLoaded(m: Model, gltf: { scene: THREE.Group; animations: THREE.AnimationClip[] }) {
     const root = gltf.scene;
     const origPos = root.position.clone();
+    const basePos = alignLoadedModelToGround(m, root);
     root.userData = {
       modelId: m.id,
-      basePos: [origPos.x, origPos.y, origPos.z],
+      basePos: [...basePos],
       isCustom: true,
       origPosition: [origPos.x, origPos.y, origPos.z],
       animations: gltf.animations
@@ -1147,6 +1427,7 @@ export function useMovieEditor() {
         }
       });
     }
+    syncSceneFogAndOrbitLimits();
   }
 
   function registerModelHierarchy(modelId: string, root: THREE.Object3D, modelDisplayName?: string) {
@@ -1241,6 +1522,29 @@ export function useMovieEditor() {
     return rootCfg.nodeConfigs[displayNodeId];
   }
 
+  function readActiveModelConfig(ch?: Chapter | null): ModelConfig {
+    const model = selModel.value;
+    const defaultCfg = createDefaultModelConfig();
+    if (!model) return defaultCfg;
+    const chapter = ch ?? getActiveChapter();
+    if (!chapter) return defaultCfg;
+    const rootCfg = chapter.modelConfigs?.[model.id] as ModelConfig | undefined;
+    if (!selModelNodeId.value) return rootCfg ? { ...defaultCfg, ...rootCfg } : defaultCfg;
+    const displayNodeId = resolveDisplayNodeId(getModelHierarchy(model.id), selModelNodeId.value);
+    const nodeCfg = rootCfg?.nodeConfigs?.[displayNodeId] ?? rootCfg?.nodeConfigs?.[selModelNodeId.value];
+    return nodeCfg ? { ...defaultCfg, ...nodeCfg } : defaultCfg;
+  }
+
+  function hasActiveModelConfig(ch?: Chapter | null): boolean {
+    const model = selModel.value;
+    const chapter = ch ?? getActiveChapter();
+    if (!model || !chapter) return false;
+    const rootCfg = chapter.modelConfigs?.[model.id] as ModelConfig | undefined;
+    if (!selModelNodeId.value) return !!rootCfg;
+    const displayNodeId = resolveDisplayNodeId(getModelHierarchy(model.id), selModelNodeId.value);
+    return !!(rootCfg?.nodeConfigs?.[displayNodeId] || rootCfg?.nodeConfigs?.[selModelNodeId.value]);
+  }
+
   function configHasAnimation(cfg: ModelConfig): boolean {
     if (cfg.animation && cfg.animConfig?.segments?.length) return true;
     if (cfg.nodeConfigs) {
@@ -1286,6 +1590,16 @@ export function useMovieEditor() {
     );
   }
 
+  function modelNodeHasEdits(modelId: string, nodeId: string): boolean {
+    const ch = getActiveChapter();
+    const nodeConfigs = ch?.modelConfigs?.[modelId]?.nodeConfigs;
+    if (!nodeConfigs) return false;
+    const displayId = resolveDisplayNodeId(getModelHierarchy(modelId), nodeId);
+    const nodeCfg = (nodeConfigs[displayId] ?? nodeConfigs[nodeId]) as ModelConfig | undefined;
+    if (!nodeCfg) return false;
+    return modelHasEditsForConfig(nodeCfg, createDefaultModelConfig());
+  }
+
   function collectChapterAnimTargets(ch: Chapter): Array<{ objs: THREE.Object3D[]; cfg: ModelConfig; liveSegs?: any[] }> {
     const targets: Array<{ objs: THREE.Object3D[]; cfg: ModelConfig; liveSegs?: any[] }> = [];
     if (!ch.modelConfigs) return targets;
@@ -1294,12 +1608,15 @@ export function useMovieEditor() {
       const root = meshes.get(cmid);
       if (!root) continue;
 
+      const rootCfgTyped = rootCfg as ModelConfig;
       const isEditingRoot = selModel.value?.id === cmid && !selModelNodeId.value;
-      targets.push({
-        objs: [root],
-        cfg: rootCfg as ModelConfig,
-        liveSegs: isEditingRoot && animSegments.length > 0 ? animSegments : undefined
-      });
+      if (rootCfgTyped.animation && rootCfgTyped.animConfig?.segments?.length) {
+        targets.push({
+          objs: [root],
+          cfg: rootCfgTyped,
+          liveSegs: isEditingRoot && animSegments.length > 0 ? animSegments : undefined
+        });
+      }
 
       const nodeConfigs = (rootCfg as ModelConfig).nodeConfigs;
       if (!nodeConfigs) continue;
@@ -1313,9 +1630,11 @@ export function useMovieEditor() {
         if (!nodeObjs.length) continue;
         const isEditingNode =
           selModel.value?.id === cmid && resolveDisplayNodeId(tree, selModelNodeId.value ?? "") === displayId;
+        const nodeCfgTyped = ((nodeConfigs[displayId] as ModelConfig) ?? nodeCfg) as ModelConfig;
+        if (!nodeCfgTyped.animation || !nodeCfgTyped.animConfig?.segments?.length) continue;
         targets.push({
           objs: nodeObjs,
-          cfg: (nodeConfigs[displayId] as ModelConfig) ?? nodeCfg,
+          cfg: nodeCfgTyped,
           liveSegs: isEditingNode && animSegments.length > 0 ? animSegments : undefined
         });
       }
@@ -1782,12 +2101,9 @@ export function useMovieEditor() {
     box.getCenter(_focusCenter);
     box.getSize(_focusSize);
     const maxDim = Math.max(_focusSize.x, _focusSize.y, _focusSize.z, 0.4);
+    const distance = getPresentationCameraDistance(maxDim);
 
-    _focusOffset.subVectors(camera.position, controls.target);
-    if (_focusOffset.lengthSq() < 1e-4) {
-      _focusOffset.set(1, 0.65, 1);
-    }
-    _focusOffset.normalize().multiplyScalar(Math.max(maxDim * 2.2, 2.5));
+    _focusOffset.copy(_defaultCamViewDir).multiplyScalar(distance);
 
     const newPos: [number, number, number] = [
       _focusCenter.x + _focusOffset.x,
@@ -1817,6 +2133,7 @@ export function useMovieEditor() {
   }
 
   function pickModelAtViewport(clientX: number, clientY: number): boolean {
+    if (viewOnly.value || isPreviewMode.value) return false;
     controls?.update();
     const target = raycastModelTarget(clientX, clientY);
     if (!target) return false;
@@ -1846,7 +2163,7 @@ export function useMovieEditor() {
     if (!hasAnim) {
       obj.scale.setScalar(cfg.scale || 1);
       if (isRoot) {
-        const bp = obj.userData.basePos || [0, 0.5, 0];
+        const bp = obj.userData.basePos || DEFAULT_MODEL_BASE_POSITION;
         obj.position.set(
           bp[0] + (cfg.posOffset?.[0] || 0),
           bp[1] + (cfg.posOffset?.[1] || 0),
@@ -1883,7 +2200,6 @@ export function useMovieEditor() {
     selectedChapterId.value = chapter.id;
     playingIdx.value = idx;
     syncChapterForm(chapter);
-    syncModelSelectionForChapter(chapter);
   }
 
   async function withChapterNavLock(fn: () => void | Promise<void>) {
@@ -1957,7 +2273,8 @@ export function useMovieEditor() {
         if (cfg.animation && cfg.animConfig?.segments?.length) {
           applyElapsedAnimToObject(obj, cfg, 0, liveSegs);
         } else if (!obj.userData?.nodeId) {
-          obj.position.set(0, 0, 0);
+          const bp = obj.userData.basePos || DEFAULT_MODEL_BASE_POSITION;
+          obj.position.set(bp[0], bp[1], bp[2]);
           obj.rotation.set(0, 0, 0);
           obj.scale.setScalar(1);
         } else {
@@ -2384,6 +2701,7 @@ export function useMovieEditor() {
     pStore.setVideoInfo(url, 0, 0, 0);
     toastShow("视频已导入");
     syncVideoElementSrc(url);
+    void tryLoadPendingModelSet();
     return false;
   }
 
@@ -2554,7 +2872,7 @@ export function useMovieEditor() {
       chapterPlayTarget.value = null;
       videoEl.value.pause();
     }
-    showPlaybackHint();
+    if (!viewOnly.value && !isPreviewMode.value) showPlaybackHint();
   }
 
   function onVideoPlay() {
@@ -2577,24 +2895,53 @@ export function useMovieEditor() {
   }
 
   // ── Animation Helpers (运动段) ──
+  function roundAnimNum(n: number, decimals = 3) {
+    const f = 10 ** decimals;
+    return Math.round(n * f) / f;
+  }
+
+  function getDefaultTransformForAnimTarget(model: Model, nodeId: string | null) {
+    const isRoot = !nodeId;
+    const o = getTransformTarget(model.id, nodeId);
+    if (!o) {
+      const bp = isRoot ? model.basePosition || DEFAULT_MODEL_BASE_POSITION : [0, 0, 0];
+      return { pos: [...bp], scale: 1, rot: [0, 0, 0] };
+    }
+    if (isRoot) {
+      const bp = o.userData.basePos || model.basePosition || DEFAULT_MODEL_BASE_POSITION;
+      return { pos: [roundAnimNum(bp[0]), roundAnimNum(bp[1]), roundAnimNum(bp[2])], scale: 1, rot: [0, 0, 0] };
+    }
+    const bp = o.userData.baseLocalPos || [0, 0, 0];
+    const br = o.userData.baseLocalRot || [0, 0, 0];
+    const bs = o.userData.baseLocalScale ?? 1;
+    return {
+      pos: [roundAnimNum(bp[0]), roundAnimNum(bp[1]), roundAnimNum(bp[2])],
+      scale: roundAnimNum(bs),
+      rot: [
+        roundAnimNum((br[0] * 180) / Math.PI),
+        roundAnimNum((br[1] * 180) / Math.PI),
+        roundAnimNum((br[2] * 180) / Math.PI)
+      ]
+    };
+  }
+
   function createDefaultAnimSegment(model?: Model | null) {
     const m = model ?? selModel.value;
-    const o = m ? getTransformTarget(m.id, selModelNodeId.value) : null;
-    const cp = o ? [o.position.x, o.position.y, o.position.z] : [0, 0.5, 0];
-    const cs = o ? o.scale.x : 1;
-    const cr = o ? [(o.rotation.x * 180) / Math.PI, (o.rotation.y * 180) / Math.PI, (o.rotation.z * 180) / Math.PI] : [0, 0, 0];
+    const { pos, scale, rot } = m
+      ? getDefaultTransformForAnimTarget(m, selModelNodeId.value)
+      : { pos: [...DEFAULT_MODEL_BASE_POSITION], scale: 1, rot: [0, 0, 0] };
     return {
       id: `seg_${++animSegIdCounter}`,
       pauseTime: 0,
       animTime: 3,
       easing: "easeInOut",
       pivot: "center",
-      startPos: [...cp],
-      endPos: [...cp],
-      startScale: cs,
-      endScale: cs,
-      startRot: [...cr],
-      endRot: [...cr],
+      startPos: [...pos],
+      endPos: [...pos],
+      startScale: scale,
+      endScale: scale,
+      startRot: [...rot],
+      endRot: [...rot],
       _expandedPanels: ["start", "end"] as string[]
     };
   }
@@ -3335,6 +3682,7 @@ export function useMovieEditor() {
     await withChapterNavLock(async () => {
       focusChapter(chapter, idx);
       applyChapter(chapter);
+      syncModelSelectionForChapter(chapter);
       video.pause();
       await seekVideoTo(chapter.startTime);
       currentTime.value = video.currentTime;
@@ -3402,6 +3750,255 @@ export function useMovieEditor() {
     if (currProj.value) pStore.updateProject({ title: projectTitle.value } as any);
   }
 
+  function syncProjectTitleToStore() {
+    const title = projectTitle.value.trim() || editSceneToolName.value.trim() || "未命名场景";
+    projectTitle.value = title;
+    if (currProj.value) pStore.updateProject({ title } as any);
+    return title;
+  }
+
+  async function loadEditSceneMeta(code: string) {
+    try {
+      const set = await fetchModelSet(code);
+      editSceneCompanyName.value = set.companyName || "";
+      editSceneToolName.value = set.name || "";
+      if (editSceneToolName.value) setPageTitle(editSceneToolName.value);
+      return set;
+    } catch {
+      return null;
+    }
+  }
+
+  function getModelSourcePath(m: Model): string | null {
+    const sourcePath = (m as any).sourcePath as string | undefined;
+    if (sourcePath) return sourcePath;
+    if (m.url && /^https?:\/\//i.test(m.url)) return m.url;
+    return null;
+  }
+
+  function buildShareLink(code: string) {
+    return buildScenePreviewLink(code);
+  }
+
+  function buildScenePayload() {
+    const proj = currProj.value;
+    if (!proj) return null;
+    return {
+      title: syncProjectTitleToStore(),
+      modelSetCode: modelSetCode.value || undefined,
+      videoSrc: proj.videoSrc,
+      videoDuration: proj.videoDuration,
+      videoWidth: proj.videoWidth,
+      videoHeight: proj.videoHeight,
+      chapters: JSON.parse(JSON.stringify(proj.chapters)),
+      subtitles: JSON.parse(JSON.stringify(proj.subtitles)),
+      models: proj.models.map(m => ({
+        id: m.id,
+        name: m.name,
+        type: m.type,
+        color: m.color,
+        path: getModelSourcePath(m),
+        basePosition: m.basePosition
+      }))
+    };
+  }
+
+  function clearAllEditorModels() {
+    [...meshes.keys()].forEach(id => rmMesh(id));
+    mixers.forEach(m => m.stopAllAction());
+    mixers = [];
+    if (currProj.value) {
+      currProj.value.models = [];
+      currProj.value.chapters = [];
+      currProj.value.subtitles = [];
+      currProj.value.videoSrc = null;
+      currProj.value.videoDuration = 0;
+      currProj.value.videoWidth = 0;
+      currProj.value.videoHeight = 0;
+    }
+    selectedChapterId.value = null;
+    selModelId.value = null;
+    selModelNodeId.value = null;
+    lastSelModelId = null;
+    invalidatePickMeshCache();
+  }
+
+  function applyChapterCameraForLoadedModels() {
+    const ch =
+      selectedChapter.value ??
+      (chapters.value.length > 0 ? chapters.value[0] : null);
+    if (!ch || meshes.size === 0) return;
+    const dur = getChapterCameraTransitionSec(ch);
+    if (isDefaultChapterCamera(ch)) {
+      frameCameraOnSceneModels(dur, ch);
+    } else {
+      applyChapter(ch);
+    }
+    syncChapterForm(ch);
+    nextTick(handleResize);
+  }
+
+  async function loadModelSetByCode(code: string) {
+    if (!currProj.value || modelSetModelsLoaded.value) return;
+    const set = await fetchModelSet(code);
+    modelSetCode.value = set.code;
+    editSceneCompanyName.value = set.companyName || "";
+    editSceneToolName.value = set.name || "";
+    modelSetModelsLoaded.value = true;
+
+    suspendProjectPersist();
+    importingModel.value = true;
+    try {
+      for (const item of set.models || []) {
+        const url = resolveAssetUrl(item.path);
+        const m = mStore.createCustomModel(currProj.value.id, item.name, url);
+        (m as any).sourcePath = item.path;
+        if (Array.isArray(item.basePosition)) m.basePosition = item.basePosition as [number, number, number];
+        await loadGLB(m);
+        if (meshes.has(m.id)) {
+          currProj.value.models.push(m);
+          refreshModelHierarchyIfLoaded(m.id, m.name);
+        }
+      }
+      ensureAllModelMixers();
+      applyChapterCameraForLoadedModels();
+    } finally {
+      importingModel.value = false;
+      resumeProjectPersist();
+    }
+  }
+
+  async function tryLoadPendingModelSet() {
+    const code = pendingModelSetCode.value;
+    if (!code || viewOnly.value || !hasVideo.value || !currProj.value || modelSetModelsLoaded.value) return;
+    pendingModelSetCode.value = null;
+    await loadModelSetByCode(code);
+  }
+
+  async function applyFetchedSceneData(sceneData: any, code: string) {
+    const proj = currProj.value || pStore.createProject(sceneData.title || "未命名场景");
+    projectTitle.value = sceneData.title || proj.title;
+    proj.title = projectTitle.value;
+    if (viewOnly.value) {
+      setPageTitle(projectTitle.value);
+      viewCameraBaseFov = null;
+    }
+    sceneCode.value = sceneData.code || code;
+    modelSetCode.value = sceneData.modelSetCode || null;
+    modelSetModelsLoaded.value = true;
+    pendingModelSetCode.value = null;
+    shareLink.value = sceneData.previewUrl
+      ? rewireEditorFrontendHost(sceneData.previewUrl)
+      : buildShareLink(sceneData.code || code);
+    proj.videoSrc = sceneData.videoSrc ? rewireEditorServerHost(sceneData.videoSrc) : null;
+    proj.videoDuration = sceneData.videoDuration || 0;
+    proj.videoWidth = sceneData.videoWidth || 0;
+    proj.videoHeight = sceneData.videoHeight || 0;
+    proj.chapters = Array.isArray(sceneData.chapters) ? sceneData.chapters : [];
+    proj.subtitles = Array.isArray(sceneData.subtitles) ? sceneData.subtitles : [];
+    proj.models = [];
+
+    for (const item of sceneData.models || []) {
+      if (!item.path) continue;
+      const url = resolveAssetUrl(item.path);
+      const m = mStore.createCustomModel(proj.id, item.name, url);
+      (m as any).sourcePath = item.path;
+      if (Array.isArray(item.basePosition)) m.basePosition = item.basePosition;
+      await loadGLB(m);
+      if (meshes.has(m.id)) {
+        proj.models.push(m);
+        refreshModelHierarchyIfLoaded(m.id, m.name);
+      }
+    }
+  }
+
+  async function syncEditorAfterSceneLoad() {
+    if (videoSrc.value) syncVideoElementSrc();
+    if (chapters.value.length > 0) {
+      const ch = chapters.value[0];
+      selectedChapterId.value = ch.id;
+      if (meshes.size > 0 && isDefaultChapterCamera(ch)) {
+        frameCameraOnSceneModels(getChapterCameraTransitionSec(ch), ch);
+      } else {
+        applyChapter(ch);
+      }
+      syncChapterForm(ch);
+      syncModelSelectionForChapter(ch);
+      resetChapterModelsToStart(ch);
+    }
+    if (videoEl.value) {
+      videoEl.value.pause();
+      videoEl.value.currentTime = 0;
+    }
+    currentTime.value = 0;
+    syncVideoAudioState();
+    nextTick(adaptPresentationViewport);
+  }
+
+  async function loadSceneByCode(code: string): Promise<"ok" | "not-found" | "error"> {
+    try {
+      clearAllEditorModels();
+      const sceneData = await fetchScene(code);
+      await applyFetchedSceneData(sceneData, code);
+      await syncEditorAfterSceneLoad();
+      return "ok";
+    } catch (e: any) {
+      if (e?.status === 404) return "not-found";
+      toastShow("加载场景失败: " + (e?.message || "未知错误"), "error");
+      return "error";
+    }
+  }
+
+  async function loadSceneForEdit(code: string): Promise<boolean> {
+    try {
+      clearAllEditorModels();
+      const sceneData = await fetchScene(code);
+      await applyFetchedSceneData(sceneData, code);
+      await syncEditorAfterSceneLoad();
+      isPreviewMode.value = false;
+      await nextTick();
+      handleResize();
+      return true;
+    } catch (e: any) {
+      toastShow("加载场景失败: " + (e?.message || "未知错误"), "error");
+      return false;
+    }
+  }
+
+  async function saveSceneToServer() {
+    if (!currProj.value || chapters.value.length === 0) {
+      toastShow("请先创建至少一个节点", "warning");
+      return null;
+    }
+    const payload = buildScenePayload();
+    if (!payload) return null;
+    savingScene.value = true;
+    try {
+      if (currProj.value.videoSrc?.startsWith("blob:")) {
+        const r = await fetch(currProj.value.videoSrc);
+        const b = await r.blob();
+        const ext = (b.type.split("/")[1] || "mp4").replace(/[^a-z0-9]/gi, "").toLowerCase();
+        const uploaded = await uploadSceneVideo(new File([b], `scene-video.${ext}`, { type: b.type || "video/mp4" }));
+        currProj.value.videoSrc = uploaded.url;
+        payload.videoSrc = uploaded.url;
+        syncVideoElementSrc(uploaded.url);
+      }
+      const result = sceneCode.value
+        ? await updateSceneOnBackend(sceneCode.value, payload)
+        : await saveSceneToBackend(payload);
+      sceneCode.value = result.code;
+      shareLink.value = result.previewUrl ? rewireEditorFrontendHost(result.previewUrl) : buildShareLink(result.code);
+      sceneListVersion.value += 1;
+      toastShow(sceneCode.value ? "场景已保存" : "场景已创建", "success");
+      return result;
+    } catch (e: any) {
+      toastShow("保存失败: " + (e?.message || "未知错误"), "error");
+      return null;
+    } finally {
+      savingScene.value = false;
+    }
+  }
+
   // Chapters
   async function selectChapter(ch: Chapter) {
     const resolved = resolveChapter(ch);
@@ -3411,6 +4008,7 @@ export function useMovieEditor() {
     await withChapterNavLock(async () => {
       focusChapter(chapter, idx);
       applyChapter(chapter);
+      syncModelSelectionForChapter(chapter);
       if (videoEl.value) await seekVideoTo(chapter.startTime);
     });
 
@@ -3647,12 +4245,13 @@ export function useMovieEditor() {
     chForm.name = ch.name;
     chForm.startTime = ch.startTime;
     chForm.endTime = ch.endTime;
-    camP[0] = ch.camera.position[0];
-    camP[1] = ch.camera.position[1];
-    camP[2] = ch.camera.position[2];
-    camT[0] = ch.camera.target[0];
-    camT[1] = ch.camera.target[1];
-    camT[2] = ch.camera.target[2];
+    const frame = resolveChapterCameraFrame(ch);
+    camP[0] = frame.position[0];
+    camP[1] = frame.position[1];
+    camP[2] = frame.position[2];
+    camT[0] = frame.target[0];
+    camT[1] = frame.target[1];
+    camT[2] = frame.target[2];
     camFov.value = ch.camera.fov;
     camTransitionSec.value = ch.camera.transitionSec ?? CHAPTER_CAMERA_TRANSITION_SEC;
     chapterFormRevision.value++;
@@ -3768,7 +4367,9 @@ export function useMovieEditor() {
           (introPresentationChapterId
             ? (sortedChapters.value.find(c => c.id === introPresentationChapterId) ?? getActiveChapter())
             : getActiveChapter());
-        if (restoreChapter) restoreModelOutlines(restoreChapter);
+        if (restoreChapter && !viewOnly.value && !isPreviewMode.value) {
+          restoreModelOutlines(restoreChapter);
+        }
       }
       introPresentationPlaying = false;
       introPresentationChapterId = null;
@@ -3782,7 +4383,7 @@ export function useMovieEditor() {
         labels.push({ modelId: editingModel.id, text: editingIntro, x: 0, y: 0 });
       }
       // 编辑态不强制改 outline/highlight，避免打扰编辑视图
-    } else {
+    } else if (!viewOnly.value && !isPreviewMode.value) {
       for (const m of models.value) {
         if (!chapter.modelConfigs?.[m.id]) continue;
         const cfg = getModelConfig(chapter.modelConfigs[m.id]);
@@ -3795,6 +4396,14 @@ export function useMovieEditor() {
       for (const m of models.value) {
         if (labels.some(label => label.modelId === m.id)) continue;
         rebuildOutline(m, chapterModelCfg(chapter, m.id));
+      }
+    } else {
+      for (const m of models.value) {
+        if (!chapter.modelConfigs?.[m.id]) continue;
+        const cfg = getModelConfig(chapter.modelConfigs[m.id]);
+        const intro = cfg.intro?.trim();
+        if (!intro || !cfg.visible) continue;
+        labels.push({ modelId: m.id, text: intro, x: 0, y: 0 });
       }
     }
 
@@ -3913,13 +4522,11 @@ export function useMovieEditor() {
       return;
     }
 
-    if (!activeChapter.modelConfigs) activeChapter.modelConfigs = {};
-
-    const cfg = getActiveModelConfig(activeChapter);
+    const cfg = readActiveModelConfig(activeChapter);
     applyModelConfigToEditor(cfg);
 
     const target = getTransformTarget(model.id, selModelNodeId.value);
-    if (target) {
+    if (target && hasActiveModelConfig(activeChapter)) {
       applyConfigToObject(model, target, cfg, !selModelNodeId.value);
     }
     modelFormRevision.value++;
@@ -4141,7 +4748,7 @@ export function useMovieEditor() {
         const mesh = meshes.get(m.id);
         if (mesh) {
           cfg.visible = mesh.visible;
-          const bp = mesh.userData.basePos || [0, 0.5, 0];
+          const bp = mesh.userData.basePos || DEFAULT_MODEL_BASE_POSITION;
           cfg.posOffset = [mesh.position.x - bp[0], mesh.position.y - bp[1], mesh.position.z - bp[2]];
           cfg.scale = mesh.scale.x;
         }
@@ -4188,8 +4795,11 @@ export function useMovieEditor() {
       return;
     }
     controls.update();
+    const center = getSceneModelCenter();
     const position: [number, number, number] = [camera.position.x, camera.position.y, camera.position.z];
-    const target: [number, number, number] = [controls.target.x, controls.target.y, controls.target.z];
+    const target: [number, number, number] = center
+      ? [center.x, center.y, center.z]
+      : [controls.target.x, controls.target.y, controls.target.z];
     const fov = camera.fov;
     chStore.setChapterCamera(ch, position, target, fov);
     if (!selectedChapterId.value) {
@@ -4210,7 +4820,8 @@ export function useMovieEditor() {
   function previewCam() {
     if (selectedChapter.value) {
       const ch = selectedChapter.value;
-      animCam(ch.camera.position, ch.camera.target, ch.camera.fov, getChapterCameraTransitionSec(ch));
+      const frame = resolveChapterCameraFrame(ch);
+      animCam(frame.position, frame.target, ch.camera.fov, getChapterCameraTransitionSec(ch));
       toastShow("正在预览镜头: " + ch.name, "success");
     }
   }
@@ -4582,7 +5193,7 @@ export function useMovieEditor() {
             target.position.set(bp[0] + mOff[0], bp[1] + mOff[1], bp[2] + mOff[2]);
           }
         } else if (root) {
-          const bp = root.userData.basePos || [0, 0.5, 0];
+          const bp = root.userData.basePos || DEFAULT_MODEL_BASE_POSITION;
           root.position.set(bp[0] + mOff[0], bp[1] + mOff[1], bp[2] + mOff[2]);
         }
         cfg.posOffset = [mOff[0], mOff[1], mOff[2]];
@@ -4697,6 +5308,7 @@ export function useMovieEditor() {
 
   // 预览模式
   function togglePreview() {
+    if (viewOnly.value) return;
     if (!hasVideo.value || chapters.value.length === 0) {
       toastShow("请先上传视频并创建节点", "warning");
       return;
@@ -4726,7 +5338,7 @@ export function useMovieEditor() {
       e.preventDefault();
       if (hasChapters.value) nextCh();
     }
-    if (e.code === "Escape" && isPreviewMode.value) {
+    if (e.code === "Escape" && isPreviewMode.value && !viewOnly.value) {
       togglePreview();
     }
   }
@@ -4741,10 +5353,15 @@ export function useMovieEditor() {
     camera.updateProjectionMatrix();
     renderer.setSize(w, h);
     if (composer) composer.setSize(w, h);
+    if (viewOnly.value || isPreviewMode.value) adaptPresentationViewport();
   }
 
   watch(isPreviewMode, () => {
     syncVideoAudioState();
+    nextTick(() => {
+      handleResize();
+      adaptPresentationViewport();
+    });
   });
 
   watch([selModelId, selectedChapterId], (_vals, oldVals) => {
@@ -4783,24 +5400,72 @@ export function useMovieEditor() {
 
   // Lifecycle
   onMounted(async () => {
-    pStore.clearInvalidVideoData();
+    const queryCode = (route.query.code as string) || "";
+    const isViewMode = (route.query.mode as string) === "view" && !!queryCode;
+    const routeProjectId = (route.query.id as string) || "";
 
-    const pid = route.query.id as string;
-    if (pid) {
-      const p = pStore.projects.find(p => p.id === pid);
-      if (p) {
-        pStore.setCurrentProject(p as any);
+    if (isViewMode) {
+      viewOnly.value = true;
+      isPreviewMode.value = true;
+      const p = pStore.createProject("");
+      projectTitle.value = p.title;
+      await nextTick();
+      init3D();
+      const result = await loadSceneByCode(queryCode);
+      if (result === "not-found") {
+        await router.replace("/404");
+        return;
+      }
+      viewCameraBaseFov = camera?.fov ?? null;
+      adaptPresentationViewport();
+      routeGateLoading.value = false;
+      handleResize();
+      window.addEventListener("resize", handleResize);
+      if (timelineChapters.value.length > 0) void startChapterPlayback(timelineChapters.value[0]);
+      return;
+    }
+
+    const editMeta = queryCode ? await loadEditSceneMeta(queryCode) : null;
+    const defaultTitle = editMeta?.name?.trim() || "演示项目";
+
+    if (queryCode) {
+      modelSetCode.value = queryCode;
+      pendingModelSetCode.value = queryCode;
+      modelSetModelsLoaded.value = false;
+      sceneCode.value = null;
+      shareLink.value = "";
+
+      const existing = routeProjectId ? (pStore.projects.find(p => p.id === routeProjectId) as any) : null;
+      const canReuse = existing && !existing.videoSrc && (existing.chapters?.length || 0) === 0 && (existing.models?.length || 0) === 0;
+      if (canReuse) {
+        pStore.setCurrentProject(existing as any);
+        projectTitle.value = defaultTitle;
+        existing.title = defaultTitle;
+      } else {
+        pStore.clearCurrentProject();
+        const p = pStore.createProject(defaultTitle);
+        projectTitle.value = defaultTitle;
+        if (routeProjectId !== p.id) await router.replace({ query: { code: queryCode, id: p.id } });
+      }
+      setPageTitle(defaultTitle);
+    } else {
+      pStore.clearInvalidVideoData();
+      if (routeProjectId) {
+        const p = pStore.projects.find(p => p.id === routeProjectId);
+        if (p) {
+          pStore.setCurrentProject(p as any);
+          projectTitle.value = p.title;
+        }
+      }
+      if (!currProj.value) {
+        const p = pStore.createProject(defaultTitle);
         projectTitle.value = p.title;
+        await router.replace({ query: { id: p.id } });
       }
     }
-    if (!currProj.value) {
-      const p = pStore.createProject("演示项目");
-      projectTitle.value = p.title;
-      router.replace({ query: { id: p.id } });
-    }
 
+    routeGateLoading.value = false;
     pStore.clearInvalidVideoData();
-
     await nextTick();
     init3D();
 
@@ -4823,8 +5488,12 @@ export function useMovieEditor() {
 
     if (chapters.value.length > 0) {
       selectedChapterId.value = chapters.value[0].id;
-      applyChapter(chapters.value[0]);
-      syncChapterForm(chapters.value[0]);
+      if (meshes.size > 0) {
+        applyChapterCameraForLoadedModels();
+      } else {
+        applyChapter(chapters.value[0]);
+        syncChapterForm(chapters.value[0]);
+      }
       syncModelSelectionForChapter(chapters.value[0]);
     }
 
@@ -4917,6 +5586,7 @@ export function useMovieEditor() {
     hierarchyRevision,
     getModelHierarchy,
     modelHasEdits,
+    modelNodeHasEdits,
     pickOnlyVisible,
     togglePickOnlyVisible,
     selectModelNode,
@@ -4930,8 +5600,16 @@ export function useMovieEditor() {
     displaySubtitle,
     tooltipText,
     isPreviewMode,
+    viewOnly,
+    routeGateLoading,
     rightTab,
     videoFps,
+    modelSetCode,
+    pendingModelSetCode,
+    sceneCode,
+    shareLink,
+    savingScene,
+    sceneListVersion,
     chapterFormRevision,
     chForm,
     subForm,
@@ -5090,6 +5768,9 @@ export function useMovieEditor() {
     editSub,
     delSub,
     doExport,
+    saveSceneToServer,
+    loadSceneByCode,
+    loadSceneForEdit,
     togglePreview,
     onKey,
     onMeta,

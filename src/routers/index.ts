@@ -38,9 +38,11 @@ router.beforeEach(async (to, from, next) => {
   // 1.NProgress 开始
   NProgress.start();
 
-  // 2.动态设置标题
+  // 2.动态设置标题（编辑器页由路由守卫 / useMovieEditor 自行设置，避免闪烁）
   const title = import.meta.env.VITE_GLOB_APP_TITLE;
-  document.title = to.meta.title ? `${to.meta.title} - ${title}` : title;
+  if (to.path !== "/project/editor") {
+    document.title = to.meta.title ? `${to.meta.title} - ${title}` : title;
+  }
 
   if (to.path === "/") return next("/project/editor");
 

@@ -1,7 +1,7 @@
 import { defineStore } from "pinia";
 
 import type { Model, ModelType } from "@/interface/project";
-import { PRIMITIVE_TYPES } from "@/utils/three/constants";
+import { DEFAULT_MODEL_BASE_POSITION, PRIMITIVE_TYPES } from "@/utils/three/constants";
 
 import piniaPersistConfig from "../helper/persist";
 
@@ -36,7 +36,7 @@ export const useModelStore = defineStore("model", {
         type,
         color: config?.defaultColor || "#5b8def",
         groundY: 0,
-        basePosition: [0, 0.5, 0],
+        basePosition: [...DEFAULT_MODEL_BASE_POSITION],
         createdAt: now,
         updatedAt: now
       };
@@ -56,7 +56,7 @@ export const useModelStore = defineStore("model", {
         file,
         glbData,
         groundY: 0,
-        basePosition: [0, 0.5, 0],
+        basePosition: [...DEFAULT_MODEL_BASE_POSITION],
         createdAt: now,
         updatedAt: now
       };

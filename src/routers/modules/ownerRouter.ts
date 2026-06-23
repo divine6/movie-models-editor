@@ -1,3 +1,5 @@
+import { editorCodeRouteGuard } from "@/utils/editorRouteGuard";
+
 /***
  * 菜单路由
  * @description 菜单路由
@@ -44,6 +46,7 @@ export const ownerRouter = [
           activeMenu: "/project/index",
           localeKey: "OpWeb.Project.Editor"
         },
+        beforeEnter: editorCodeRouteGuard,
         component: () => import("@/views/project/editor.vue")
       }
     ]

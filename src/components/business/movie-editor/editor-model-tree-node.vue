@@ -24,6 +24,7 @@
       <span v-else class="tree-toggle-placeholder" />
       <span class="tree-node-icon">{{ typeIcon }}</span>
       <span class="tree-node-name" :title="node.path">{{ node.name }}</span>
+      <span v-if="editor.modelNodeHasEdits(node.modelId, node.id)" class="edited-badge" title="该节点在此章节已编辑过">已改</span>
       <span v-if="node.mergedNodeIds && node.mergedNodeIds.length > 1 && !node.materialGroupHost" class="tree-node-merged" title="同几何体多材质合并">×{{ node.mergedNodeIds.length }}</span>
       <span class="tree-node-type">{{ typeLabel }}</span>
     </div>

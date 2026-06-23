@@ -57,10 +57,13 @@
         v-show="editor.showVideoPip"
         ref="pipGroupRef"
         class="pip-group"
-        :class="{ 'is-dragging': pipDragging, 'is-resizing': pipResizing }"
+        :class="{
+          'is-dragging': pipDragging,
+          'is-resizing': pipResizing,
+          'pip-group--view-fixed': editor.viewOnly
+        }"
         :style="pipStyle"
         @mousedown="onPipDragStart"
-        @click.stop
       >
         <div class="video-pip">
           <video
@@ -75,9 +78,18 @@
             @ended="editor.onVideoEnd"
             @error="editor.onVideoErr"
           />
-          <button class="video-pip-del" type="button" @mousedown.stop @click="editor.removeVideo" title="移除视频">✕</button>
+          <button
+            v-if="!editor.viewOnly"
+            class="video-pip-del"
+            type="button"
+            @mousedown.stop
+            @click="editor.removeVideo"
+            title="移除视频"
+          >
+            ✕
+          </button>
         </div>
-        <div class="video-info-bar">
+        <div v-if="!editor.viewOnly" class="video-info-bar">
           <span class="vi-item">
             <span class="vi-label">{{ $t("OpWeb.Editor.Duration", "时长") }}</span>
             <span class="vi-value">{{ editor.fmt(editor.duration) }}</span>
@@ -91,11 +103,11 @@
             <span class="vi-value">{{ editor.videoFps }}fps</span>
           </span>
         </div>
-        <div class="pip-resize-handle" title="缩放" @mousedown.stop="onPipResizeStart" />
+        <div v-if="!editor.viewOnly" class="pip-resize-handle" title="缩放" @mousedown.stop="onPipResizeStart" />
       </div>
     </div>
 
-    <div v-if="editor.hasVideo" class="progress-area" :class="{ 'preview-progress': editor.isPreviewMode }">
+    <div v-if="editor.hasVideo" class="progress-area" :class="{ 'preview-progress': editor.isPreviewMode }" @click.stop>
       <div :ref="editor.bindRef('trackEl')" class="progress-track progress-track--chapters" @click="editor.seekTrack">
         <div class="prog-segs">
           <div
@@ -190,11 +202,16 @@ function onViewportDblClick(e: MouseEvent) {
   editor.togglePlay();
 }
 
-const pipStyle = computed(() => ({
-  left: `${pipLeft.value}px`,
-  top: `${pipTop.value}px`,
-  width: `${pipWidth.value}px`
-}));
+const pipPresentationMode = computed(() => editor.viewOnly || editor.isPreviewMode);
+
+const pipStyle = computed(() => {
+  const style: Record<string, string> = { width: `${pipWidth.value}px` };
+  if (!pipPresentationMode.value) {
+    style.left = `${pipLeft.value}px`;
+    style.top = `${pipTop.value}px`;
+  }
+  return style;
+});
 
 function clamp(value: number, min: number, max: number) {
   return Math.min(Math.max(value, min), max);
@@ -214,13 +231,31 @@ function clampPipBounds() {
   pipTop.value = clamp(pipTop.value, 0, maxTop);
 }
 
+function resolvePipWidth(viewportWidth: number, presentation: boolean) {
+  if (presentation) {
+    if (viewportWidth <= 480) return Math.max(100, Math.round(viewportWidth * 0.3));
+    if (viewportWidth <= 768) return Math.max(120, Math.round(viewportWidth * 0.32));
+    return Math.min(168, Math.max(140, Math.round(viewportWidth * 0.22)));
+  }
+  if (viewportWidth <= 640) return 160;
+  return PIP_DEFAULT_WIDTH;
+}
+
 function placePipToRight(resetWidth = false) {
   const viewport = editor.viewportEl;
   if (!viewport) return;
-  if (resetWidth) pipWidth.value = PIP_DEFAULT_WIDTH;
-  pipLeft.value = Math.max(10, viewport.clientWidth - pipWidth.value - 10);
-  pipTop.value = 10;
-  requestAnimationFrame(clampPipBounds);
+  const presentation = editor.viewOnly || editor.isPreviewMode;
+  if (resetWidth) pipWidth.value = resolvePipWidth(viewport.clientWidth, presentation);
+  if (!presentation) {
+    const inset = resolvePipInset(viewport.clientWidth);
+    pipLeft.value = Math.max(inset.right, viewport.clientWidth - pipWidth.value - inset.right);
+    pipTop.value = inset.top;
+    requestAnimationFrame(clampPipBounds);
+  }
+}
+
+function resolvePipInset(viewportWidth: number) {
+  return { top: 10, right: 10 };
 }
 
 function placePipDefault() {
@@ -228,6 +263,7 @@ function placePipDefault() {
 }
 
 function onPipDragStart(e: MouseEvent) {
+  if (editor.viewOnly) return;
   if (e.button !== 0) return;
   const target = e.target as HTMLElement;
   if (target.closest(".video-pip-del, .pip-resize-handle")) return;
@@ -266,6 +302,7 @@ function onPipDragStart(e: MouseEvent) {
 }
 
 function onPipResizeStart(e: MouseEvent) {
+  if (editor.viewOnly) return;
   if (e.button !== 0) return;
 
   const viewport = editor.viewportEl;
@@ -306,10 +343,13 @@ let viewportObserver: ResizeObserver | null = null;
 
 onMounted(() => {
   nextTick(() => {
-    placePipDefault();
+    placePipToRight(editor.viewOnly);
     const viewport = editor.viewportEl;
     if (viewport) {
-      viewportObserver = new ResizeObserver(() => clampPipBounds());
+      viewportObserver = new ResizeObserver(() => {
+        if (editor.viewOnly) placePipToRight();
+        else clampPipBounds();
+      });
       viewportObserver.observe(viewport);
     }
   });
@@ -322,7 +362,7 @@ onUnmounted(() => {
 watch(
   () => editor.hasVideo,
   hasVideo => {
-    if (hasVideo) nextTick(placePipDefault);
+    if (hasVideo) nextTick(() => placePipToRight(editor.viewOnly));
   }
 );
 
@@ -331,8 +371,16 @@ watch(
   isPreview => {
     if (!isPreview || !editor.hasVideo) return;
     nextTick(() => {
-      setTimeout(() => placePipToRight(), 120);
+      setTimeout(() => placePipToRight(true), 120);
     });
+  }
+);
+
+watch(
+  () => editor.viewOnly,
+  viewOnly => {
+    if (!viewOnly || !editor.hasVideo) return;
+    nextTick(() => placePipToRight(true));
   }
 );
 </script>

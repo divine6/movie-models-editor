@@ -1,8 +1,8 @@
 <template>
   <div
     class="movie-editor"
-    :class="{ 'preview-mode': editor.isPreviewMode }"
-    tabindex="0"
+    :class="{ 'preview-mode': editor.isPreviewMode, 'view-only-route': editor.viewOnly }"
+    :tabindex="editor.viewOnly ? -1 : 0"
     :ref="editor.bindRef('rootEl')"
     @keydown="editor.onKey"
   >
@@ -27,9 +27,15 @@
 
     <editor-overlays />
   </div>
+
+  <div v-if="editor.routeGateLoading" class="editor-route-gate">
+    <el-icon class="is-loading" :size="32"><Loading /></el-icon>
+    <span>加载中...</span>
+  </div>
 </template>
 
 <script setup lang="ts" name="project-editor">
+import { Loading } from "@element-plus/icons-vue";
 import { provide } from "vue";
 
 import EditorChapterList from "@/components/business/movie-editor/editor-chapter-list.vue";
@@ -46,4 +52,18 @@ provide(MOVIE_EDITOR_KEY, editor);
 <!-- 样式嵌套在 .movie-editor 下，不加 scoped 以便子组件继承 -->
 <style lang="scss">
 @use "@/components/business/movie-editor/editor-styles.scss";
+
+.editor-route-gate {
+  position: fixed;
+  inset: 0;
+  z-index: 3000;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  background: #fff;
+  color: var(--text-color-2);
+  font-size: 14px;
+}
 </style>

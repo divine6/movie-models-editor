@@ -11,6 +11,7 @@
           size="small"
           class="seg-input-num"
           @input="onLive"
+          @change="onLive"
         />
       </div>
       <label class="seg-transform-label">{{ $t("OpWeb.Editor.PosOffsetY", "位置 Y") }}</label>
@@ -23,6 +24,7 @@
           size="small"
           class="seg-input-num"
           @input="onLive"
+          @change="onLive"
         />
       </div>
       <label class="seg-transform-label">{{ $t("OpWeb.Editor.PosOffsetZ", "位置 Z") }}</label>
@@ -35,6 +37,7 @@
           size="small"
           class="seg-input-num"
           @input="onLive"
+          @change="onLive"
         />
       </div>
     </div>
@@ -52,6 +55,7 @@
           size="small"
           class="seg-input-num"
           @input="onLive"
+          @change="onLive"
         />
       </div>
     </div>
@@ -69,6 +73,7 @@
           size="small"
           class="seg-input-num"
           @input="onRot"
+          @change="onRot"
         />
       </div>
       <label class="seg-transform-label">{{ $t("OpWeb.Editor.RotY", "旋转 Y") }}</label>
@@ -83,6 +88,7 @@
           size="small"
           class="seg-input-num"
           @input="onRot"
+          @change="onRot"
         />
       </div>
       <label class="seg-transform-label">{{ $t("OpWeb.Editor.RotZ", "旋转 Z") }}</label>
@@ -97,6 +103,7 @@
           size="small"
           class="seg-input-num"
           @input="onRot"
+          @change="onRot"
         />
       </div>
     </div>
@@ -104,7 +111,7 @@
 </template>
 
 <script setup lang="ts" name="editor-segment-transform">
-import { computed } from "vue";
+import { computed, watch } from "vue";
 
 import { useMovieEditorContext } from "@/composables/useMovieEditorContext";
 import { useTranslate } from "@/hooks/useTranslate";
@@ -130,4 +137,23 @@ const onRot = () => {
   editor.focusSegTransform(props.seg, props.mode);
   editor.onRotChange(props.seg, props.mode);
 };
+
+watch(
+  () => {
+    const pk = props.mode === "start" ? "startPos" : "endPos";
+    const sk = props.mode === "start" ? "startScale" : "endScale";
+    return [props.seg[pk], props.seg[sk]];
+  },
+  () => onLive(),
+  { deep: true }
+);
+
+watch(
+  () => {
+    const rk = props.mode === "start" ? "startRot" : "endRot";
+    return props.seg[rk];
+  },
+  () => onRot(),
+  { deep: true }
+);
 </script>

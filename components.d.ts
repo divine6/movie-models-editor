@@ -28,6 +28,7 @@ declare module 'vue' {
     EditorModelConfig: typeof import('./src/components/business/movie-editor/editor-model-config.vue')['default']
     EditorModelTreeNode: typeof import('./src/components/business/movie-editor/editor-model-tree-node.vue')['default']
     EditorOverlays: typeof import('./src/components/business/movie-editor/editor-overlays.vue')['default']
+    EditorSceneListDrawer: typeof import('./src/components/business/movie-editor/editor-scene-list-drawer.vue')['default']
     EditorScenePanel: typeof import('./src/components/business/movie-editor/editor-scene-panel.vue')['default']
     EditorSegmentTransform: typeof import('./src/components/business/movie-editor/editor-segment-transform.vue')['default']
     EditorSubtitlePanel: typeof import('./src/components/business/movie-editor/editor-subtitle-panel.vue')['default']
@@ -42,9 +43,11 @@ declare module 'vue' {
     ElColorPicker: typeof import('element-plus/es')['ElColorPicker']
     ElContainer: typeof import('element-plus/es')['ElContainer']
     ElDialog: typeof import('element-plus/es')['ElDialog']
+    ElDrawer: typeof import('element-plus/es')['ElDrawer']
     ElDropdown: typeof import('element-plus/es')['ElDropdown']
     ElDropdownItem: typeof import('element-plus/es')['ElDropdownItem']
     ElDropdownMenu: typeof import('element-plus/es')['ElDropdownMenu']
+    ElEmpty: typeof import('element-plus/es')['ElEmpty']
     ElHeader: typeof import('element-plus/es')['ElHeader']
     ElIcon: typeof import('element-plus/es')['ElIcon']
     ElInput: typeof import('element-plus/es')['ElInput']
@@ -57,6 +60,8 @@ declare module 'vue' {
     ElSlider: typeof import('element-plus/es')['ElSlider']
     ElSpace: typeof import('element-plus/es')['ElSpace']
     ElSwitch: typeof import('element-plus/es')['ElSwitch']
+    ElTable: typeof import('element-plus/es')['ElTable']
+    ElTableColumn: typeof import('element-plus/es')['ElTableColumn']
     ElTooltip: typeof import('element-plus/es')['ElTooltip']
     ElWatermark: typeof import('element-plus/es')['ElWatermark']
     Grid: typeof import('./src/components/common/grid/index.vue')['default']
@@ -72,5 +77,8 @@ declare module 'vue' {
     UpdatePassword: typeof import('./src/components/business/update-password/index.vue')['default']
     UpdateVersion: typeof import('./src/components/common/update-version/index.vue')['default']
     WangEditor: typeof import('./src/components/common/wang-editor/index.vue')['default']
+  }
+  export interface ComponentCustomProperties {
+    vLoading: typeof import('element-plus/es')['ElLoadingDirective']
   }
 }

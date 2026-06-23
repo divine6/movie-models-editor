@@ -89,6 +89,7 @@ export interface Model {
   type: ModelType;
   color: string;
   url?: string; // GLB Blob URL
+  sourcePath?: string; // 后端模型相对路径，用于保存场景后复原
   file?: File; // 原始文件引用（本地上传时）
   glbData?: ArrayBuffer; // 原始 GLB 数据（用于导出）
   groundY: number; // 自动计算的地面位置
