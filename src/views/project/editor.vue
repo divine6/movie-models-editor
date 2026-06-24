@@ -36,7 +36,7 @@
 
 <script setup lang="ts" name="project-editor">
 import { Loading } from "@element-plus/icons-vue";
-import { provide } from "vue";
+import { provide as vueProvide } from "vue";
 
 import EditorChapterList from "@/components/business/movie-editor/editor-chapter-list.vue";
 import EditorConfigPanel from "@/components/business/movie-editor/editor-config-panel.vue";
@@ -44,9 +44,11 @@ import EditorHeader from "@/components/business/movie-editor/editor-header.vue";
 import EditorOverlays from "@/components/business/movie-editor/editor-overlays.vue";
 import EditorViewport from "@/components/business/movie-editor/editor-viewport.vue";
 import { MOVIE_EDITOR_KEY, useMovieEditor } from "@/composables/useMovieEditor";
+import { providePreviewChapterDrawer } from "@/composables/usePreviewChapterDrawer";
 
 const editor = useMovieEditor();
-provide(MOVIE_EDITOR_KEY, editor);
+vueProvide(MOVIE_EDITOR_KEY, editor);
+providePreviewChapterDrawer();
 </script>
 
 <!-- 样式嵌套在 .movie-editor 下，不加 scoped 以便子组件继承 -->

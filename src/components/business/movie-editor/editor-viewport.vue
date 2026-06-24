@@ -3,7 +3,7 @@
     <div
       :ref="editor.bindRef('viewportEl')"
       class="viewport"
-      :class="{ 'viewport--interactive': editor.hasVideo }"
+      :class="{ 'viewport--interactive': editor.isPreviewMode && editor.hasVideo }"
       @dblclick="onViewportDblClick"
     >
       <div :ref="editor.bindRef('subEl')" class="viewport-subtitle" v-show="editor.displaySubtitle" />
@@ -39,7 +39,20 @@
           :disabled="!previewCanPrev"
           @click="editor.prevCh()"
         >
-          <el-icon><ArrowLeft /></el-icon>
+          <svg
+            class="viewport-preview-nav-btn__icon"
+            xmlns="http://www.w3.org/2000/svg"
+            width="12"
+            height="12"
+            viewBox="0 0 12 12"
+            role="img"
+            aria-hidden="true"
+          >
+            <path
+              fill="currentColor"
+              d="M8.53 1.47a.75.75 0 0 0-1.06 0l-4 4a.75.75 0 0 0 0 1.06l4 4a.75.75 0 0 0 1.06-1.06L5.06 6l3.47-3.47a.75.75 0 0 0 0-1.06"
+            />
+          </svg>
         </button>
         <button
           class="viewport-preview-nav-btn viewport-preview-nav-btn--next"
@@ -48,7 +61,20 @@
           :disabled="!previewCanNext"
           @click="editor.nextCh()"
         >
-          <el-icon><ArrowRight /></el-icon>
+          <svg
+            class="viewport-preview-nav-btn__icon"
+            xmlns="http://www.w3.org/2000/svg"
+            width="12"
+            height="12"
+            viewBox="0 0 12 12"
+            role="img"
+            aria-hidden="true"
+          >
+            <path
+              fill="currentColor"
+              d="M3.47 1.47a.75.75 0 0 1 1.06 0l4 4a.75.75 0 0 1 0 1.06l-4 4a.75.75 0 0 1-1.06-1.06L6.94 6 3.47 2.53a.75.75 0 0 1 0-1.06"
+            />
+          </svg>
         </button>
       </div>
 
@@ -60,24 +86,37 @@
         :class="{
           'is-dragging': pipDragging,
           'is-resizing': pipResizing,
-          'pip-group--view-fixed': editor.viewOnly
+          'pip-group--view-fixed': editor.viewOnly,
+          'pip-group--preview': editor.isPreviewMode
         }"
         :style="pipStyle"
         @mousedown="onPipDragStart"
       >
-        <div class="video-pip">
+        <div class="video-pip" :class="{ 'is-loading': videoLoading }">
           <video
             :ref="editor.bindRef('videoEl')"
             :src="editor.videoSrc"
             :muted="false"
+            preload="metadata"
             playsinline
-            @loadedmetadata="editor.onMeta"
+            @loadstart="onVideoLoadStart"
+            @loadedmetadata="onVideoLoadedMetadata"
+            @loadeddata="onVideoLoaded"
+            @canplay="onVideoLoaded"
             @timeupdate="editor.onTick"
             @play="editor.onVideoPlay"
+            @waiting="onVideoWaiting"
+            @playing="onVideoLoaded"
             @pause="editor.onVideoPause"
             @ended="editor.onVideoEnd"
-            @error="editor.onVideoErr"
+            @error="onVideoLoadError"
           />
+          <div v-if="isMobile && !editor.isPlaying" class="video-pip-play-hint" aria-hidden="true">
+            <el-icon><VideoPlay /></el-icon>
+          </div>
+          <div v-if="videoLoading" class="video-pip-loading" aria-live="polite" aria-busy="true">
+            <el-icon class="is-loading video-pip-loading__icon"><Loading /></el-icon>
+          </div>
           <button
             v-if="!editor.viewOnly"
             class="video-pip-del"
@@ -132,10 +171,39 @@
       <div class="progress-meta">
         <div class="progress-meta-left">
           <button class="progress-ctrl-btn" type="button" :title="editor.isPlaying ? '暂停' : '播放'" @click="editor.togglePlay">
-            <el-icon>
-              <VideoPause v-if="editor.isPlaying" />
-              <VideoPlay v-else />
-            </el-icon>
+            <svg
+              v-if="editor.isPlaying"
+              width="12"
+              height="12"
+              viewBox="0 0 12 12"
+              fill="none"
+              xmlns="http://www.w3.org/2000/svg"
+              class="progress-ctrl-btn__icon"
+              role="img"
+              aria-hidden="true"
+            >
+              <path
+                fill-rule="evenodd"
+                clip-rule="evenodd"
+                d="M3.67 2C3.29997 2 3 2.29997 3 2.67V9.33C3 9.70003 3.29997 10 3.67 10H4.33C4.70003 10 5 9.70003 5 9.33V2.67C5 2.29997 4.70003 2 4.33 2H3.67ZM7.67 2C7.29997 2 7 2.29997 7 2.67V9.33C7 9.70003 7.29997 10 7.67 10H8.33C8.70003 10 9 9.70003 9 9.33V2.67C9 2.29997 8.70003 2 8.33 2H7.67Z"
+                fill="currentColor"
+              />
+            </svg>
+            <svg
+              v-else
+              xmlns="http://www.w3.org/2000/svg"
+              width="12"
+              height="12"
+              viewBox="0 0 12 12"
+              class="progress-ctrl-btn__icon"
+              role="img"
+              aria-hidden="true"
+            >
+              <path
+                fill="currentColor"
+                d="M8.807 6.597a.667.667 0 0 0 0-1.194l-5.842-2.92A.667.667 0 0 0 2 3.079v5.842c0 .496.522.818.965.596z"
+              />
+            </svg>
           </button>
           <button
             class="progress-ctrl-btn progress-ctrl-btn--speed"
@@ -158,10 +226,11 @@
 </template>
 
 <script setup lang="ts" name="editor-viewport">
-import { ArrowLeft, ArrowRight, VideoPause, VideoPlay } from "@element-plus/icons-vue";
+import { Loading, VideoPause, VideoPlay } from "@element-plus/icons-vue";
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 
 import { useMovieEditorContext } from "@/composables/useMovieEditorContext";
+import { isCoarsePointerDevice } from "@/utils/device";
 
 const editor = useMovieEditorContext();
 
@@ -193,9 +262,52 @@ const pipLeft = ref(10);
 const pipTop = ref(10);
 const pipDragging = ref(false);
 const pipResizing = ref(false);
+const videoLoading = ref(false);
+const isMobile = ref(false);
+
+function onVideoLoadStart() {
+  if (isMobile.value) return;
+  videoLoading.value = true;
+}
+
+function onVideoLoaded() {
+  videoLoading.value = false;
+}
+
+function onVideoLoadedMetadata(e: Event) {
+  editor.onMeta(e);
+  onVideoLoaded();
+}
+
+function onVideoLoadError() {
+  videoLoading.value = false;
+  editor.onVideoErr();
+}
+
+function onVideoWaiting() {
+  if (isMobile.value && !editor.isPlaying) return;
+  videoLoading.value = true;
+}
+
+function syncVideoLoadingState() {
+  if (!editor.hasVideo || !editor.videoSrc || isMobile.value) {
+    videoLoading.value = false;
+    return;
+  }
+  const video = editor.videoEl;
+  videoLoading.value = !video || video.readyState < HTMLMediaElement.HAVE_METADATA;
+}
+
+function ensureVideoPreload() {
+  if (isMobile.value) return;
+  const video = editor.videoEl;
+  if (!video || !editor.videoSrc) return;
+  video.preload = "metadata";
+  if (video.readyState < HTMLMediaElement.HAVE_METADATA) video.load();
+}
 
 function onViewportDblClick(e: MouseEvent) {
-  if (!editor.hasVideo) return;
+  if (!editor.hasVideo || editor.isPreviewMode) return;
   if ((e.target as HTMLElement).closest(".pip-group, .viewport-play-hint, .viewport-preview-nav")) return;
   // 双击空白区域：播放/暂停（单击留给模型选中，避免冲突）
   if (editor.pickModelAtViewport(e.clientX, e.clientY)) return;
@@ -233,9 +345,9 @@ function clampPipBounds() {
 
 function resolvePipWidth(viewportWidth: number, presentation: boolean) {
   if (presentation) {
-    if (viewportWidth <= 480) return Math.max(100, Math.round(viewportWidth * 0.3));
-    if (viewportWidth <= 768) return Math.max(120, Math.round(viewportWidth * 0.32));
-    return Math.min(168, Math.max(140, Math.round(viewportWidth * 0.22)));
+    if (viewportWidth <= 480) return Math.min(200, Math.max(148, Math.round(viewportWidth * 0.42)));
+    if (viewportWidth <= 768) return Math.min(220, Math.max(168, Math.round(viewportWidth * 0.38)));
+    return Math.min(150, Math.max(120, Math.round(viewportWidth * 0.11)));
   }
   if (viewportWidth <= 640) return 160;
   return PIP_DEFAULT_WIDTH;
@@ -342,12 +454,15 @@ function onPipResizeStart(e: MouseEvent) {
 let viewportObserver: ResizeObserver | null = null;
 
 onMounted(() => {
+  isMobile.value = isCoarsePointerDevice();
   nextTick(() => {
-    placePipToRight(editor.viewOnly);
+    ensureVideoPreload();
+    syncVideoLoadingState();
+    placePipToRight(editor.viewOnly || editor.isPreviewMode);
     const viewport = editor.viewportEl;
     if (viewport) {
       viewportObserver = new ResizeObserver(() => {
-        if (editor.viewOnly) placePipToRight();
+        if (editor.viewOnly || editor.isPreviewMode) placePipToRight();
         else clampPipBounds();
       });
       viewportObserver.observe(viewport);
@@ -362,7 +477,26 @@ onUnmounted(() => {
 watch(
   () => editor.hasVideo,
   hasVideo => {
-    if (hasVideo) nextTick(() => placePipToRight(editor.viewOnly));
+    if (!hasVideo) {
+      videoLoading.value = false;
+      return;
+    }
+    nextTick(() => {
+      ensureVideoPreload();
+      syncVideoLoadingState();
+      placePipToRight(editor.viewOnly || editor.isPreviewMode);
+    });
+  }
+);
+
+watch(
+  () => editor.videoSrc,
+  src => {
+    if (!src) {
+      videoLoading.value = false;
+      return;
+    }
+    nextTick(syncVideoLoadingState);
   }
 );
 

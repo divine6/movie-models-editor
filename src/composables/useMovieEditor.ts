@@ -87,6 +87,7 @@ import {
 import { exportPlayer } from "@/composables/usePlayerExport";
 import { resumeProjectPersist, suspendProjectPersist } from "@/utils/projectPersist";
 import { flattenChapterTree, getDescendantChapterIds, getRootChapters } from "@/utils/chapterTree";
+import { isCoarsePointerDevice, withVideoPosterFragment } from "@/utils/device";
 import {
   type Chapter,
   type Model,
@@ -116,7 +117,12 @@ import {
   SCENE_TONE_MAPPING_EXPOSURE,
   SCENE_VIEWPORT_BG
 } from "@/utils/three/constants";
-import { buildModelHierarchy, collectObjectsForNodeId, findHierarchyNode, resolveDisplayNodeId } from "@/utils/three/modelHierarchy";
+import {
+  buildModelHierarchy,
+  collectObjectsForNodeId,
+  findHierarchyNode,
+  resolveDisplayNodeId
+} from "@/utils/three/modelHierarchy";
 import { createViewportGrid, disposeViewportGrid } from "@/utils/three/viewportGrid";
 import { createViewportEnvironment, disposeViewportEnvironment } from "@/utils/three/viewportEnvironment";
 import { toastShow } from "@/utils/toast";
@@ -447,6 +453,7 @@ export function useMovieEditor() {
   const HOVER_PICK_MOVE_PX = 4;
   const ORBIT_DRAG_SUSPEND_PX = 8;
   let onControlsInteractionEnd: (() => void) | null = null;
+  let onControlsInteractionStart: (() => void) | null = null;
   let onCanvasContextMenu: ((e: Event) => void) | null = null;
 
   function init3D() {
@@ -472,7 +479,7 @@ export function useMovieEditor() {
     renderer.toneMappingExposure = SCENE_TONE_MAPPING_EXPOSURE;
     renderer.setClearColor(bgColor, 1);
 
-    controls = new OrbitControls(camera, renderer.domElement);
+    controls = new OrbitControls(camera, canvasEl.value);
     controls.target.set(...DEFAULT_CAMERA.target);
     controls.enableDamping = true;
     controls.dampingFactor = 0.08;
@@ -481,6 +488,7 @@ export function useMovieEditor() {
     controls.maxDistance = 30;
     controls.maxPolarAngle = Math.PI / 2;
     bindControlsInteraction();
+    syncOrbitControlsDom();
 
     // 光照（初始值与 DEFAULT_SCENE_SETTINGS 一致，loadAllSettings 后会再同步）
     ambientLight = new THREE.AmbientLight(0xffffff, DEFAULT_SCENE_SETTINGS.ambIntensity);
@@ -546,33 +554,56 @@ export function useMovieEditor() {
 
   function bindViewportPicking() {
     const canvas = canvasEl.value;
-    if (!canvas) return;
+    const viewport = viewportEl.value;
+    if (!canvas || !viewport) return;
 
+    viewport.style.touchAction = "none";
     canvas.style.touchAction = "none";
 
+    const isPresentationInteraction = () => viewOnly.value || isPreviewMode.value;
+
     onCanvasPointerDown = (e: PointerEvent) => {
-      if (viewOnly.value || isPreviewMode.value) return;
       if (e.button !== 0 || e.isPrimary === false) return;
+      if (isPresentationInteraction()) {
+        viewportPickState = { x: e.clientX, y: e.clientY, time: performance.now() };
+        return;
+      }
       orbitDragVisualsSuspended = false;
       viewportPickState = { x: e.clientX, y: e.clientY, time: performance.now() };
     };
 
     onCanvasPointerUp = (e: PointerEvent) => {
-      if (viewOnly.value || isPreviewMode.value) return;
       if (e.button !== 0 || e.isPrimary === false || !viewportPickState) return;
       const dx = e.clientX - viewportPickState.x;
       const dy = e.clientY - viewportPickState.y;
       const elapsed = performance.now() - viewportPickState.time;
       const wasDrag = Math.hypot(dx, dy) > 10 || elapsed > 600;
       viewportPickState = null;
+
+      if (isPresentationInteraction()) {
+        if (!wasDrag && isPreviewMode.value) {
+          tryTogglePlayOnPreviewTap(e.clientX, e.clientY);
+        }
+        return;
+      }
+
       if (!wasDrag) {
         pickModelAtViewport(e.clientX, e.clientY);
       }
     };
 
     onCanvasPointerMove = (e: PointerEvent) => {
-      if (viewOnly.value || isPreviewMode.value) return;
       if (e.isPrimary === false) return;
+      if (isPresentationInteraction()) {
+        if (viewportPickState) {
+          const dx = e.clientX - viewportPickState.x;
+          const dy = e.clientY - viewportPickState.y;
+          if (Math.hypot(dx, dy) >= ORBIT_DRAG_SUSPEND_PX) {
+            viewportPickState = null;
+          }
+        }
+        return;
+      }
       lastViewportPointer = { x: e.clientX, y: e.clientY };
       if (viewportPickState && !orbitDragVisualsSuspended) {
         const dx = e.clientX - viewportPickState.x;
@@ -592,7 +623,7 @@ export function useMovieEditor() {
 
     onCanvasPointerLeave = () => {
       lastViewportPointer = null;
-      clearHoverTarget();
+      if (!isPresentationInteraction()) clearHoverTarget();
     };
 
     canvas.addEventListener("pointerdown", onCanvasPointerDown);
@@ -689,10 +720,8 @@ export function useMovieEditor() {
     const dp = DEFAULT_CAMERA.position;
     const dt = DEFAULT_CAMERA.target;
     const eps = 0.001;
-    const positionMatches =
-      Math.abs(p[0] - dp[0]) < eps && Math.abs(p[1] - dp[1]) < eps && Math.abs(p[2] - dp[2]) < eps;
-    const targetMatchesDefault =
-      Math.abs(t[0] - dt[0]) < eps && Math.abs(t[1] - dt[1]) < eps && Math.abs(t[2] - dt[2]) < eps;
+    const positionMatches = Math.abs(p[0] - dp[0]) < eps && Math.abs(p[1] - dp[1]) < eps && Math.abs(p[2] - dp[2]) < eps;
+    const targetMatchesDefault = Math.abs(t[0] - dt[0]) < eps && Math.abs(t[1] - dt[1]) < eps && Math.abs(t[2] - dt[2]) < eps;
     const targetMatchesLegacy = Math.abs(t[0]) < eps && Math.abs(t[1] - 0.5) < eps && Math.abs(t[2]) < eps;
     return positionMatches && (targetMatchesDefault || targetMatchesLegacy) && ch.camera.fov === DEFAULT_CAMERA.fov;
   }
@@ -834,15 +863,32 @@ export function useMovieEditor() {
 
   function bindControlsInteraction() {
     if (!controls) return;
+    onControlsInteractionStart = () => {
+      viewportPickState = null;
+    };
     onControlsInteractionEnd = () => {
       endOrbitVisualSuspend();
     };
+    controls.addEventListener("start", onControlsInteractionStart);
     controls.addEventListener("end", onControlsInteractionEnd);
+  }
+
+  function syncOrbitControlsDom() {
+    const canvas = canvasEl.value;
+    if (!controls || !canvas) return;
+    if (controls.domElement !== canvas) {
+      controls.disconnect();
+      controls.connect(canvas);
+    }
+    canvas.style.touchAction = "none";
+    viewportEl.value && (viewportEl.value.style.touchAction = "none");
   }
 
   function unbindControlsInteraction() {
     if (!controls) return;
+    if (onControlsInteractionStart) controls.removeEventListener("start", onControlsInteractionStart);
     if (onControlsInteractionEnd) controls.removeEventListener("end", onControlsInteractionEnd);
+    onControlsInteractionStart = null;
     onControlsInteractionEnd = null;
   }
 
@@ -945,8 +991,7 @@ export function useMovieEditor() {
       if (d.fogFar !== undefined) fogFar.value = d.fogFar;
       if (d.bgColorVal) {
         const normalized = String(d.bgColorVal).toLowerCase();
-        bgColorVal.value =
-          normalized === "#f2f3f5" || normalized === "#0a0c10" ? SCENE_VIEWPORT_BG : d.bgColorVal;
+        bgColorVal.value = normalized === "#f2f3f5" || normalized === "#0a0c10" ? SCENE_VIEWPORT_BG : d.bgColorVal;
       }
       if (d.shadowEnabled !== undefined) shadowEnabled.value = d.shadowEnabled;
       if (d.shadowIntensity !== undefined) shadowIntensity.value = d.shadowIntensity;
@@ -1595,11 +1640,7 @@ export function useMovieEditor() {
     const pos = ch.camera.position;
     const tgt = ch.camera.target;
     return {
-      position: [pos[0] - tgt[0] + center.x, pos[1] - tgt[1] + center.y, pos[2] - tgt[2] + center.z] as [
-        number,
-        number,
-        number
-      ],
+      position: [pos[0] - tgt[0] + center.x, pos[1] - tgt[1] + center.y, pos[2] - tgt[2] + center.z] as [number, number, number],
       target: [center.x, center.y, center.z] as [number, number, number]
     };
   }
@@ -1708,11 +1749,7 @@ export function useMovieEditor() {
     return objs[0] ?? null;
   }
 
-  function getNodeObjects(
-    modelId?: string | null,
-    nodeId?: string | null,
-    includeHidden = false
-  ): THREE.Object3D[] {
+  function getNodeObjects(modelId?: string | null, nodeId?: string | null, includeHidden = false): THREE.Object3D[] {
     const mid = modelId ?? selModelId.value;
     if (!mid) return [];
     const root = meshes.get(mid);
@@ -1867,8 +1904,7 @@ export function useMovieEditor() {
         seenDisplayIds.add(displayId);
         const nodeObjs = collectObjectsForNodeId(root, displayId);
         if (!nodeObjs.length) continue;
-        const isEditingNode =
-          selModel.value?.id === cmid && resolveDisplayNodeId(tree, selModelNodeId.value ?? "") === displayId;
+        const isEditingNode = selModel.value?.id === cmid && resolveDisplayNodeId(tree, selModelNodeId.value ?? "") === displayId;
         const nodeCfgTyped = ((nodeConfigs[displayId] as ModelConfig) ?? nodeCfg) as ModelConfig;
         if (!nodeCfgTyped.animation || !nodeCfgTyped.animConfig?.segments?.length) continue;
         targets.push({
@@ -2080,18 +2116,13 @@ export function useMovieEditor() {
     clearHoverHighlight();
   }
 
-  function setHoverTarget(
-    modelId: string | null,
-    nodeId?: string | null,
-    hitObject?: THREE.Object3D | null
-  ) {
+  function setHoverTarget(modelId: string | null, nodeId?: string | null, hitObject?: THREE.Object3D | null) {
     if (!modelId) {
       clearHoverTarget();
       return;
     }
     const resolvedNodeId = nodeId ? resolveSelectedNodeId(modelId, nodeId) : null;
-    const sameAsSelection =
-      modelId === selModelId.value && (resolvedNodeId ?? null) === (selModelNodeId.value ?? null);
+    const sameAsSelection = modelId === selModelId.value && (resolvedNodeId ?? null) === (selModelNodeId.value ?? null);
 
     if (hoverModelId.value === modelId && hoverModelNodeId.value === resolvedNodeId) {
       if (!sameAsSelection && !viewportInteracting) {
@@ -2111,11 +2142,7 @@ export function useMovieEditor() {
     applyHoverVisualMeshes(modelId, resolvedNodeId, hitObject);
   }
 
-  function applyHoverVisualMeshes(
-    modelId: string,
-    resolvedNodeId: string | null,
-    hitObject?: THREE.Object3D | null
-  ) {
+  function applyHoverVisualMeshes(modelId: string, resolvedNodeId: string | null, hitObject?: THREE.Object3D | null) {
     if (viewportInteracting || cameraAnimating || camTrans) return;
     if (!hoverOutlinePass) {
       clearHoverHighlight();
@@ -2290,7 +2317,34 @@ export function useMovieEditor() {
     return hits;
   }
 
-  type PickTargetResult = { modelId: string; nodeId: string | null; hitObject: THREE.Object3D };
+  type PickTargetResult = { modelId: string; nodeId: string | null; hitObject: THREE.Object3D; hitPoint: THREE.Vector3 };
+
+  const _previewHitBox = new THREE.Box3();
+  const _previewHitCenter = new THREE.Vector3();
+  const _previewHitSize = new THREE.Vector3();
+  const _previewHitLocal = new THREE.Vector3();
+
+  function isPreviewModelCenterHit(clientX: number, clientY: number) {
+    const result = raycastAt(clientX, clientY);
+    if (!result) return false;
+    const root = meshes.get(result.modelId);
+    if (!root) return false;
+    _previewHitBox.setFromObject(root);
+    if (_previewHitBox.isEmpty()) return false;
+    _previewHitBox.getCenter(_previewHitCenter);
+    _previewHitBox.getSize(_previewHitSize);
+    _previewHitLocal.copy(result.hitPoint).sub(_previewHitCenter);
+    const rx = _previewHitSize.x > 1e-6 ? Math.abs(_previewHitLocal.x) / (_previewHitSize.x * 0.5) : 0;
+    const ry = _previewHitSize.y > 1e-6 ? Math.abs(_previewHitLocal.y) / (_previewHitSize.y * 0.5) : 0;
+    const rz = _previewHitSize.z > 1e-6 ? Math.abs(_previewHitLocal.z) / (_previewHitSize.z * 0.5) : 0;
+    return Math.max(rx, ry, rz) <= 0.7;
+  }
+
+  function tryTogglePlayOnPreviewTap(clientX: number, clientY: number) {
+    if (!isPreviewMode.value || !hasVideo.value) return;
+    if (!isPreviewModelCenterHit(clientX, clientY)) return;
+    togglePlay();
+  }
 
   function raycastAt(clientX: number, clientY: number): PickTargetResult | null {
     if (!renderer || !camera) return null;
@@ -2316,7 +2370,7 @@ export function useMovieEditor() {
       if (!mesh.isMesh) continue;
       if (!isFrontFaceHit(hit)) continue;
       const target = resolvePickTarget(mesh);
-      if (target) return { ...target, hitObject: mesh };
+      if (target) return { ...target, hitObject: mesh, hitPoint: hit.point.clone() };
     }
     return null;
   }
@@ -2403,18 +2457,10 @@ export function useMovieEditor() {
       obj.scale.setScalar(cfg.scale || 1);
       if (isRoot) {
         const bp = obj.userData.basePos || DEFAULT_MODEL_BASE_POSITION;
-        obj.position.set(
-          bp[0] + (cfg.posOffset?.[0] || 0),
-          bp[1] + (cfg.posOffset?.[1] || 0),
-          bp[2] + (cfg.posOffset?.[2] || 0)
-        );
+        obj.position.set(bp[0] + (cfg.posOffset?.[0] || 0), bp[1] + (cfg.posOffset?.[1] || 0), bp[2] + (cfg.posOffset?.[2] || 0));
       } else {
         const bp = obj.userData.baseLocalPos || [obj.position.x, obj.position.y, obj.position.z];
-        obj.position.set(
-          bp[0] + (cfg.posOffset?.[0] || 0),
-          bp[1] + (cfg.posOffset?.[1] || 0),
-          bp[2] + (cfg.posOffset?.[2] || 0)
-        );
+        obj.position.set(bp[0] + (cfg.posOffset?.[0] || 0), bp[1] + (cfg.posOffset?.[1] || 0), bp[2] + (cfg.posOffset?.[2] || 0));
       }
     }
     rebuildOutlineForObject(m, obj, cfg);
@@ -2693,7 +2739,10 @@ export function useMovieEditor() {
 
     const startMin = prev?.endTime ?? scope.startTime;
     const endMax = next?.startTime ?? scope.endTime;
-    const startMax = Math.max(startMin, Math.min(ch.endTime - MIN_CHAPTER_DURATION, endMax - MIN_CHAPTER_DURATION, firstChildStart));
+    const startMax = Math.max(
+      startMin,
+      Math.min(ch.endTime - MIN_CHAPTER_DURATION, endMax - MIN_CHAPTER_DURATION, firstChildStart)
+    );
     const endMin = Math.min(endMax, Math.max(ch.startTime + MIN_CHAPTER_DURATION, startMin + MIN_CHAPTER_DURATION, lastChildEnd));
 
     return { startMin, startMax, endMin, endMax };
@@ -2954,13 +3003,16 @@ export function useMovieEditor() {
   function syncVideoElementSrc(src?: string) {
     const url = src || videoSrc.value;
     if (!url) return;
+    const resolvedUrl = isCoarsePointerDevice() ? withVideoPosterFragment(url) : url;
     const apply = () => {
       if (!videoEl.value) return false;
-      videoEl.value.src = url;
+      videoEl.value.preload = "metadata";
+      videoEl.value.src = resolvedUrl;
       if (url.startsWith("http")) videoEl.value.setAttribute("crossorigin", "anonymous");
       videoEl.value.loop = isLooping.value;
       videoEl.value.playbackRate = playbackRate.value;
       syncVideoAudioState();
+      if (!isCoarsePointerDevice()) videoEl.value.load();
       return true;
     };
     if (apply()) return;
@@ -3156,11 +3208,7 @@ export function useMovieEditor() {
     return {
       pos: [roundAnimNum(bp[0]), roundAnimNum(bp[1]), roundAnimNum(bp[2])],
       scale: roundAnimNum(bs),
-      rot: [
-        roundAnimNum((br[0] * 180) / Math.PI),
-        roundAnimNum((br[1] * 180) / Math.PI),
-        roundAnimNum((br[2] * 180) / Math.PI)
-      ]
+      rot: [roundAnimNum((br[0] * 180) / Math.PI), roundAnimNum((br[1] * 180) / Math.PI), roundAnimNum((br[2] * 180) / Math.PI)]
     };
   }
 
@@ -3814,12 +3862,24 @@ export function useMovieEditor() {
     bbox.getCenter(ctr);
     let localPt = new THREE.Vector3(ctr.x, ctr.y, ctr.z);
     switch (pivotType) {
-      case "top": localPt.y = bbox.max.y; break;
-      case "bottom": localPt.y = bbox.min.y; break;
-      case "left": localPt.x = bbox.min.x; break;
-      case "right": localPt.x = bbox.max.x; break;
-      case "front": localPt.z = bbox.max.z; break;
-      case "back": localPt.z = bbox.min.z; break;
+      case "top":
+        localPt.y = bbox.max.y;
+        break;
+      case "bottom":
+        localPt.y = bbox.min.y;
+        break;
+      case "left":
+        localPt.x = bbox.min.x;
+        break;
+      case "right":
+        localPt.x = bbox.max.x;
+        break;
+      case "front":
+        localPt.z = bbox.max.z;
+        break;
+      case "back":
+        localPt.z = bbox.min.z;
+        break;
     }
     const worldPt = localPt.clone().applyQuaternion(target.quaternion).add(target.position);
     sphere.position.copy(worldPt);
@@ -3908,12 +3968,13 @@ export function useMovieEditor() {
     if (ch) void startChapterPlayback(ch);
   }
 
-  async function startChapterPlayback(ch: Chapter) {
+  async function startChapterPlayback(ch: Chapter, options?: { autoplay?: boolean }) {
     const resolved = resolveChapter(ch);
     const video = videoEl.value;
     if (!resolved || !video) return;
 
     const { chapter, idx } = resolved;
+    const autoplay = options?.autoplay ?? !isCoarsePointerDevice();
     chapterPlayTarget.value = chapter;
     chapterAutoNext.value = true;
     _chAnimLock = false;
@@ -3929,10 +3990,14 @@ export function useMovieEditor() {
 
     // 模型动画与节点视频同步播放（由 onVideoPlay 启动，从当前进度续播）
     _chAnimLock = false;
-    try {
-      await video.play();
-    } catch {
-      /* ignore autoplay restrictions */
+    if (autoplay) {
+      try {
+        await video.play();
+      } catch {
+        /* ignore autoplay restrictions */
+      }
+    } else {
+      video.pause();
     }
   }
 
@@ -4063,9 +4128,7 @@ export function useMovieEditor() {
   }
 
   function applyChapterCameraForLoadedModels() {
-    const ch =
-      selectedChapter.value ??
-      (chapters.value.length > 0 ? chapters.value[0] : null);
+    const ch = selectedChapter.value ?? (chapters.value.length > 0 ? chapters.value[0] : null);
     if (!ch || meshes.size === 0) return;
     const dur = getChapterCameraTransitionSec(ch);
     if (isDefaultChapterCamera(ch)) {
@@ -4152,7 +4215,10 @@ export function useMovieEditor() {
   }
 
   async function syncEditorAfterSceneLoad() {
-    if (videoSrc.value) syncVideoElementSrc();
+    if (videoSrc.value) {
+      syncVideoElementSrc();
+      duration.value = currProj.value?.videoDuration || 0;
+    }
     if (chapters.value.length > 0) {
       const ch = chapters.value[0];
       selectedChapterId.value = ch.id;
@@ -4222,9 +4288,7 @@ export function useMovieEditor() {
         payload.videoSrc = uploaded.url;
         syncVideoElementSrc(uploaded.url);
       }
-      const result = sceneCode.value
-        ? await updateSceneOnBackend(sceneCode.value, payload)
-        : await saveSceneToBackend(payload);
+      const result = sceneCode.value ? await updateSceneOnBackend(sceneCode.value, payload) : await saveSceneToBackend(payload);
       sceneCode.value = result.code;
       shareLink.value = result.previewUrl ? rewireEditorFrontendHost(result.previewUrl) : buildShareLink(result.code);
       sceneListVersion.value += 1;
@@ -4896,13 +4960,7 @@ export function useMovieEditor() {
         break;
       case "dup":
         {
-          const clone = chStore.createChapter(
-            ch.projectId,
-            ch.name + " (副本)",
-            ch.startTime,
-            ch.endTime,
-            ch.parentId
-          );
+          const clone = chStore.createChapter(ch.projectId, ch.name + " (副本)", ch.startTime, ch.endTime, ch.parentId);
           Object.assign(clone.camera, ch.camera);
           clone.modelConfigs = JSON.parse(JSON.stringify(ch.modelConfigs));
           currProj.value?.chapters.push(clone);
@@ -5377,16 +5435,18 @@ export function useMovieEditor() {
   function applyMCfgLive(field: string, value?: any) {
     if (!selModel.value) return;
     const ch = getActiveChapter();
-    const cfg = ch ? getActiveModelConfig(ch) : {
-      visible: mVis.value,
-      posOffset: [mOff[0], mOff[1], mOff[2]] as [number, number, number],
-      scale: mScl.value,
-      highlight: mHL.value,
-      highlightColor: mHLColor.value,
-      outline: mOut.value,
-      animation: mAni.value,
-      intro: mIntro.value
-    };
+    const cfg = ch
+      ? getActiveModelConfig(ch)
+      : {
+          visible: mVis.value,
+          posOffset: [mOff[0], mOff[1], mOff[2]] as [number, number, number],
+          scale: mScl.value,
+          highlight: mHL.value,
+          highlightColor: mHLColor.value,
+          outline: mOut.value,
+          animation: mAni.value,
+          intro: mIntro.value
+        };
     const targets = getNodeObjects(undefined, undefined, true);
     const root = meshes.get(selModel.value.id);
 
@@ -5598,6 +5658,7 @@ export function useMovieEditor() {
   watch(isPreviewMode, () => {
     syncVideoAudioState();
     nextTick(() => {
+      syncOrbitControlsDom();
       handleResize();
       adaptPresentationViewport();
     });
@@ -5680,7 +5741,8 @@ export function useMovieEditor() {
       shareLink.value = "";
 
       const existing = routeProjectId ? (pStore.projects.find(p => p.id === routeProjectId) as any) : null;
-      const canReuse = existing && !existing.videoSrc && (existing.chapters?.length || 0) === 0 && (existing.models?.length || 0) === 0;
+      const canReuse =
+        existing && !existing.videoSrc && (existing.chapters?.length || 0) === 0 && (existing.models?.length || 0) === 0;
       if (canReuse) {
         pStore.setCurrentProject(existing as any);
         projectTitle.value = defaultTitle;
