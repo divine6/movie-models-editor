@@ -430,7 +430,7 @@
         line-height: 1.2;
         letter-spacing: 0.12em;
         text-transform: uppercase;
-        color: rgb(255 255 255 / 72%);
+        color: rgb(255 255 255 / 48%);
       }
 
       .chapter-preview-drawer-close {
@@ -472,7 +472,7 @@
         flex-direction: column;
         gap: 0;
         min-height: 0;
-        padding: 8px 0 12px;
+        padding: 4px 0 12px;
         background: transparent;
         overflow-x: hidden;
         overflow-y: auto;
@@ -486,6 +486,27 @@
         &::-webkit-scrollbar-thumb {
           border-radius: 4px;
           background: rgb(255 255 255 / 18%);
+        }
+      }
+
+      .chapter-preview-group {
+        display: flex;
+        flex-direction: column;
+      }
+
+      .chapter-preview-children {
+        position: relative;
+        margin-left: 20px;
+        padding-left: 14px;
+
+        &::before {
+          content: "";
+          position: absolute;
+          left: 0;
+          top: 0;
+          bottom: 0;
+          width: 1px;
+          background: rgb(255 255 255 / 14%);
         }
       }
 
@@ -509,6 +530,7 @@
         }
 
         &--root {
+          &.is-expanded,
           &.active,
           &.playing {
             background: #143024;
@@ -526,17 +548,12 @@
 
         &--child {
           position: relative;
-          margin-left: 16px;
-          padding-left: 14px;
+          margin-left: 0;
+          padding: 8px 12px 8px 4px;
 
-          &::before {
-            content: "";
-            position: absolute;
-            left: 8px;
-            top: 0;
-            bottom: 0;
-            width: 1px;
-            background: rgb(255 255 255 / 14%);
+          &::before,
+          &::after {
+            display: none;
           }
 
           &.active,
@@ -545,17 +562,18 @@
               color: #4ade80;
               font-weight: 500;
             }
+          }
 
-            &::after {
-              content: "";
-              position: absolute;
-              left: 7px;
-              top: 8px;
-              bottom: 8px;
-              width: 2px;
-              border-radius: 0;
-              background: #4ade80;
-            }
+          &.active::before {
+            display: block;
+            content: "";
+            position: absolute;
+            left: -14px;
+            top: 6px;
+            bottom: 6px;
+            width: 2px;
+            border-radius: 1px;
+            background: #4ade80;
           }
         }
 
@@ -633,6 +651,11 @@
           padding: 4px 0 12px;
         }
 
+        .chapter-preview-children {
+          margin-left: 20px;
+          padding-left: 14px;
+        }
+
         .ch-item {
           align-items: flex-start;
           gap: 8px;
@@ -648,32 +671,21 @@
           }
 
           &--child {
-            position: relative;
-            margin-left: 0;
-            padding-left: 26px;
+            padding: 8px 12px 8px 4px;
 
-            &::before {
-              left: var(--preview-panel-inset);
-              top: 0;
-              bottom: 0;
-              width: 1px;
-              background: rgb(255 255 255 / 10%);
+            &::before,
+            &::after {
+              display: none;
             }
 
-            &.active,
-            &.playing {
-              &::before {
-                background: rgb(255 255 255 / 10%);
-              }
-
-              &::after {
-                left: calc(var(--preview-panel-inset) - 1px);
-                top: 0;
-                bottom: 0;
-                width: 2px;
-                border-radius: 0;
-                background: #4ade80;
-              }
+            &.active::before {
+              display: block;
+              left: -14px;
+              top: 6px;
+              bottom: 6px;
+              width: 2px;
+              border-radius: 1px;
+              background: #4ade80;
             }
 
             .ch-name {

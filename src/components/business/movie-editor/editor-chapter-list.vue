@@ -26,7 +26,7 @@
 
     <div class="chapter-panel-body">
       <template v-if="editor.isPreviewMode">
-        <editor-chapter-preview-drawer @close="hideChapterDrawer()" @select="onPreviewChapterClick" />
+        <editor-chapter-preview-drawer @close="hideChapterDrawer()" @play="onPreviewChapterPlay" />
       </template>
 
       <template v-else>
@@ -132,8 +132,8 @@ const onAddChapter = () => {
   editor.addChapter();
 };
 
-const onPreviewChapterClick = (chapter: Chapter) => {
-  editor.selectChapter(chapter);
+const onPreviewChapterPlay = (chapter: Chapter) => {
+  void editor.startChapterPlayback(chapter, { autoplay: true });
   hideChapterDrawer();
 };
 

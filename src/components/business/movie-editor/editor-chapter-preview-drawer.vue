@@ -1,35 +1,52 @@
 <template>
   <div class="chapter-preview-panel">
     <div class="chapter-preview-drawer-head">
-      <span class="chapter-preview-drawer-title">{{ $t("OpWeb.Editor.Chapters", "节点") }}</span>
+      <span class="chapter-preview-drawer-title">{{ $t("OpWeb.Editor.ChapterList", "节点列表") }}</span>
       <button type="button" class="chapter-preview-drawer-close" :title="$t('OpWeb.Common.Close', '关闭')" @click="emit('close')">
         <el-icon><Close /></el-icon>
       </button>
     </div>
 
     <div class="chapter-panel-list">
-      <div class="chapter-list chapter-list--preview-drawer" :class="{ 'is-empty': editor.chapters.length === 0 }">
-        <div
-          v-for="item in editor.chapterTreeList"
-          :key="item.chapter.id"
-          class="ch-item"
-          :class="{
-            'ch-item--root': item.depth === 0,
-            'ch-item--child': item.depth > 0,
-            active: editor.selectedChapterId === item.chapter.id,
-            playing: editor.isChapterPlaying(item.chapter)
-          }"
-          @click="emit('select', item.chapter)"
-        >
-          <el-icon v-if="item.depth === 0" class="ch-item-icon">
-            <VideoCamera v-if="editor.isChapterPlaying(item.chapter)" />
-            <Compass v-else />
-          </el-icon>
-          <span class="ch-body">
-            <span class="ch-name">{{ item.chapter.name }}</span>
-          </span>
+      <div class="chapter-list chapter-list--preview-drawer" :class="{ 'is-empty': rootChapters.length === 0 }">
+        <div v-for="root in rootChapters" :key="root.id" class="chapter-preview-group">
+          <div
+            class="ch-item ch-item--root"
+            :class="{
+              'is-expanded': isRootExpanded(root.id),
+              active: isRootHighlighted(root),
+              playing: isRootPlaying(root)
+            }"
+            @click="onRootClick(root)"
+          >
+            <el-icon class="ch-item-icon">
+              <VideoCamera v-if="isRootPlaying(root) || isRootHighlighted(root)" />
+              <Compass v-else />
+            </el-icon>
+            <span class="ch-body">
+              <span class="ch-name">{{ root.name }}</span>
+            </span>
+          </div>
+
+          <div v-if="isRootExpanded(root.id) && getChildren(root.id).length > 0" class="chapter-preview-children">
+            <div
+              v-for="child in getChildren(root.id)"
+              :key="child.id"
+              class="ch-item ch-item--child"
+              :class="{
+                active: editor.selectedChapterId === child.id,
+                playing: editor.isChapterPlaying(child)
+              }"
+              @click.stop="onChildClick(child)"
+            >
+              <span class="ch-body">
+                <span class="ch-name">{{ child.name }}</span>
+              </span>
+            </div>
+          </div>
         </div>
-        <div v-if="editor.chapters.length === 0" class="chapter-list-empty chapter-list-empty--preview">
+
+        <div v-if="rootChapters.length === 0" class="chapter-list-empty chapter-list-empty--preview">
           <span>{{ $t("OpWeb.Editor.NoChapters", "暂无节点") }}</span>
         </div>
       </div>
@@ -39,6 +56,7 @@
 
 <script setup lang="ts" name="editor-chapter-preview-drawer">
 import { Close, Compass, VideoCamera } from "@element-plus/icons-vue";
+import { computed, ref, watch } from "vue";
 
 import { useMovieEditorContext } from "@/composables/useMovieEditorContext";
 import { useTranslate } from "@/hooks/useTranslate";
@@ -49,6 +67,66 @@ const $t = useTranslate();
 
 const emit = defineEmits<{
   close: [];
-  select: [chapter: Chapter];
+  play: [chapter: Chapter];
 }>();
+
+const rootChapters = computed(() => editor.timelineChapters);
+const expandedRootId = ref<string | null>(null);
+
+function getChildren(rootId: string) {
+  return editor.getChapterChildren(rootId);
+}
+
+function isRootExpanded(rootId: string) {
+  return expandedRootId.value === rootId;
+}
+
+function isRootHighlighted(root: Chapter) {
+  if (editor.selectedChapterId === root.id) return true;
+  return getChildren(root.id).some(child => child.id === editor.selectedChapterId);
+}
+
+function isRootPlaying(root: Chapter) {
+  if (!editor.isPlaying) return false;
+  if (editor.isChapterPlaying(root)) return true;
+  return getChildren(root.id).some(child => editor.isChapterPlaying(child));
+}
+
+function syncExpandedRoot() {
+  const selectedId = editor.selectedChapterId;
+  if (!selectedId) {
+    if (expandedRootId.value) return;
+    const firstWithChildren = rootChapters.value.find(root => getChildren(root.id).length > 0);
+    expandedRootId.value = firstWithChildren?.id ?? rootChapters.value[0]?.id ?? null;
+    return;
+  }
+
+  const selected = editor.chapters.find(ch => ch.id === selectedId);
+  if (!selected) return;
+  expandedRootId.value = selected.parentId ?? selected.id;
+}
+
+function onRootClick(root: Chapter) {
+  const children = getChildren(root.id);
+  if (children.length === 0) {
+    emit("play", root);
+    return;
+  }
+  if (expandedRootId.value === root.id) {
+    expandedRootId.value = null;
+    return;
+  }
+  expandedRootId.value = root.id;
+  emit("play", children[0]);
+}
+
+function onChildClick(child: Chapter) {
+  emit("play", child);
+}
+
+watch(
+  () => [editor.selectedChapterId, editor.chapters.length] as const,
+  () => syncExpandedRoot(),
+  { immediate: true }
+);
 </script>
