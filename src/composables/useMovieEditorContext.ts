@@ -1,7 +1,7 @@
 import { inject } from "vue";
 
+import { MOVIE_EDITOR_KEY } from "@/composables/movie-editor/keys";
 import type { useMovieEditor } from "@/composables/useMovieEditor";
-import { MOVIE_EDITOR_KEY } from "@/composables/useMovieEditor";
 
 export type MovieEditorContext = ReturnType<typeof useMovieEditor>;
 

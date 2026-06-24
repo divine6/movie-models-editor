@@ -25,51 +25,6 @@ import { ShaderPass } from "three/addons/postprocessing/ShaderPass.js";
 import { UnrealBloomPass } from "three/addons/postprocessing/UnrealBloomPass.js";
 import { BrightnessContrastShader } from "three/addons/shaders/BrightnessContrastShader.js";
 import { HueSaturationShader } from "three/addons/shaders/HueSaturationShader.js";
-
-/** 色调映射选项（与 Three.js renderer.toneMapping 对应） */
-export const TONE_MAPPING_OPTIONS = [
-  { value: "NoToneMapping", label: "None" },
-  { value: "LinearToneMapping", label: "Linear" },
-  { value: "ReinhardToneMapping", label: "Reinhard" },
-  { value: "CineonToneMapping", label: "Cineon" },
-  { value: "ACESFilmicToneMapping", label: "ACES Filmic" },
-  { value: "AgXToneMapping", label: "AgX" },
-  { value: "NeutralToneMapping", label: "Neutral" }
-] as const;
-
-const TONE_MAPPING_MAP: Record<string, THREE.ToneMapping> = {
-  NoToneMapping: THREE.NoToneMapping,
-  LinearToneMapping: THREE.LinearToneMapping,
-  ReinhardToneMapping: THREE.ReinhardToneMapping,
-  CineonToneMapping: THREE.CineonToneMapping,
-  ACESFilmicToneMapping: THREE.ACESFilmicToneMapping,
-  AgXToneMapping: THREE.AgXToneMapping,
-  NeutralToneMapping: THREE.NeutralToneMapping
-};
-
-/** 色彩校正着色器（曝光） */
-const ColorCorrectionShader = {
-  uniforms: {
-    tDiffuse: { value: null },
-    exposure: { value: 1.0 }
-  },
-  vertexShader: /* glsl */ `
-    varying vec2 vUv;
-    void main() {
-      vUv = uv;
-      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-    }
-  `,
-  fragmentShader: /* glsl */ `
-    uniform sampler2D tDiffuse;
-    uniform float exposure;
-    varying vec2 vUv;
-    void main() {
-      vec4 color = texture2D(tDiffuse, vUv);
-      gl_FragColor = vec4(color.rgb * exposure, color.a);
-    }
-  `
-};
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 import { useRoute, useRouter } from "vue-router";
 
@@ -84,6 +39,25 @@ import {
   updateScene as updateSceneOnBackend,
   uploadSceneVideo
 } from "@/api/modules/editor-server";
+import {
+  CHAPTER_END_EPS,
+  CHAPTER_TIME_EPS,
+  CURVE_LABELS,
+  DEFAULT_SCENE_SETTINGS,
+  EASING_LIST,
+  PLAYBACK_RATES,
+  SCENE_SETTINGS_STORAGE_KEY,
+  SEEK_EVENT_TIMEOUT_MS,
+  SEEK_READY_TIMEOUT_MS,
+  TONE_MAPPING_MAP,
+  TONE_MAPPING_OPTIONS
+} from "@/composables/movie-editor/constants";
+export { MOVIE_EDITOR_KEY } from "@/composables/movie-editor/keys";
+import { MOVIE_EDITOR_KEY } from "@/composables/movie-editor/keys";
+import { ColorCorrectionShader } from "@/composables/movie-editor/shaders/colorCorrection";
+import { mapStoredAnimSegment, nextAnimSegmentId, roundAnimNum } from "@/composables/movie-editor/utils/animation";
+import { createDefaultModelConfig, getModelConfig } from "@/composables/movie-editor/utils/modelConfig";
+import { createTimelineHelpers } from "@/composables/movie-editor/utils/timeline";
 import { exportPlayer } from "@/composables/usePlayerExport";
 import { resumeProjectPersist, suspendProjectPersist } from "@/utils/projectPersist";
 import { flattenChapterTree, getDescendantChapterIds, getRootChapters } from "@/utils/chapterTree";
@@ -127,7 +101,7 @@ import { createViewportGrid, disposeViewportGrid } from "@/utils/three/viewportG
 import { createViewportEnvironment, disposeViewportEnvironment } from "@/utils/three/viewportEnvironment";
 import { toastShow } from "@/utils/toast";
 
-export const MOVIE_EDITOR_KEY = Symbol("movieEditor");
+export { TONE_MAPPING_OPTIONS };
 
 export function useMovieEditor() {
   const route = useRoute();
@@ -143,7 +117,6 @@ export function useMovieEditor() {
   const duration = ref(0);
   const isPlaying = ref(false);
   const isLooping = ref(true);
-  const PLAYBACK_RATES = [1, 1.25, 1.5, 2, 0.5] as const;
   const playbackRate = ref<number>(1);
   const playingIdx = ref(-1);
   const selectedChapterId = ref<string | null>(null);
@@ -204,7 +177,6 @@ export function useMovieEditor() {
   const animLoop = ref(true);
   const animEasing = ref("easeInOut");
   const animSegments = reactive<any[]>([]);
-  let animSegIdCounter = 0;
   const editingSeg = ref<any>(null);
   const editingSegMode = ref<"start" | "end">("start");
   let _chAnimLock = false; // prevent re-entrant chapter animation from onTick
@@ -235,44 +207,6 @@ export function useMovieEditor() {
   const importingModel = ref(false);
   const showSettings = ref(false);
   const spTab = ref("lighting");
-
-  const DEFAULT_SCENE_SETTINGS = {
-    ambIntensity: 0.35,
-    dirIntensity: 0.65,
-    dirPos: [5, 10, 5] as [number, number, number],
-    fillIntensity: 0.2,
-    fillPos: [-5, 3, 5] as [number, number, number],
-    matColor: "#ffffff",
-    matRoughness: 0.5,
-    matMetalness: 0,
-    matNormalStr: 1,
-    matEmissiveInt: 0,
-    matAoInt: 1,
-    bloomIntensity: 0,
-    bloomThreshold: 0.2,
-    bloomRadius: 0.5,
-    ppExposure: SCENE_TONE_MAPPING_EXPOSURE,
-    ppContrast: 0,
-    ppSaturation: 0,
-    toneMapping: "ACESFilmicToneMapping",
-    envIntensityVal: 1,
-    envMapUrl: null as string | null,
-    envMapIsHdr: false,
-    bgColorVal: SCENE_VIEWPORT_BG,
-    fogEnabled: true,
-    fogNear: 4,
-    fogFar: 32,
-    shadowEnabled: false,
-    shadowIntensity: 1,
-    shadowMapSize: 2048,
-    shadowBias: 0.0001,
-    shadowNormalBias: 0,
-    shadowType: "pcfsoft",
-    gridVisible: true,
-    gridSize: SCENE_GRID_SIZE,
-    gridDivisions: SCENE_GRID_DIVISIONS,
-    gridHeight: 0
-  };
 
   // Lighting
   const ambIntensity = ref(DEFAULT_SCENE_SETTINGS.ambIntensity);
@@ -909,7 +843,7 @@ export function useMovieEditor() {
     });
   }
 
-  let SETTINGS_KEY = "movie-editor-scene-settings";
+  let SETTINGS_KEY = SCENE_SETTINGS_STORAGE_KEY;
   function saveAllSettings() {
     try {
       let data = {
@@ -2467,10 +2401,6 @@ export function useMovieEditor() {
   }
 
   // ── Chapter navigation ──
-  const CHAPTER_TIME_EPS = 0.05;
-  const CHAPTER_END_EPS = 0.02;
-  const SEEK_READY_TIMEOUT_MS = 4000;
-  const SEEK_EVENT_TIMEOUT_MS = 800;
 
   function resolveChapter(ch: Chapter) {
     const chapter = chapters.value.find(c => c.id === ch.id);
@@ -2948,40 +2878,12 @@ export function useMovieEditor() {
   }
 
   // ── Actions ──
-  const fmt = (s: number) => {
-    const m = Math.floor(s / 60);
-    const se = Math.floor(s % 60);
-    return `${m}:${se.toString().padStart(2, "0")}`;
-  };
-  const pct = (v: number) => (duration.value > 0 ? (v / duration.value) * 100 : 0);
-  const fillScale = (i: number) => {
-    const ch = timelineChapters.value[i];
-    if (!ch || !duration.value) return 0;
-    if (currentTime.value >= ch.endTime) return 1;
-    if (currentTime.value > ch.startTime) return (currentTime.value - ch.startTime) / (ch.endTime - ch.startTime);
-    return 0;
-  };
-  const chapterFillPct = (ch: Chapter) => {
-    if (!duration.value || ch.endTime <= ch.startTime) return 0;
-    if (currentTime.value >= ch.endTime) return 100;
-    if (currentTime.value > ch.startTime) return ((currentTime.value - ch.startTime) / (ch.endTime - ch.startTime)) * 100;
-    return 0;
-  };
-  const chapterSegmentFlex = (ch: Chapter) => {
-    const dur = duration.value;
-    if (dur <= 0) return 1;
-    return Math.max((ch.endTime - ch.startTime) / dur, 0.001);
-  };
-  const chapterSegmentStyle = (ch: Chapter) => {
-    const dur = duration.value;
-    if (dur <= 0) return { left: "0%", width: "0%" };
-    const left = (ch.startTime / dur) * 100;
-    const width = ((ch.endTime - ch.startTime) / dur) * 100;
-    return {
-      left: `${left}%`,
-      width: `${Math.max(0.15, width)}%`
-    };
-  };
+  const { fmt, pct, fillScale, chapterFillPct, chapterSegmentFlex, chapterSegmentStyle } = createTimelineHelpers(
+    duration,
+    currentTime,
+    timelineChapters
+  );
+
   function uploadVideo(file: File) {
     if (!currProj.value) return false;
     const url = URL.createObjectURL(file);
@@ -3186,10 +3088,6 @@ export function useMovieEditor() {
   }
 
   // ── Animation Helpers (运动段) ──
-  function roundAnimNum(n: number, decimals = 3) {
-    const f = 10 ** decimals;
-    return Math.round(n * f) / f;
-  }
 
   function getDefaultTransformForAnimTarget(model: Model, nodeId: string | null) {
     const isRoot = !nodeId;
@@ -3218,7 +3116,7 @@ export function useMovieEditor() {
       ? getDefaultTransformForAnimTarget(m, selModelNodeId.value)
       : { pos: [...DEFAULT_MODEL_BASE_POSITION], scale: 1, rot: [0, 0, 0] };
     return {
-      id: `seg_${++animSegIdCounter}`,
+      id: nextAnimSegmentId(),
       pauseTime: 0,
       animTime: 3,
       easing: "easeInOut",
@@ -3230,23 +3128,6 @@ export function useMovieEditor() {
       startRot: [...rot],
       endRot: [...rot],
       _expandedPanels: ["start", "end"] as string[]
-    };
-  }
-
-  function mapStoredAnimSegment(s: any) {
-    return {
-      id: s.id || `seg_${++animSegIdCounter}`,
-      pauseTime: s.pauseTime || 0,
-      animTime: s.animTime || 3,
-      easing: s.easing || "easeInOut",
-      pivot: s.pivot || "center",
-      startPos: [...s.startPos],
-      endPos: [...s.endPos],
-      startScale: s.startScale,
-      endScale: s.endScale,
-      startRot: [...s.startRot],
-      endRot: [...s.endRot],
-      _expandedPanels: s._expandedPanels || ["start", "end"]
     };
   }
 
@@ -3313,15 +3194,7 @@ export function useMovieEditor() {
     animDirty.value = false;
     toastShow(selModelNodeId.value ? "子层级动画已保存" : "动画已保存");
   }
-  const EASING_LIST = ["linear", "easeIn", "easeOut", "easeInOut", "bounce", "elastic"];
-  const CURVE_LABELS: Record<string, string> = {
-    linear: "线性",
-    easeIn: "渐入",
-    easeOut: "渐出",
-    easeInOut: "渐入渐出",
-    bounce: "弹跳",
-    elastic: "弹性"
-  };
+
   function refreshActiveHighlightOutline() {
     const m = selModel.value;
     const ch = getActiveChapter();
@@ -4601,28 +4474,40 @@ export function useMovieEditor() {
     liveFov();
   }
 
-  function createDefaultModelConfig(): ModelConfig {
-    return {
-      visible: true,
-      posOffset: [0, 0, 0],
-      scale: 1,
-      highlight: false,
-      highlightColor: "#00ff00",
-      outline: false,
-      animation: true,
-      intro: ""
-    };
-  }
-
-  function getModelConfig(cfg?: Partial<ModelConfig> | null): ModelConfig {
-    return { ...createDefaultModelConfig(), ...cfg };
-  }
-
   function restoreModelOutlines(ch: Chapter) {
     for (const m of models.value) {
       const cfg = chapterModelCfg(ch, m.id);
       if (cfg) applyMConfig(m, cfg);
     }
+  }
+
+  function applyModelConfigToEditor(cfg: ModelConfig) {
+    mOff[0] = cfg.posOffset?.[0] ?? 0;
+    mOff[1] = cfg.posOffset?.[1] ?? 0;
+    mOff[2] = cfg.posOffset?.[2] ?? 0;
+    mScl.value = cfg.scale ?? 1;
+    mVis.value = cfg.visible ?? true;
+    mHL.value = cfg.highlight ?? false;
+    mOut.value = cfg.outline ?? false;
+    mHLColor.value = cfg.highlightColor || "#00ff00";
+    mAni.value = cfg.animation ?? true;
+    mIntro.value = cfg.intro ?? "";
+    mRot[0] = 0;
+    mRot[1] = 0;
+    mRot[2] = 0;
+
+    const ac = cfg.animConfig;
+    if (ac?.segments?.length) {
+      animDuration.value = ac.duration || 3;
+      animEasing.value = (ac as any).easing || "easeInOut";
+      animSegments.splice(0, animSegments.length, mapStoredAnimSegment(ac.segments[0]));
+      animDirty.value = false;
+    } else {
+      animSegments.splice(0);
+      ensureSingleAnimSegment(selModel.value);
+      animDirty.value = false;
+    }
+    if (mAni.value) ensureSingleAnimSegment(selModel.value);
   }
 
   function syncIntroPresentation() {
@@ -4744,35 +4629,6 @@ export function useMovieEditor() {
 
   function resetModelFormDefaults() {
     applyModelConfigToEditor(createDefaultModelConfig());
-  }
-
-  function applyModelConfigToEditor(cfg: ModelConfig) {
-    mOff[0] = cfg.posOffset?.[0] ?? 0;
-    mOff[1] = cfg.posOffset?.[1] ?? 0;
-    mOff[2] = cfg.posOffset?.[2] ?? 0;
-    mScl.value = cfg.scale ?? 1;
-    mVis.value = cfg.visible ?? true;
-    mHL.value = cfg.highlight ?? false;
-    mOut.value = cfg.outline ?? false;
-    mHLColor.value = cfg.highlightColor || "#00ff00";
-    mAni.value = cfg.animation ?? true;
-    mIntro.value = cfg.intro ?? "";
-    mRot[0] = 0;
-    mRot[1] = 0;
-    mRot[2] = 0;
-
-    const ac = cfg.animConfig;
-    if (ac?.segments?.length) {
-      animDuration.value = ac.duration || 3;
-      animEasing.value = (ac as any).easing || "easeInOut";
-      animSegments.splice(0, animSegments.length, mapStoredAnimSegment(ac.segments[0]));
-      animDirty.value = false;
-    } else {
-      animSegments.splice(0);
-      ensureSingleAnimSegment(selModel.value);
-      animDirty.value = false;
-    }
-    if (mAni.value) ensureSingleAnimSegment(selModel.value);
   }
 
   function getActiveChapter(): Chapter | null {
