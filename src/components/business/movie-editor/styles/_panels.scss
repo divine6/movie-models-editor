@@ -365,8 +365,11 @@
   }
 
   &.is-loading {
-    aspect-ratio: 16 / 9;
     min-height: 72px;
+
+    video {
+      opacity: 0;
+    }
   }
 
   .video-pip-play-hint {
@@ -376,13 +379,30 @@
     display: flex;
     align-items: center;
     justify-content: center;
+    margin: 0;
+    padding: 0;
+    border: none;
     background: rgb(0 0 0 / 28%);
     color: #fff;
-    pointer-events: none;
+    cursor: pointer;
+    pointer-events: auto;
 
     .el-icon {
       font-size: 28px;
       opacity: 0.92;
+    }
+
+    &:hover {
+      background: rgb(0 0 0 / 36%);
+    }
+
+    &.is-playing {
+      background: transparent;
+
+      &:hover,
+      &:active {
+        background: rgb(0 0 0 / 12%);
+      }
     }
   }
 
@@ -1469,4 +1489,3 @@
     min-height: 0;
   }
 }
-

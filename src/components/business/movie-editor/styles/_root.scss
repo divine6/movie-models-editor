@@ -472,7 +472,7 @@
         flex-direction: column;
         gap: 0;
         min-height: 0;
-        padding: 4px 0 12px;
+        padding: 8px 0 12px;
         background: transparent;
         overflow-x: hidden;
         overflow-y: auto;
@@ -806,9 +806,11 @@
           top: max(var(--preview-drawer-inset), env(safe-area-inset-top, 0px));
           right: max(var(--preview-drawer-inset), env(safe-area-inset-right, 0px));
           bottom: calc(var(--preview-drawer-inset) + env(safe-area-inset-bottom, 0px));
-          left: auto;
+          left: max(var(--preview-drawer-inset), env(safe-area-inset-left, 0px));
           z-index: 2;
-          width: min(360px, calc(100vw - var(--preview-drawer-inset) * 2));
+          width: auto;
+          max-width: none;
+          box-sizing: border-box;
           max-height: none;
           height: auto;
           border: none;

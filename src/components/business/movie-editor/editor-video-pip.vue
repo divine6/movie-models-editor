@@ -12,7 +12,7 @@
     :style="pipStyle"
     @mousedown="onPipDragStart"
   >
-    <div class="video-pip" :class="{ 'is-loading': videoLoading }">
+    <div class="video-pip" :class="{ 'is-loading': videoLoading }" :style="videoPipBoxStyle">
       <video
         :ref="editor.bindRef('videoEl')"
         :src="editor.videoSrc"
@@ -31,9 +31,17 @@
         @ended="editor.onVideoEnd"
         @error="onVideoLoadError"
       />
-      <div v-if="isMobile && !editor.isPlaying" class="video-pip-play-hint" aria-hidden="true">
-        <el-icon><VideoPlay /></el-icon>
-      </div>
+      <button
+        v-if="isMobile && !videoLoading"
+        type="button"
+        class="video-pip-play-hint"
+        :class="{ 'is-playing': editor.isPlaying }"
+        :title="editor.isPlaying ? '点击暂停' : '点击播放'"
+        @mousedown.stop
+        @click.stop="onPlayHintClick"
+      >
+        <el-icon v-if="!editor.isPlaying"><VideoPlay /></el-icon>
+      </button>
       <div v-if="videoLoading" class="video-pip-loading" aria-live="polite" aria-busy="true">
         <el-icon class="is-loading video-pip-loading__icon"><Loading /></el-icon>
       </div>
@@ -68,7 +76,7 @@
 
 <script setup lang="ts" name="editor-video-pip">
 import { Loading, VideoPlay } from "@element-plus/icons-vue";
-import { nextTick, onMounted, ref, watch } from "vue";
+import { computed, nextTick, onMounted, ref, watch } from "vue";
 
 import { useVideoPip } from "@/composables/movie-editor/useVideoPip";
 import { useMovieEditorContext } from "@/composables/useMovieEditorContext";
@@ -85,6 +93,31 @@ const { pipGroupRef, pipStyle, pipDragging, pipResizing, onPipDragStart, onPipRe
 
 const videoLoading = ref(false);
 const isMobile = ref(false);
+
+function resolveVideoDimensions() {
+  const w = editor.videoWidth || editor.videoEl?.videoWidth || 0;
+  const h = editor.videoHeight || editor.videoEl?.videoHeight || 0;
+  return { w, h };
+}
+
+/** 加载占位与视频实际显示区域使用相同宽高比 */
+const videoPipBoxStyle = computed(() => {
+  const { w, h } = resolveVideoDimensions();
+  if (w > 0 && h > 0) {
+    if (videoLoading.value) {
+      return { aspectRatio: `${w} / ${h}` };
+    }
+    return undefined;
+  }
+  if (videoLoading.value || (isMobile.value && !editor.isPlaying)) {
+    return { aspectRatio: "16 / 9" };
+  }
+  return undefined;
+});
+
+function onPlayHintClick() {
+  editor.togglePlay();
+}
 
 function onVideoLoadStart() {
   if (isMobile.value) return;
