@@ -53,7 +53,7 @@ providePreviewChapterDrawer();
 
 <!-- 样式嵌套在 .movie-editor 下，不加 scoped 以便子组件继承 -->
 <style lang="scss">
-@use "@/components/business/movie-editor/editor-styles.scss";
+@use "@/components/business/movie-editor/styles/index.scss";
 
 .editor-route-gate {
   position: fixed;
