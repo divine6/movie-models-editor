@@ -200,6 +200,9 @@
     --preview-pip-right: 16px;
     --preview-sidebar-width: 200px;
     --preview-sidebar-inset: 16px;
+    --preview-progress-inset: 12px;
+    --preview-progress-bottom: 16px;
+    --preview-progress-sidebar-gap: 12px;
 
     @media (min-width: 769px) {
       --preview-topbar-height: 56px;
@@ -207,6 +210,7 @@
       --preview-sidebar-width: min(260px, 24vw);
       --preview-sidebar-inset: 0;
       --preview-panel-inset: 12px;
+      --preview-panel-left: 16px;
 
       .editor-body__chapters {
         position: fixed;
@@ -612,12 +616,12 @@
       @media (min-width: 769px) {
         .chapter-preview-panel {
           position: fixed;
-          left: 16px;
+          left: var(--preview-panel-left);
           top: 72px;
           bottom: 16px;
           width: var(--preview-sidebar-width);
           max-width: var(--preview-sidebar-width);
-          height: calc(100% - 72px - 16px - 68px);
+          height: calc(100% - 72px - 16px);
           max-height: none;
           box-sizing: border-box;
           background: #000;
@@ -871,68 +875,6 @@
       .viewport-preview-nav {
         padding: 0 12px;
       }
-
-      .panel-center .progress-area.preview-progress {
-        left: max(var(--preview-progress-inset), env(safe-area-inset-left, 0px));
-        right: max(var(--preview-progress-inset), env(safe-area-inset-right, 0px));
-        bottom: calc(var(--preview-progress-bottom) + env(safe-area-inset-bottom, 0px));
-        padding: 10px 12px;
-        background: #0d0f12;
-        border: none;
-        border-radius: 0;
-        box-shadow: 0 12px 40px rgb(0 0 0 / 36%);
-        --prog-gap: rgb(255 255 255 / 10%);
-        --prog-seg: rgb(255 255 255 / 16%);
-        --prog-seg-hover: rgb(255 255 255 / 22%);
-        --prog-seg-current: rgb(255 255 255 / 20%);
-        --prog-seg-current-hover: rgb(255 255 255 / 26%);
-        --prog-fill: #4ade80;
-        --prog-fill-highlight: #6ee7a0;
-        --prog-playhead: #4ade80;
-
-        .progress-ctrl-btn {
-          border-color: rgb(255 255 255 / 14%);
-          background: rgb(255 255 255 / 6%);
-          color: rgb(255 255 255 / 72%);
-
-          &:hover {
-            background: rgb(255 255 255 / 10%);
-            border-color: rgb(255 255 255 / 22%);
-            color: #fff;
-          }
-        }
-
-        .progress-time-current {
-          color: rgb(255 255 255 / 88%);
-        }
-
-        .progress-time-sep,
-        .progress-time-total {
-          color: rgb(255 255 255 / 48%);
-        }
-
-        .progress-chapter {
-          color: rgb(255 255 255 / 56%);
-        }
-
-        .prog-seg.is-current {
-          box-shadow: inset 0 0 0 1px rgb(255 255 255 / 12%);
-        }
-
-        .prog-playhead {
-          box-shadow:
-            0 0 0 1px rgb(0 0 0 / 40%),
-            0 0 6px rgb(74 222 128 / 35%);
-        }
-
-        .prog-seg-fill {
-          box-shadow: inset 0 1px 0 rgb(255 255 255 / 15%);
-
-          &::after {
-            background: linear-gradient(90deg, rgb(255 255 255 / 12%), transparent 55%);
-          }
-        }
-      }
     }
 
     @media (max-width: 480px) {
@@ -946,15 +888,81 @@
 
     .panel-center .progress-area.preview-progress {
       position: absolute;
-      bottom: 0;
-      left: 0;
-      right: 0;
       z-index: 60;
-      padding: 12px 20px 16px;
-      background: #fff;
-      border-top: 1px solid var(--border-color-2);
-      box-shadow: 0 -4px 16px rgb(15 23 42 / 6%);
+      left: max(var(--preview-progress-inset), env(safe-area-inset-left, 0px));
+      right: max(var(--preview-progress-inset), env(safe-area-inset-right, 0px));
+      bottom: calc(var(--preview-progress-bottom) + env(safe-area-inset-bottom, 0px));
+      padding: 10px 12px;
+      background: #0d0f12;
+      border: none;
+      border-radius: 0;
+      box-shadow: 0 12px 40px rgb(0 0 0 / 36%);
       pointer-events: auto;
+      --prog-gap: rgb(255 255 255 / 10%);
+      --prog-seg: rgb(255 255 255 / 16%);
+      --prog-seg-hover: rgb(255 255 255 / 22%);
+      --prog-seg-current: rgb(255 255 255 / 20%);
+      --prog-seg-current-hover: rgb(255 255 255 / 26%);
+      --prog-fill: #4ade80;
+      --prog-fill-highlight: #6ee7a0;
+      --prog-playhead: #4ade80;
+
+      .progress-ctrl-btn {
+        border-color: rgb(255 255 255 / 14%);
+        background: rgb(255 255 255 / 6%);
+        color: rgb(255 255 255 / 72%);
+
+        &:hover {
+          background: rgb(255 255 255 / 10%);
+          border-color: rgb(255 255 255 / 22%);
+          color: #fff;
+        }
+      }
+
+      .progress-time-current {
+        color: rgb(255 255 255 / 88%);
+      }
+
+      .progress-time-sep,
+      .progress-time-total {
+        color: rgb(255 255 255 / 48%);
+      }
+
+      .progress-chapter {
+        color: rgb(255 255 255 / 56%);
+      }
+
+      .prog-seg.is-current {
+        box-shadow: inset 0 0 0 1px rgb(255 255 255 / 12%);
+      }
+
+      .prog-playhead {
+        box-shadow:
+          0 0 0 1px rgb(0 0 0 / 40%),
+          0 0 6px rgb(74 222 128 / 35%);
+      }
+
+      .prog-seg-fill {
+        box-shadow: inset 0 1px 0 rgb(255 255 255 / 15%);
+
+        &::after {
+          background: linear-gradient(90deg, rgb(255 255 255 / 12%), transparent 55%);
+        }
+      }
+    }
+
+    .panel-center .progress-area.preview-progress .progress-meta {
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+
+    @media (min-width: 769px) {
+      .panel-center .progress-area.preview-progress {
+        left: max(
+          calc(var(--preview-panel-left) + var(--preview-sidebar-width) + var(--preview-progress-sidebar-gap)),
+          env(safe-area-inset-left, 0px)
+        );
+      }
     }
 
     .panel-center .viewport {
@@ -1053,73 +1061,6 @@
 
       .viewport-preview-nav {
         padding: 0 12px;
-      }
-
-      .panel-center .progress-area.preview-progress {
-        left: max(var(--preview-progress-inset, 12px), env(safe-area-inset-left, 0px));
-        right: max(var(--preview-progress-inset, 12px), env(safe-area-inset-right, 0px));
-        bottom: calc(var(--preview-progress-bottom, 24px) + env(safe-area-inset-bottom, 0px));
-        padding: 10px 12px;
-        background: #0d0f12;
-        border: none;
-        border-radius: 0;
-        box-shadow: 0 12px 40px rgb(0 0 0 / 36%);
-        --prog-gap: rgb(255 255 255 / 10%);
-        --prog-seg: rgb(255 255 255 / 16%);
-        --prog-seg-hover: rgb(255 255 255 / 22%);
-        --prog-seg-current: rgb(255 255 255 / 20%);
-        --prog-seg-current-hover: rgb(255 255 255 / 26%);
-        --prog-fill: #4ade80;
-        --prog-fill-highlight: #6ee7a0;
-        --prog-playhead: #4ade80;
-
-        .progress-ctrl-btn {
-          border-color: rgb(255 255 255 / 14%);
-          background: rgb(255 255 255 / 6%);
-          color: rgb(255 255 255 / 72%);
-
-          &:hover {
-            background: rgb(255 255 255 / 10%);
-            border-color: rgb(255 255 255 / 22%);
-            color: #fff;
-          }
-        }
-
-        .progress-time-current {
-          color: rgb(255 255 255 / 88%);
-        }
-
-        .progress-time-sep,
-        .progress-time-total {
-          color: rgb(255 255 255 / 48%);
-        }
-
-        .progress-chapter {
-          color: rgb(255 255 255 / 56%);
-        }
-
-        .prog-seg.is-current {
-          box-shadow: inset 0 0 0 1px rgb(255 255 255 / 12%);
-        }
-
-        .prog-playhead {
-          box-shadow:
-            0 0 0 1px rgb(0 0 0 / 40%),
-            0 0 6px rgb(74 222 128 / 35%);
-        }
-
-        .prog-seg-fill {
-          box-shadow: inset 0 1px 0 rgb(255 255 255 / 15%);
-
-          &::after {
-            background: linear-gradient(90deg, rgb(255 255 255 / 12%), transparent 55%);
-          }
-        }
-      }
-
-      .progress-meta {
-        flex-wrap: wrap;
-        gap: 6px;
       }
 
       .pip-group--view-fixed {
