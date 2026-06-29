@@ -1,0 +1,1037 @@
+// 编辑页统一深色主题（与预览模式配色一致，不改变布局与功能）
+@mixin editor-dark-surface {
+  background: var(--editor-panel-elevated) !important;
+  border-color: var(--editor-border) !important;
+  color: var(--editor-text-secondary);
+}
+
+@mixin editor-dark-button-default {
+  --el-button-bg-color: rgb(255 255 255 / 6%);
+  --el-button-border-color: var(--editor-border-strong);
+  --el-button-text-color: var(--editor-text-secondary);
+  --el-button-hover-bg-color: rgb(255 255 255 / 10%);
+  --el-button-hover-border-color: rgb(255 255 255 / 22%);
+  --el-button-hover-text-color: #fff;
+  --el-button-active-bg-color: rgb(255 255 255 / 12%);
+  --el-button-active-border-color: rgb(255 255 255 / 28%);
+  --el-button-active-text-color: #fff;
+}
+
+@mixin editor-dark-button-primary-plain {
+  --el-button-bg-color: var(--editor-accent-soft);
+  --el-button-border-color: rgb(74 222 128 / 35%);
+  --el-button-text-color: var(--editor-accent);
+  --el-button-hover-bg-color: rgb(20 48 36 / 92%);
+  --el-button-hover-border-color: rgb(74 222 128 / 50%);
+  --el-button-hover-text-color: var(--editor-accent-highlight);
+}
+
+@mixin editor-dark-button-danger-plain {
+  --el-button-bg-color: rgb(127 29 29 / 28%);
+  --el-button-border-color: rgb(248 113 113 / 35%);
+  --el-button-text-color: #f87171;
+  --el-button-hover-bg-color: rgb(127 29 29 / 42%);
+  --el-button-hover-border-color: rgb(248 113 113 / 50%);
+  --el-button-hover-text-color: #fca5a5;
+}
+
+.movie-editor.editor-dark-theme {
+  --editor-surface: #0a0b0d;
+  --editor-panel: #000;
+  --editor-panel-elevated: #0d0f12;
+  --editor-border: rgb(255 255 255 / 8%);
+  --editor-border-strong: rgb(255 255 255 / 14%);
+  --editor-text: rgb(255 255 255 / 88%);
+  --editor-text-secondary: rgb(255 255 255 / 72%);
+  --editor-text-muted: rgb(255 255 255 / 48%);
+  --editor-accent: #4ade80;
+  --editor-accent-soft: #143024;
+  --editor-accent-highlight: #6ee7a0;
+
+  background: var(--editor-surface);
+  color: var(--editor-text-secondary);
+
+  &:not(.preview-mode) {
+    // 覆盖全局 design token，避免子组件仍引用浅色变量
+    --text-color-1: rgb(255 255 255 / 88%);
+    --text-color-2: rgb(255 255 255 / 72%);
+    --text-color-3: rgb(255 255 255 / 48%);
+    --text-color-4: rgb(255 255 255 / 36%);
+    --border-color-1: rgb(255 255 255 / 8%);
+    --border-color-2: rgb(255 255 255 / 12%);
+    --border-color-3: rgb(255 255 255 / 18%);
+    --fill-color-1: #0a0b0d;
+    --fill-color-2: rgb(255 255 255 / 4%);
+    --fill-color-3: rgb(255 255 255 / 6%);
+    --fill-color-4: rgb(255 255 255 / 8%);
+    --fill-color-5: #0d0f12;
+    --fill-color-6: #000;
+    --fill-color-8: #0d0f12;
+    --primary-color-1: #143024;
+    --primary-color-5: #4ade80;
+    --primary-color-6: #4ade80;
+    --box-shadow-1: none;
+    --box-shadow-2: 0 8px 24px rgb(0 0 0 / 28%);
+
+    // ── 顶栏 ──
+    .editor-topbar {
+      background: var(--editor-panel);
+      border-bottom: 1px solid var(--editor-border);
+
+      &__logo img {
+        filter: brightness(0) invert(1);
+        opacity: 0.92;
+      }
+
+      &__title-text {
+        color: var(--editor-text);
+      }
+
+      &__title-edit {
+        color: var(--editor-text-muted);
+
+        &:hover {
+          color: var(--editor-accent);
+          background: rgb(255 255 255 / 6%);
+        }
+      }
+
+      &__title-input .el-input__wrapper {
+        background: rgb(255 255 255 / 6%);
+        box-shadow: inset 0 0 0 1px var(--editor-border-strong);
+
+        .el-input__inner {
+          color: var(--editor-text);
+        }
+      }
+
+      &__actions .el-button {
+        @include editor-dark-button-default;
+
+        &.el-button--primary {
+          @include editor-dark-button-primary-plain;
+        }
+
+        &.editor-topbar__save-btn.el-button--primary {
+          --el-color-primary: var(--editor-accent);
+          --el-button-bg-color: var(--editor-accent-soft);
+          --el-button-border-color: rgb(74 222 128 / 45%);
+          --el-button-text-color: var(--editor-accent);
+          --el-button-hover-bg-color: rgb(20 48 36 / 92%);
+          --el-button-hover-border-color: rgb(74 222 128 / 55%);
+          --el-button-hover-text-color: var(--editor-accent-highlight);
+          --el-button-active-bg-color: rgb(20 48 36);
+          --el-button-active-border-color: rgb(74 222 128 / 60%);
+          --el-button-active-text-color: var(--editor-accent-highlight);
+          --el-button-disabled-bg-color: rgb(255 255 255 / 4%);
+          --el-button-disabled-border-color: var(--editor-border);
+          --el-button-disabled-text-color: var(--editor-text-muted);
+
+          background-color: var(--el-button-bg-color) !important;
+          border-color: var(--el-button-border-color) !important;
+          color: var(--el-button-text-color) !important;
+
+          &:hover:not(.is-disabled) {
+            background-color: var(--el-button-hover-bg-color) !important;
+            border-color: var(--el-button-hover-border-color) !important;
+            color: var(--el-button-hover-text-color) !important;
+          }
+        }
+      }
+    }
+
+    // ── 全局 Element Plus 控件 ──
+    .el-button {
+      @include editor-dark-button-default;
+
+      &.el-button--primary {
+        @include editor-dark-button-primary-plain;
+
+        &:not(.is-plain) {
+          --el-button-bg-color: var(--editor-accent-soft);
+          --el-button-border-color: rgb(74 222 128 / 45%);
+          --el-button-text-color: var(--editor-accent);
+        }
+      }
+
+      &.el-button--danger.is-plain {
+        @include editor-dark-button-danger-plain;
+      }
+
+      &.is-text {
+        --el-button-bg-color: transparent;
+        --el-button-border-color: transparent;
+        --el-button-text-color: var(--editor-text-secondary);
+
+        &:hover {
+          --el-button-hover-text-color: var(--editor-accent);
+          --el-button-hover-bg-color: rgb(255 255 255 / 6%);
+        }
+
+        &.el-button--primary {
+          --el-button-text-color: var(--editor-accent);
+        }
+
+        &.el-button--danger {
+          --el-button-text-color: #f87171;
+        }
+      }
+    }
+
+    .el-input__wrapper,
+    .el-textarea__inner,
+    .el-select__wrapper {
+      background: rgb(255 255 255 / 4%) !important;
+      box-shadow: inset 0 0 0 1px var(--editor-border-strong) !important;
+    }
+
+    .el-input__inner,
+    .el-textarea__inner,
+    .el-select__selected-item,
+    .el-input-number .el-input__inner {
+      color: var(--editor-text) !important;
+    }
+
+    .el-input-number__decrease,
+    .el-input-number__increase {
+      background: rgb(255 255 255 / 4%);
+      color: var(--editor-text-muted);
+      border-color: var(--editor-border-strong);
+    }
+
+    .el-slider__runway {
+      background: rgb(255 255 255 / 12%);
+    }
+
+    .el-slider__bar {
+      background: var(--editor-accent);
+    }
+
+    .el-slider__button {
+      border-color: var(--editor-accent);
+      background: #fff;
+    }
+
+    // 开关：开启绿色、关闭深灰（与预览模式一致，避免默认蓝色/浅灰）
+    .el-switch {
+      --el-switch-on-color: var(--editor-accent);
+      --el-switch-off-color: rgb(255 255 255 / 16%);
+
+      .el-switch__core {
+        border-color: rgb(255 255 255 / 12%);
+      }
+
+      &.is-checked .el-switch__core {
+        border-color: rgb(74 222 128 / 40%);
+      }
+
+      .el-switch__action {
+        background: #fff;
+      }
+    }
+
+    .el-collapse-item__header {
+      color: var(--editor-text-secondary) !important;
+      background: transparent !important;
+      border-color: var(--editor-border) !important;
+    }
+
+    .el-collapse-item__wrap,
+    .el-collapse-item__content {
+      background: transparent !important;
+      border-color: var(--editor-border) !important;
+      color: var(--editor-text-secondary);
+    }
+
+    // ── 左侧节点面板 ──
+    .panel-left {
+      background: var(--editor-panel);
+      border-right: 1px solid var(--editor-border);
+    }
+
+    .chapter-list-panel {
+      background: var(--editor-panel) !important;
+
+      .panel-head {
+        background: transparent !important;
+        border-bottom: 1px solid var(--editor-border);
+        color: var(--editor-text-muted);
+        font-size: 11px;
+        font-weight: 600;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      .chapter-panel-detail {
+        background: var(--editor-panel) !important;
+      }
+
+      .chapter-detail-head {
+        background: transparent !important;
+        border-bottom: 1px solid var(--editor-border);
+        color: var(--editor-text);
+      }
+
+      .chapter-detail-sub {
+        color: var(--editor-accent);
+      }
+
+      .chapter-list {
+        background: transparent !important;
+        padding: 4px 0 12px;
+      }
+    }
+
+    .ch-item {
+      position: relative;
+      margin-bottom: 0;
+      border: none !important;
+      border-radius: 0;
+      background: transparent !important;
+      box-shadow: none !important;
+
+      &:hover {
+        background: rgb(255 255 255 / 4%) !important;
+      }
+
+      &.active,
+      &.playing {
+        background: var(--editor-accent-soft) !important;
+
+        .ch-name {
+          color: var(--editor-accent);
+          font-weight: 500;
+        }
+
+        .ch-dot {
+          background: var(--editor-accent);
+        }
+      }
+
+      .ch-name {
+        color: var(--editor-text-secondary);
+      }
+
+      .ch-time {
+        color: var(--editor-text-muted);
+      }
+
+      .ch-segment-track {
+        background: rgb(255 255 255 / 10%);
+      }
+
+      .ch-segment-fill {
+        background: var(--editor-accent);
+      }
+
+      &.is-child.active::before {
+        content: "";
+        position: absolute;
+        left: 8px;
+        top: 6px;
+        bottom: 6px;
+        width: 2px;
+        border-radius: 1px;
+        background: var(--editor-accent);
+      }
+    }
+
+    // ── 节点详情 / 镜头表单 ──
+    .chapter-detail-panel {
+      background: transparent !important;
+
+      .detail-section {
+        @include editor-dark-surface;
+        box-shadow: none !important;
+      }
+
+      .detail-section-title {
+        color: var(--editor-text);
+        border-bottom-color: var(--editor-border);
+      }
+
+      .chapter-field-label,
+      .chapter-cam-group-label {
+        color: var(--editor-text-secondary) !important;
+      }
+
+      .chapter-axis-label {
+        color: var(--editor-text-muted) !important;
+      }
+
+      .chapter-time-hint {
+        color: var(--editor-text-muted);
+      }
+
+      .chapter-capture-btn {
+        @include editor-dark-button-primary-plain;
+      }
+    }
+
+    .chapter-detail-empty {
+      background: transparent !important;
+      color: var(--editor-text-muted);
+    }
+
+    .chapter-list-empty,
+    .chapter-empty-desc-text,
+    .empty-hint {
+      color: var(--editor-text-muted);
+    }
+
+    .chapter-empty-add-link {
+      color: var(--editor-accent);
+
+      &:hover {
+        color: var(--editor-accent-highlight);
+      }
+    }
+
+    // ── 右侧配置面板 ──
+    .editor-body__right,
+    .panel-right,
+    .editor-config-panel {
+      background: var(--editor-panel) !important;
+      border-left: 1px solid var(--editor-border);
+    }
+
+    .right-tabs {
+      background: var(--editor-panel);
+      border-bottom: 1px solid var(--editor-border);
+
+      .right-tab {
+        color: var(--editor-text-muted);
+
+        &:hover {
+          color: var(--editor-text);
+          background: rgb(255 255 255 / 4%);
+        }
+
+        &.active {
+          color: var(--editor-accent);
+          background: var(--editor-accent-soft);
+          border-color: rgb(74 222 128 / 24%);
+          box-shadow: none;
+        }
+      }
+    }
+
+    .panel-model-head,
+    .model-tab .model-list,
+    .model-config,
+    .model-config-empty,
+    .model-config-header,
+    .subtitle-editor-panel,
+    .subtitle-form-card,
+    .subtitle-list-section,
+    .subtitle-item,
+    .scene-settings-panel .sp-body,
+    .scene-tab-footer,
+    .base-form-group,
+    .panel-actions,
+    .video-upload-card,
+    .card-header,
+    .video-drop-zone,
+    .video-url-box {
+      @include editor-dark-surface;
+    }
+
+    .base-form-group .base-form-title,
+    .panel-model-head,
+    .sp-module-title,
+    .subtitle-form-title,
+    .subtitle-list-title {
+      color: var(--editor-text-muted);
+    }
+
+    .base-form-group {
+      .base-form-title {
+        background: rgb(255 255 255 / 3%);
+        border-bottom: 1px solid var(--editor-border);
+      }
+
+      .base-form-row {
+        background: transparent;
+      }
+    }
+
+    .scene-tab-footer {
+      border-top: 1px solid var(--editor-border);
+    }
+
+    .sp-aa-preset {
+      border-color: var(--editor-border-strong);
+      background: rgb(255 255 255 / 4%);
+      color: var(--editor-text-secondary);
+
+      &:hover {
+        border-color: rgb(74 222 128 / 35%);
+        color: var(--editor-accent);
+        background: var(--editor-accent-soft);
+      }
+
+      &.is-active {
+        border-color: rgb(74 222 128 / 45%);
+        color: var(--editor-accent);
+        background: var(--editor-accent-soft);
+      }
+    }
+
+    // ── 模型列表 / 树 ──
+    .model-card {
+      background: rgb(255 255 255 / 3%) !important;
+      border-color: var(--editor-border) !important;
+      box-shadow: none !important;
+
+      &:hover {
+        border-color: rgb(74 222 128 / 30%) !important;
+      }
+
+      &.selected {
+        background: var(--editor-accent-soft) !important;
+        border-color: rgb(74 222 128 / 45%) !important;
+
+        .model-name {
+          color: var(--editor-accent);
+        }
+      }
+
+      .model-name {
+        color: var(--editor-text-secondary);
+      }
+
+      .model-type-tag {
+        color: var(--editor-text-muted);
+        background: rgb(255 255 255 / 6%);
+      }
+
+      .edited-badge {
+        background: rgb(74 222 128 / 12%);
+        color: var(--editor-accent);
+        border-color: rgb(74 222 128 / 28%);
+      }
+    }
+
+    .model-tree-node {
+      &:hover {
+        background: rgb(255 255 255 / 4%);
+        border-color: var(--editor-border);
+      }
+
+      &.selected,
+      &.hovered:not(.selected) {
+        background: var(--editor-accent-soft);
+        border-color: rgb(74 222 128 / 35%);
+        box-shadow: inset 2px 0 0 var(--editor-accent);
+      }
+
+      .tree-node-name {
+        color: var(--editor-text-secondary);
+      }
+
+      .tree-node-type {
+        color: var(--editor-text-muted);
+        background: rgb(255 255 255 / 6%);
+      }
+
+      .tree-node-icon {
+        color: var(--editor-text-muted);
+      }
+
+      &.is-mesh .tree-node-icon {
+        color: var(--editor-accent);
+      }
+
+      .edited-badge,
+      .tree-node-merged {
+        background: rgb(74 222 128 / 12%);
+        color: var(--editor-accent);
+        border: 1px solid rgb(74 222 128 / 24%);
+      }
+    }
+
+    .model-tree-children {
+      border-left-color: var(--editor-border);
+    }
+
+    // ── 模型配置 / 动画 ──
+    .model-config-header,
+    .model-switch-label,
+    .model-intro-label,
+    .md-name,
+    .md-group-title,
+    .md-switch span,
+    .md-color-val,
+    .md-chapter {
+      color: var(--editor-text-muted);
+    }
+
+    .md-group-title > span {
+      color: var(--editor-text);
+    }
+
+    .md-node-path {
+      color: var(--editor-accent);
+      background: var(--editor-accent-soft);
+    }
+
+    .md-section-divider {
+      background: var(--editor-border);
+    }
+
+    .model-animation {
+      .md-anim-play-btn,
+      .md-anim-save-btn {
+        color: var(--editor-accent) !important;
+        border-color: rgb(74 222 128 / 35%) !important;
+        background: var(--editor-accent-soft) !important;
+
+        &:hover:not(:disabled) {
+          color: var(--editor-accent-highlight) !important;
+          background: rgb(20 48 36 / 92%) !important;
+          border-color: rgb(74 222 128 / 50%) !important;
+        }
+      }
+
+      .md-anim-reset-btn {
+        color: var(--editor-text-secondary) !important;
+        border-color: var(--editor-border-strong) !important;
+        background: rgb(255 255 255 / 6%) !important;
+
+        &:hover:not(:disabled) {
+          color: #fff !important;
+          background: rgb(255 255 255 / 10%) !important;
+        }
+      }
+
+      .seg-transform-label,
+      .seg-info {
+        color: var(--editor-text-muted) !important;
+      }
+    }
+
+    .seg-card,
+    .kf-card {
+      background: rgb(255 255 255 / 3%) !important;
+      border-color: var(--editor-border) !important;
+      box-shadow: none !important;
+    }
+
+    .seg-card-head:hover,
+    .kf-card-head:hover,
+    .seg-card-head-row {
+      background: transparent;
+    }
+
+    .seg-btn {
+      background: rgb(255 255 255 / 6%);
+      border-color: var(--editor-border-strong);
+      color: var(--editor-text-secondary);
+
+      &:hover {
+        border-color: rgb(74 222 128 / 35%);
+        color: var(--editor-accent);
+        background: var(--editor-accent-soft);
+      }
+    }
+
+    .seg-idx {
+      color: var(--editor-accent);
+    }
+
+    .seg-progress {
+      background: rgb(255 255 255 / 10%);
+    }
+
+    .seg-progress-bar {
+      background: var(--editor-accent);
+    }
+
+    // ── 字幕 ──
+    .subtitle-field-label,
+    .subtitle-item-time {
+      color: var(--editor-text-muted);
+    }
+
+    .subtitle-item-text {
+      color: var(--editor-text-secondary);
+    }
+
+    .subtitle-item {
+      border-color: var(--editor-border);
+
+      &:hover,
+      &.is-editing {
+        background: rgb(255 255 255 / 4%);
+      }
+    }
+
+    .subtitle-item-del {
+      opacity: 0.72;
+      color: rgb(255 255 255 / 52%);
+      background: rgb(255 255 255 / 6%);
+
+      &:hover {
+        opacity: 1;
+        color: #f87171;
+        background: rgb(127 29 29 / 32%);
+      }
+    }
+
+    .subtitle-item:hover .subtitle-item-del,
+    .subtitle-item.is-editing .subtitle-item-del {
+      opacity: 1;
+    }
+
+    .subtitle-submit-btn {
+      @include editor-dark-button-primary-plain;
+    }
+
+    // ── 视频上传 ──
+    .video-upload-card {
+      .card-title {
+        color: var(--editor-text);
+      }
+    }
+
+    .video-source-tab {
+      color: var(--editor-text-muted);
+      background: rgb(255 255 255 / 4%);
+      border-color: var(--editor-border);
+
+      &:hover {
+        color: var(--editor-text);
+        background: rgb(255 255 255 / 8%);
+      }
+
+      &.active {
+        color: var(--editor-accent);
+        background: var(--editor-accent-soft);
+        border-color: rgb(74 222 128 / 35%);
+      }
+    }
+
+    .video-drop-zone {
+      border-color: var(--editor-border-strong);
+      background: rgb(255 255 255 / 2%) !important;
+
+      &:hover,
+      &.drag-over {
+        border-color: rgb(74 222 128 / 40%);
+        background: var(--editor-accent-soft) !important;
+      }
+    }
+
+    .drop-text {
+      color: var(--editor-text-secondary);
+    }
+
+    .drop-hint,
+    .url-label,
+    .url-hint {
+      color: var(--editor-text-muted);
+    }
+
+    // ── 视口 / 进度条 / PIP ──
+    .panel-center .viewport {
+      background: var(--editor-surface);
+    }
+
+    .panel-center .progress-area {
+      background: var(--editor-panel-elevated);
+      border-top: none;
+      --prog-gap: rgb(255 255 255 / 10%);
+      --prog-seg: rgb(255 255 255 / 16%);
+      --prog-seg-hover: rgb(255 255 255 / 22%);
+      --prog-seg-current: rgb(255 255 255 / 20%);
+      --prog-seg-current-hover: rgb(255 255 255 / 26%);
+      --prog-fill: var(--editor-accent);
+      --prog-fill-highlight: var(--editor-accent-highlight);
+      --prog-playhead: var(--editor-accent);
+
+      .progress-ctrl-btn {
+        border-color: var(--editor-border-strong);
+        background: rgb(255 255 255 / 6%);
+        color: var(--editor-text-secondary);
+
+        &:hover {
+          background: rgb(255 255 255 / 10%);
+          border-color: rgb(255 255 255 / 22%);
+          color: #fff;
+        }
+      }
+
+      .progress-time-current {
+        color: var(--editor-text);
+      }
+
+      .progress-time-sep,
+      .progress-time-total,
+      .progress-chapter {
+        color: var(--editor-text-muted);
+      }
+
+      .prog-seg.is-current {
+        box-shadow: inset 0 0 0 1px rgb(255 255 255 / 12%);
+      }
+
+      .prog-playhead {
+        box-shadow:
+          0 0 0 1px rgb(0 0 0 / 40%),
+          0 0 6px rgb(74 222 128 / 35%);
+      }
+
+      .prog-seg-fill::after {
+        background: linear-gradient(90deg, rgb(255 255 255 / 12%), transparent 55%);
+      }
+    }
+
+    .pip-group .video-pip {
+      border: 1px solid rgb(255 255 255 / 12%);
+      border-radius: 0;
+      background: #000;
+      box-shadow:
+        0 0 0 1px rgb(0 0 0 / 18%) inset,
+        0 8px 24px rgb(0 0 0 / 28%);
+    }
+
+    .video-info-bar {
+      background: var(--editor-panel-elevated);
+      border: 1px solid var(--editor-border);
+      border-top: none;
+      color: var(--editor-text-muted);
+
+      .vi-value {
+        color: var(--editor-text-secondary);
+      }
+    }
+
+    // ── 场景面板字段标签 ──
+    .el-form-item__label,
+    .sp-field > label,
+    .base-form .el-form-item__label {
+      color: var(--editor-text-muted) !important;
+    }
+
+    .subtitle-list.is-empty {
+      background: rgb(255 255 255 / 3%) !important;
+      border-color: var(--editor-border) !important;
+    }
+
+    .subtitle-list-count {
+      color: var(--editor-text-muted);
+      background: rgb(255 255 255 / 6%);
+    }
+
+    .base-empty {
+      .base-empty__text,
+      .empty-text {
+        color: var(--editor-text-muted) !important;
+      }
+    }
+
+    .detail-empty,
+    .model-empty-desc,
+    .model-config-empty-desc,
+    .subtitle-empty-desc,
+    .sp-hint {
+      color: var(--editor-text-muted);
+    }
+  }
+}
+
+// 场景列表抽屉（teleport 到 body，class 在 .el-drawer 根节点上）
+.editor-scene-list-drawer.el-drawer {
+  background: #0a0b0d !important;
+  box-shadow: -12px 0 40px rgb(0 0 0 / 42%);
+
+  .el-drawer__header {
+    margin-bottom: 0;
+    padding: 16px 20px 12px;
+    border-bottom: 1px solid rgb(255 255 255 / 8%);
+    background: #0a0b0d;
+  }
+
+  .el-drawer__title {
+    color: rgb(255 255 255 / 88%);
+  }
+
+  .el-drawer__close-btn {
+    color: rgb(255 255 255 / 56%);
+
+    &:hover {
+      color: #fff;
+    }
+  }
+
+  .el-drawer__body {
+    background: #0a0b0d;
+    color: rgb(255 255 255 / 72%);
+  }
+
+  .editor-scene-list-drawer__table-wrap {
+    background: #0d0f12 !important;
+    border: 1px solid rgb(255 255 255 / 8%);
+    border-radius: var(--corner-radius-2);
+  }
+
+  .editor-scene-list-drawer__table {
+    --el-table-bg-color: #0d0f12;
+    --el-table-tr-bg-color: #0d0f12;
+    --el-table-header-bg-color: #000;
+    --el-table-row-hover-bg-color: #143024;
+    --el-table-border-color: rgb(255 255 255 / 8%);
+    --el-table-text-color: rgb(255 255 255 / 72%);
+    --el-table-header-text-color: rgb(255 255 255 / 48%);
+    --el-fill-color-lighter: rgb(255 255 255 / 4%);
+    background: #0d0f12;
+
+    .el-table__body tr.el-table__row--striped td.el-table__cell {
+      background: rgb(255 255 255 / 4%) !important;
+    }
+
+    .el-table__body tr td.el-table__cell {
+      background: #0d0f12;
+    }
+
+    .el-table__fixed-right,
+    .el-table__fixed-left,
+    .el-table__fixed-right-patch {
+      background: #0d0f12 !important;
+    }
+  }
+
+  .scene-row-actions {
+    .el-button {
+      --el-button-bg-color: rgb(255 255 255 / 6%);
+      --el-button-border-color: rgb(255 255 255 / 14%);
+      --el-button-text-color: rgb(255 255 255 / 72%);
+      --el-button-hover-bg-color: rgb(255 255 255 / 10%);
+      --el-button-hover-border-color: rgb(255 255 255 / 22%);
+      --el-button-hover-text-color: #fff;
+    }
+
+    .el-button--primary.is-plain {
+      --el-button-bg-color: #143024;
+      --el-button-border-color: rgb(74 222 128 / 35%);
+      --el-button-text-color: #4ade80;
+      --el-button-hover-bg-color: rgb(20 48 36 / 92%);
+      --el-button-hover-border-color: rgb(74 222 128 / 50%);
+      --el-button-hover-text-color: #6ee7a0;
+    }
+
+    .el-button--danger.is-plain {
+      --el-button-bg-color: rgb(127 29 29 / 28%);
+      --el-button-border-color: rgb(248 113 113 / 35%);
+      --el-button-text-color: #f87171;
+      --el-button-hover-bg-color: rgb(127 29 29 / 42%);
+      --el-button-hover-border-color: rgb(248 113 113 / 50%);
+      --el-button-hover-text-color: #fca5a5;
+    }
+  }
+
+  .el-empty__description {
+    color: rgb(255 255 255 / 48%);
+  }
+}
+
+// 编辑页内提示弹框（teleport 到 body）
+body:has(.movie-editor.editor-dark-theme) {
+  .el-overlay.is-message-box {
+    background-color: rgb(0 0 0 / 52%);
+  }
+
+  .el-message-box {
+    background: #0d0f12;
+    border: 1px solid rgb(255 255 255 / 10%);
+    border-radius: 8px;
+    box-shadow: 0 16px 48px rgb(0 0 0 / 48%);
+
+    .el-message-box__header {
+      padding-top: 18px;
+    }
+
+    .el-message-box__title {
+      color: rgb(255 255 255 / 88%);
+    }
+
+    .el-message-box__headerbtn .el-message-box__close {
+      color: rgb(255 255 255 / 56%);
+
+      &:hover {
+        color: #fff;
+      }
+    }
+
+    .el-message-box__content {
+      color: rgb(255 255 255 / 72%);
+    }
+
+    .el-message-box__status.el-message-box-icon--warning {
+      color: #fbbf24;
+    }
+
+    .el-message-box__btns {
+      .el-button {
+        --el-button-bg-color: rgb(255 255 255 / 6%);
+        --el-button-border-color: rgb(255 255 255 / 14%);
+        --el-button-text-color: rgb(255 255 255 / 72%);
+        --el-button-hover-bg-color: rgb(255 255 255 / 10%);
+        --el-button-hover-border-color: rgb(255 255 255 / 22%);
+        --el-button-hover-text-color: #fff;
+      }
+
+      .el-button--primary {
+        --el-button-bg-color: #143024;
+        --el-button-border-color: rgb(74 222 128 / 35%);
+        --el-button-text-color: #4ade80;
+        --el-button-hover-bg-color: rgb(20 48 36 / 92%);
+        --el-button-hover-border-color: rgb(74 222 128 / 50%);
+        --el-button-hover-text-color: #6ee7a0;
+      }
+    }
+  }
+
+  .el-message {
+    --el-message-bg-color: #0d0f12;
+    --el-message-border-color: rgb(255 255 255 / 10%);
+    --el-message-text-color: rgb(255 255 255 / 88%);
+  }
+
+  // 下拉菜单（teleport 到 body：旋转中心点、阴影类型等）
+  .el-select__popper.el-popper,
+  .el-select-dropdown.el-popper {
+    --el-bg-color-overlay: #0d0f12;
+    background: #0d0f12 !important;
+    border: 1px solid rgb(255 255 255 / 10%) !important;
+    box-shadow: 0 8px 24px rgb(0 0 0 / 40%) !important;
+
+    .el-popper__arrow::before {
+      background: #0d0f12 !important;
+      border: 1px solid rgb(255 255 255 / 10%) !important;
+    }
+  }
+
+  .el-select-dropdown__wrap {
+    background: #0d0f12;
+  }
+
+  .el-select-dropdown__list {
+    padding: 4px 0;
+  }
+
+  .el-select-dropdown__item {
+    color: rgb(255 255 255 / 72%);
+
+    &.is-hovering,
+    &:hover {
+      background: rgb(255 255 255 / 6%);
+    }
+
+    &.is-selected,
+    &.selected {
+      color: #4ade80;
+      font-weight: 500;
+    }
+  }
+}

@@ -12,14 +12,23 @@
             v-model="subForm.startTime"
             :min="0"
             :max="editor.duration"
-            :step="0.1"
+            :step="1"
+            :precision="0"
             :controls="false"
             size="small"
           />
         </div>
         <div class="subtitle-form-field">
           <label class="subtitle-field-label">{{ $t("OpWeb.Editor.EndTime", "结束时间") }}</label>
-          <el-input-number v-model="subForm.endTime" :min="0" :max="editor.duration" :step="0.1" :controls="false" size="small" />
+          <el-input-number
+            v-model="subForm.endTime"
+            :min="0"
+            :max="editor.duration"
+            :step="1"
+            :precision="0"
+            :controls="false"
+            size="small"
+          />
         </div>
       </div>
 

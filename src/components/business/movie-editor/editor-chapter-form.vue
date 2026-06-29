@@ -43,15 +43,15 @@
           <div class="chapter-cam-grid chapter-cam-grid--3">
             <div class="chapter-cam-field">
               <label class="chapter-axis-label">X</label>
-              <el-input-number v-model="cameraForm.posX" :step="0.05" :controls="false" size="small" />
+              <el-input-number v-model="cameraForm.posX" :step="0.001" :precision="3" :controls="false" size="small" />
             </div>
             <div class="chapter-cam-field">
               <label class="chapter-axis-label">Y</label>
-              <el-input-number v-model="cameraForm.posY" :step="0.05" :controls="false" size="small" />
+              <el-input-number v-model="cameraForm.posY" :step="0.001" :precision="3" :controls="false" size="small" />
             </div>
             <div class="chapter-cam-field">
               <label class="chapter-axis-label">Z</label>
-              <el-input-number v-model="cameraForm.posZ" :step="0.05" :controls="false" size="small" />
+              <el-input-number v-model="cameraForm.posZ" :step="0.001" :precision="3" :controls="false" size="small" />
             </div>
           </div>
         </div>
@@ -61,15 +61,15 @@
           <div class="chapter-cam-grid chapter-cam-grid--3">
             <div class="chapter-cam-field">
               <label class="chapter-axis-label">X</label>
-              <el-input-number v-model="cameraForm.targetX" :step="0.05" :controls="false" size="small" />
+              <el-input-number v-model="cameraForm.targetX" :step="0.001" :precision="3" :controls="false" size="small" />
             </div>
             <div class="chapter-cam-field">
               <label class="chapter-axis-label">Y</label>
-              <el-input-number v-model="cameraForm.targetY" :step="0.05" :controls="false" size="small" />
+              <el-input-number v-model="cameraForm.targetY" :step="0.001" :precision="3" :controls="false" size="small" />
             </div>
             <div class="chapter-cam-field">
               <label class="chapter-axis-label">Z</label>
-              <el-input-number v-model="cameraForm.targetZ" :step="0.05" :controls="false" size="small" />
+              <el-input-number v-model="cameraForm.targetZ" :step="0.001" :precision="3" :controls="false" size="small" />
             </div>
           </div>
         </div>
@@ -150,6 +150,7 @@ const activeChapter = computed(() => {
 });
 
 const isChildChapter = computed(() => !!activeChapter.value?.parentId);
+const round3 = (n: number) => Math.round((Number(n) || 0) * 1000) / 1000;
 
 const syncForms = () => {
   const ch = activeChapter.value;
@@ -185,7 +186,7 @@ watch(() => [editor.selectedChapterId, editor.chapterFormRevision, editor.camera
 watch(
   chapterForm,
   () => {
-    if (isSyncingChapterForm || editor.chapterNavLock) return;
+    if (isSyncingChapterForm || unref(editor.chapterNavLock)) return;
     editor.applyChapterFormSnapshot({ ...chapterForm });
     editor.saveChF();
   },
@@ -195,7 +196,13 @@ watch(
 watch(
   cameraForm,
   () => {
-    if (isSyncingCameraForm) return;
+    if (isSyncingCameraForm || unref(editor.chapterNavLock) || unref(editor.isCameraTransitioning)) return;
+    cameraForm.posX = round3(cameraForm.posX);
+    cameraForm.posY = round3(cameraForm.posY);
+    cameraForm.posZ = round3(cameraForm.posZ);
+    cameraForm.targetX = round3(cameraForm.targetX);
+    cameraForm.targetY = round3(cameraForm.targetY);
+    cameraForm.targetZ = round3(cameraForm.targetZ);
     editor.applyCameraFormSnapshot({ ...cameraForm });
     const ch = activeChapter.value;
     if (ch) {

@@ -5,6 +5,8 @@ import { SCENE_GRID_COLOR, SCENE_GRID_COLOR_CENTER } from "./constants";
 function createGridMaterial(color: number): THREE.LineBasicMaterial {
   return new THREE.LineBasicMaterial({
     color,
+    transparent: true,
+    opacity: 0.55,
     depthWrite: false,
     fog: true,
     toneMapped: false

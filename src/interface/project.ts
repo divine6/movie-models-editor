@@ -10,6 +10,8 @@ export interface Project {
   videoDuration: number;
   videoWidth: number;
   videoHeight: number;
+  /** 画中画展示宽度（用于桌面横屏的预览/浏览尺寸同步） */
+  videoDisplayWidth: number;
   createdAt: string;
   updatedAt: string;
 }
@@ -71,9 +73,14 @@ export interface ModelConfig {
   visible: boolean;
   posOffset: [number, number, number];
   scale: number;
-  highlight: boolean;
-  highlightColor: string; // 边框高亮颜色
-  outline: boolean; // 显示轮廓边线
+  wireframe?: boolean; // 仅显示线框（隐藏模型面）
+  highlight: boolean; // 模型本体高亮
+  /** @deprecated 请使用 outlineColor / modelHighlightColor */
+  highlightColor?: string;
+  outlineColor?: string; // 轮廓高亮颜色
+  wireframeColor?: string; // 线框颜色
+  modelHighlightColor?: string; // 模型高亮颜色
+  outline: boolean; // 模型外轮廓高亮
   animation: boolean;
   intro?: string; // 节点内模型介绍文案
   animConfig?: AnimationConfig;
@@ -115,6 +122,8 @@ export interface ModelHierarchyNode {
   materialGroupHost?: boolean;
   /** 仅 mesh：用于识别同源几何体 */
   geometryKey?: string;
+  /** 本地位置指纹，用于区分同几何体实例与多材质拆分 */
+  localPosKey?: string;
 }
 
 /** 字幕 */

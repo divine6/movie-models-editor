@@ -996,93 +996,96 @@
     .viewport-preview-nav-btn {
       pointer-events: auto !important;
     }
-  }
 
-  &.view-only-route {
-    .editor-topbar {
-      grid-template-columns: 1fr;
-      padding: 0 16px;
+    &.view-only-route {
+      .editor-topbar {
+        display: flex;
+        grid-template-columns: unset;
+        align-items: center;
+        height: var(--preview-topbar-height);
+        min-height: var(--preview-topbar-height);
+        padding: 16px 16px 0;
+        background: transparent;
+        border-bottom: none;
 
-      .editor-topbar__logo {
-        justify-self: start;
-      }
-    }
-
-    &.preview-mode .editor-topbar {
-      display: flex;
-      grid-template-columns: unset;
-      align-items: center;
-      height: var(--preview-topbar-height);
-      min-height: var(--preview-topbar-height);
-      padding: 16px 16px 0;
-
-      @media (min-width: 769px) {
-        align-items: flex-start;
-        padding: 16px 24px 0;
-      }
-    }
-
-    .pip-group--view-fixed {
-      cursor: default;
-      touch-action: none;
-      user-select: none;
-      pointer-events: none;
-      left: auto !important;
-      right: max(
-        var(--preview-pip-right, 16px),
-        calc(env(safe-area-inset-right, 0px) + var(--preview-pip-right, 16px))
-      ) !important;
-      top: calc(env(safe-area-inset-top, 0px) + var(--preview-pip-top, 68px)) !important;
-      max-width: none;
-
-      &.is-dragging,
-      &.is-resizing {
-        cursor: default;
-      }
-    }
-
-    .pip-resize-handle {
-      display: none;
-    }
-
-    @media (max-width: 768px) {
-      .editor-body__chapters {
-        left: 0;
-        top: 0;
-        bottom: 0;
-        width: 0;
-        max-width: 0;
-        overflow: visible;
-
-        &:has(.chapter-list-panel.is-drawer-open) {
-          z-index: 100;
+        @media (min-width: 769px) {
+          align-items: flex-start;
+          padding: 16px 24px 0;
         }
       }
 
-      .viewport-preview-nav {
-        padding: 0 12px;
-      }
-
       .pip-group--view-fixed {
-        max-width: none;
+        cursor: default;
+        touch-action: none;
+        user-select: none;
+        pointer-events: none;
+        left: auto !important;
         right: max(
           var(--preview-pip-right, 16px),
           calc(env(safe-area-inset-right, 0px) + var(--preview-pip-right, 16px))
         ) !important;
-      }
-    }
-
-    @media (max-width: 480px) {
-      .editor-body__chapters {
-        max-width: 0;
-      }
-
-      .viewport-preview-nav {
-        padding: 0 12px;
-      }
-
-      .pip-group--view-fixed {
+        top: calc(env(safe-area-inset-top, 0px) + var(--preview-pip-top, 68px)) !important;
         max-width: none;
+        filter: drop-shadow(0 10px 28px rgb(0 0 0 / 36%));
+
+        &.is-dragging,
+        &.is-resizing {
+          cursor: default;
+        }
+
+        .video-pip {
+          border: 1px solid rgb(255 255 255 / 12%);
+          border-radius: 0;
+          background: #000;
+          box-shadow:
+            0 0 0 1px rgb(0 0 0 / 18%) inset,
+            0 8px 24px rgb(0 0 0 / 28%);
+        }
+      }
+
+      .pip-resize-handle {
+        display: none;
+      }
+
+      @media (max-width: 768px) {
+        .editor-body__chapters {
+          left: 0;
+          top: 0;
+          bottom: 0;
+          width: 0;
+          max-width: 0;
+          overflow: visible;
+
+          &:has(.chapter-list-panel.is-drawer-open) {
+            z-index: 100;
+          }
+        }
+
+        .viewport-preview-nav {
+          padding: 0 12px;
+        }
+
+        .pip-group--view-fixed {
+          max-width: none;
+          right: max(
+            var(--preview-pip-right, 16px),
+            calc(env(safe-area-inset-right, 0px) + var(--preview-pip-right, 16px))
+          ) !important;
+        }
+      }
+
+      @media (max-width: 480px) {
+        .editor-body__chapters {
+          max-width: 0;
+        }
+
+        .viewport-preview-nav {
+          padding: 0 12px;
+        }
+
+        .pip-group--view-fixed {
+          max-width: none;
+        }
       }
     }
   }

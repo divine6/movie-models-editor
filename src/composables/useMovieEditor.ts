@@ -31,6 +31,7 @@ import { useRoute, useRouter } from "vue-router";
 import {
   buildScenePreviewLink,
   fetchModelSet,
+  fetchSceneList,
   fetchScene,
   rewireEditorFrontendHost,
   rewireEditorServerHost,
@@ -40,27 +41,43 @@ import {
   uploadSceneVideo
 } from "@/api/modules/editor-server";
 import {
+  ANTIALIASING_MODE_OPTIONS,
   CHAPTER_END_EPS,
   CHAPTER_TIME_EPS,
   CURVE_LABELS,
   DEFAULT_SCENE_SETTINGS,
   EASING_LIST,
+  getSceneSettingsStorageKey,
   PLAYBACK_RATES,
   SCENE_SETTINGS_STORAGE_KEY,
   SEEK_EVENT_TIMEOUT_MS,
   SEEK_READY_TIMEOUT_MS,
+  normalizeAntialiasRatio,
+  resolveEditorRenderPixelRatio,
   TONE_MAPPING_MAP,
-  TONE_MAPPING_OPTIONS
+  TONE_MAPPING_OPTIONS,
+  type AntialiasingMode
 } from "@/composables/movie-editor/constants";
 export { MOVIE_EDITOR_KEY } from "@/composables/movie-editor/keys";
 import { MOVIE_EDITOR_KEY } from "@/composables/movie-editor/keys";
 import { ColorCorrectionShader } from "@/composables/movie-editor/shaders/colorCorrection";
+import { FXAAPass } from "three/addons/postprocessing/FXAAPass.js";
+import { SMAAPass } from "three/addons/postprocessing/SMAAPass.js";
 import { mapStoredAnimSegment, nextAnimSegmentId, roundAnimNum } from "@/composables/movie-editor/utils/animation";
-import { createDefaultModelConfig, getModelConfig } from "@/composables/movie-editor/utils/modelConfig";
+import { createDefaultModelConfig, getModelConfig, DEFAULT_OUTLINE_COLOR, DEFAULT_WIREFRAME_COLOR, DEFAULT_MODEL_HIGHLIGHT_COLOR } from "@/composables/movie-editor/utils/modelConfig";
+import {
+  buildSceneLightRuntime,
+  computeSceneLightPosition,
+  createDefaultSceneLight,
+  disposeSceneLightRuntime,
+  migrateLegacySceneLights,
+  syncSceneLightRuntime,
+  type SceneLightRuntime
+} from "@/composables/movie-editor/sceneLights";
 import { createTimelineHelpers } from "@/composables/movie-editor/utils/timeline";
 import { exportPlayer } from "@/composables/usePlayerExport";
 import { resumeProjectPersist, suspendProjectPersist } from "@/utils/projectPersist";
-import { flattenChapterTree, getDescendantChapterIds, getRootChapters } from "@/utils/chapterTree";
+import { flattenChapterTree, getDescendantChapterIds, getRootChapters, resolveActiveChapterAtTime } from "@/utils/chapterTree";
 import { isCoarsePointerDevice, withVideoPosterFragment } from "@/utils/device";
 import {
   type Chapter,
@@ -71,6 +88,7 @@ import {
   SUBTITLE_DEFAULT_BACKGROUND,
   SUBTITLE_TEXT_MAX_LENGTH
 } from "@/interface/project";
+import type { SceneLightSettings, SceneLightType } from "@/interface/sceneLight";
 import { useChapterStore } from "@/stores/modules/chapter";
 import { useModelStore } from "@/stores/modules/model";
 import { useProjectStore } from "@/stores/modules/project";
@@ -99,6 +117,9 @@ import {
 } from "@/utils/three/modelHierarchy";
 import { createViewportGrid, disposeViewportGrid } from "@/utils/three/viewportGrid";
 import { createViewportEnvironment, disposeViewportEnvironment } from "@/utils/three/viewportEnvironment";
+import { createEnvReflectionProbe, type EnvReflectionProbe } from "@/utils/three/envReflectionProbe";
+import { applyMeshTextureQuality, resolvePresentationPixelRatio } from "@/utils/three/presentationQuality";
+import { detectGpuTierProfile, type GpuTierProfile } from "@/utils/three/gpuTier";
 import { toastShow } from "@/utils/toast";
 
 export { TONE_MAPPING_OPTIONS };
@@ -128,6 +149,7 @@ export function useMovieEditor() {
   const hierarchyRevision = ref(0);
   let lastSelModelId: string | null = null;
   const modelFormRevision = ref(0);
+  const animSegmentRevision = ref(0);
   const cameraFormRevision = ref(0);
   const chapterFormRevision = ref(0);
   // 折叠面板状态
@@ -136,8 +158,8 @@ export function useMovieEditor() {
   const exporting = ref(false);
   const displaySubtitle = ref(false);
   const tooltipText = ref("");
-  const isPreviewMode = ref(false);
   const viewOnly = ref((route.query.mode as string) === "view" && !!(route.query.code as string));
+  const isPreviewMode = ref(viewOnly.value);
   const routeGateLoading = ref(!!(route.query.code as string));
   const rightTab = ref("model");
   const videoFps = ref(0);
@@ -162,14 +184,21 @@ export function useMovieEditor() {
     backgroundColor: SUBTITLE_DEFAULT_BACKGROUND,
     displayMode: "fadeIn" as "fadeIn" | "typewriter"
   });
+  const roundInt = (n: number) => Math.round(Number(n) || 0);
+  const round3 = (n: number) => roundAnimNum(Number(n) || 0, 3);
+  const roundVec3 = (v: [number, number, number]): [number, number, number] => [round3(v[0]), round3(v[1]), round3(v[2])];
+
   let editingSId: string | null = null;
   const mOff = reactive([0, 0, 0]);
   const mScl = ref(1);
   const mVis = ref(true);
   const mHL = ref(false);
   const mAni = ref(true);
+  const mWire = ref(false);
   const mRot = reactive([0, 0, 0]);
-  const mHLColor = ref("#00ff00");
+  const mOutlineColor = ref(DEFAULT_OUTLINE_COLOR);
+  const mWireColor = ref(DEFAULT_WIREFRAME_COLOR);
+  const mHLColor = ref(DEFAULT_MODEL_HIGHLIGHT_COLOR);
   const mIntro = ref("");
   const mOut = ref(false);
   const mdTab = ref<"props" | "anim">("props");
@@ -186,6 +215,13 @@ export function useMovieEditor() {
   const chapterPlayTarget = ref<Chapter | null>(null);
   const chapterAutoNext = ref(false);
   const chapterNavLock = ref(false);
+  const isCameraTransitioning = ref(false);
+  let seekGeneration = 0;
+  let chapterNavGeneration = 0;
+  let videoChapterSyncPaused = false;
+  let chapterNavAnimRaf = 0;
+  let sceneModelCenterValid = false;
+  const _cachedSceneModelCenter = new THREE.Vector3();
   const totalPlaying = ref(false);
   const totalProgress = ref(0);
   const animDirty = ref(false);
@@ -204,23 +240,31 @@ export function useMovieEditor() {
   let introPresentationPlaying = false;
   let lastIntroStateKey = "";
   const _introWorldPos = new THREE.Vector3();
+  const _overlayAttachPos = new THREE.Vector3();
+  const _overlayAttachQuat = new THREE.Quaternion();
+  const _overlayAttachScale = new THREE.Vector3();
+  const _overlayAttachMat = new THREE.Matrix4();
   const importingModel = ref(false);
+  const sceneBootstrapBusy = ref(false);
   const showSettings = ref(false);
   const spTab = ref("lighting");
 
   // Lighting
   const ambIntensity = ref(DEFAULT_SCENE_SETTINGS.ambIntensity);
-  const dirIntensity = ref(DEFAULT_SCENE_SETTINGS.dirIntensity);
-  const dirPos = reactive([...DEFAULT_SCENE_SETTINGS.dirPos]);
-  const fillIntensity = ref(DEFAULT_SCENE_SETTINGS.fillIntensity);
-  const fillPos = reactive([...DEFAULT_SCENE_SETTINGS.fillPos]);
+  const sceneLights = ref<SceneLightSettings[]>(
+    migrateLegacySceneLights({
+      dirIntensity: DEFAULT_SCENE_SETTINGS.dirIntensity,
+      fillIntensity: DEFAULT_SCENE_SETTINGS.fillIntensity
+    })
+  );
+  const selectedSceneLightId = ref<string | null>(sceneLights.value[0]?.id ?? null);
+  const sceneLightRuntimes = new Map<string, SceneLightRuntime>();
   // Material (per-model)
   const matColor = ref(DEFAULT_SCENE_SETTINGS.matColor);
   const matRoughness = ref(DEFAULT_SCENE_SETTINGS.matRoughness);
   const matMetalness = ref(DEFAULT_SCENE_SETTINGS.matMetalness);
   const matNormalStr = ref(DEFAULT_SCENE_SETTINGS.matNormalStr);
   const matEmissiveInt = ref(DEFAULT_SCENE_SETTINGS.matEmissiveInt);
-  const matAoInt = ref(DEFAULT_SCENE_SETTINGS.matAoInt);
   // Post-processing
   const bloomIntensity = ref(DEFAULT_SCENE_SETTINGS.bloomIntensity);
   const bloomThreshold = ref(DEFAULT_SCENE_SETTINGS.bloomThreshold);
@@ -231,6 +275,9 @@ export function useMovieEditor() {
   const toneMapping = ref(DEFAULT_SCENE_SETTINGS.toneMapping);
   // Environment
   const envIntensityVal = ref(DEFAULT_SCENE_SETTINGS.envIntensityVal);
+  const envReflectionIntensity = ref(DEFAULT_SCENE_SETTINGS.envReflectionIntensity);
+  const envRotation = ref(DEFAULT_SCENE_SETTINGS.envRotation);
+  const envReflectionSphereVisible = ref(DEFAULT_SCENE_SETTINGS.envReflectionSphereVisible);
   const envMapUrl = ref<string | null>(DEFAULT_SCENE_SETTINGS.envMapUrl);
   const envMapIsHdr = ref(DEFAULT_SCENE_SETTINGS.envMapIsHdr);
   const bgColorVal = ref(DEFAULT_SCENE_SETTINGS.bgColorVal);
@@ -250,6 +297,11 @@ export function useMovieEditor() {
   const gridSize = ref(DEFAULT_SCENE_SETTINGS.gridSize);
   const gridDivisions = ref(DEFAULT_SCENE_SETTINGS.gridDivisions);
   const gridHeight = ref(DEFAULT_SCENE_SETTINGS.gridHeight);
+  const msaaEnabled = ref(DEFAULT_SCENE_SETTINGS.msaaEnabled);
+  const antialiasingMode = ref<AntialiasingMode>(DEFAULT_SCENE_SETTINGS.antialiasingMode);
+  const maxPixelRatio = ref(DEFAULT_SCENE_SETTINGS.maxPixelRatio);
+  /** 当前实际生效的渲染像素比（切换 2/4/8 后可在面板查看） */
+  const effectiveRenderPixelRatio = ref(DEFAULT_SCENE_SETTINGS.maxPixelRatio);
   // Picking behavior
   const pickOnlyVisible = ref(true); // when true, raycast ignores invisible objects
   const camP = reactive([...DEFAULT_CAMERA.position]);
@@ -340,19 +392,24 @@ export function useMovieEditor() {
   let groundMesh: THREE.Mesh;
   let gridHelper: THREE.Object3D;
   let ambientLight: THREE.AmbientLight;
-  let dirLight: THREE.DirectionalLight;
-  let fillLight: THREE.DirectionalLight;
-  let composer: EffectComposer;
+  let sceneLightsGroup: THREE.Group;
+  let composer: EffectComposer | undefined;
   let bloomPass: UnrealBloomPass;
   let colorPass: ShaderPass;
   let hueSatPass: ShaderPass;
   let brightContrastPass: ShaderPass;
+  let fxaaPass: FXAAPass;
+  let smaaPass: SMAAPass;
   let envMap: THREE.Texture | null = null;
+  let envMapEquirect: THREE.Texture | null = null;
   let envMapSourceUrl: string | null = null;
+  let envReflectionProbe: EnvReflectionProbe | null = null;
   const textureLoader = new THREE.TextureLoader();
   const rgbeLoader = new RGBELoader();
   let outlinePass: OutlinePass;
   let hoverOutlinePass: OutlinePass;
+  let modelConfigOutlinePass: OutlinePass;
+  const modelConfigOutlineRegistry = new Map<THREE.Mesh, string>();
   const raycaster = new THREE.Raycaster();
   const pickPointer = new THREE.Vector2();
   const SELECTION_COLOR = 0x409eff;
@@ -360,6 +417,7 @@ export function useMovieEditor() {
   const HIDDEN_EDGE_COLOR = 0x1a3a5f;
   const _pickNormal = new THREE.Vector3();
   const _pickView = new THREE.Vector3();
+  const _gizmoWorldPos = new THREE.Vector3();
   const _focusCenter = new THREE.Vector3();
   const _focusSize = new THREE.Vector3();
   const _focusOffset = new THREE.Vector3();
@@ -403,8 +461,14 @@ export function useMovieEditor() {
     camera = new THREE.PerspectiveCamera(50, w / Math.max(h, 1), 0.1, 200);
     camera.position.set(...DEFAULT_CAMERA.position);
 
-    renderer = new THREE.WebGLRenderer({ canvas: canvasEl.value, antialias: true });
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer = new THREE.WebGLRenderer({
+      canvas: canvasEl.value,
+      antialias: true,
+      powerPreference: "high-performance",
+      alpha: false,
+      depth: true
+    });
+    renderer.setPixelRatio(getRenderPixelRatio());
     renderer.setSize(w, h);
     renderer.shadowMap.enabled = false;
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
@@ -428,26 +492,10 @@ export function useMovieEditor() {
     ambientLight = new THREE.AmbientLight(0xffffff, DEFAULT_SCENE_SETTINGS.ambIntensity);
     scene.add(ambientLight);
 
-    dirLight = new THREE.DirectionalLight(0xffffff, DEFAULT_SCENE_SETTINGS.dirIntensity);
-    dirLight.position.set(...DEFAULT_SCENE_SETTINGS.dirPos);
-    dirLight.target.position.set(0, 0, 0);
-    scene.add(dirLight);
-    scene.add(dirLight.target);
-
-    fillLight = new THREE.DirectionalLight(0x88bbff, DEFAULT_SCENE_SETTINGS.fillIntensity);
-    fillLight.position.set(...DEFAULT_SCENE_SETTINGS.fillPos);
-    fillLight.target.position.set(0, 0, 0);
-    scene.add(fillLight);
-    scene.add(fillLight.target);
-    // mainLight.castShadow = true;
-    // mainLight.shadow.mapSize.width = 2048;
-    // mainLight.shadow.mapSize.height = 2048;
-    // mainLight.shadow.camera.near = 0.5;
-    //mainLight.shadow.camera.far = 60;
-    //mainLight.shadow.camera.left = -15;
-    //mainLight.shadow.camera.right = 15;
-    //mainLight.shadow.camera.top = 15;
-    //mainLight.shadow.camera.bottom = -15;
+    sceneLightsGroup = new THREE.Group();
+    sceneLightsGroup.name = "SceneLights";
+    scene.add(sceneLightsGroup);
+    syncSceneLights();
 
     // 地面 - 已移除；网格在 loadAllSettings 后由 applyGrid 创建
     try {
@@ -458,6 +506,7 @@ export function useMovieEditor() {
       if (shadowEnabled.value) applyShadow();
       // composer 常驻：渲染路径永不切换，避免选中/悬停时画面闪烁
       initComposer();
+      applyAntialiasing();
       if (bloomIntensity.value > 0 || ppContrast.value !== 0 || ppSaturation.value !== 0) {
         toggleBloom();
         toggleColor();
@@ -475,14 +524,18 @@ export function useMovieEditor() {
     try {
       envMap = createViewportEnvironment(renderer);
       scene.environment = envMap;
-      scene.environmentIntensity = envIntensityVal.value;
+      applyEnv();
+      ensureEnvReflectionSphere();
       if (envMapUrl.value) {
         loadEnvironmentMapFromUrl(envMapUrl.value, envMapIsHdr.value);
+      } else {
+        applyBackgroundFromSettings();
       }
     } catch (e) {
       console.warn("Viewport environment init failed", e);
     }
     bindViewportPicking();
+    syncEditorGizmosVisibility();
     animate();
   }
 
@@ -617,11 +670,21 @@ export function useMovieEditor() {
     orbitDragVisualsSuspended = false;
   }
 
+  function invalidateSceneModelCenterCache() {
+    sceneModelCenterValid = false;
+  }
+
   function getSceneModelCenter(out = _orbitPivotCenter): THREE.Vector3 | null {
+    if (sceneModelCenterValid) {
+      out.copy(_cachedSceneModelCenter);
+      return out;
+    }
     const box = new THREE.Box3();
     meshes.forEach(group => box.expandByObject(group));
     if (box.isEmpty()) return null;
     box.getCenter(out);
+    _cachedSceneModelCenter.copy(out);
+    sceneModelCenterValid = true;
     return out;
   }
 
@@ -843,124 +906,337 @@ export function useMovieEditor() {
     });
   }
 
+  function isEditorGizmoVisible() {
+    return !viewOnly.value && !isPreviewMode.value;
+  }
+
+  function hideAllPivotHelpers() {
+    for (const id of [...pivotHelpers.keys()]) {
+      hidePivotHelpers(id);
+    }
+  }
+
+  function syncEditorGizmosVisibility() {
+    const visible = isEditorGizmoVisible();
+    for (const runtime of sceneLightRuntimes.values()) {
+      runtime.gizmo.visible = visible;
+    }
+    if (envReflectionProbe) {
+      envReflectionProbe.group.visible = visible && envReflectionSphereVisible.value;
+    }
+    if (!visible) {
+      hideAllPivotHelpers();
+    }
+  }
+
+  function layoutEditorGizmosNearScene() {
+    if (!scene) return;
+    const box = new THREE.Box3();
+    meshes.forEach(group => box.expandByObject(group));
+    if (box.isEmpty()) return;
+
+    box.getCenter(_focusCenter);
+    box.getSize(_focusSize);
+    const extent = Math.max(_focusSize.x, _focusSize.y, _focusSize.z, 0.6);
+
+    if (envReflectionProbe) {
+      envReflectionProbe.group.position.set(
+        _focusCenter.x + extent * 0.42,
+        _focusCenter.y + Math.max(_focusSize.y * 0.25, 0.2),
+        _focusCenter.z + extent * 0.12
+      );
+    }
+  }
+
+  function updateEditorGizmoScales() {
+    if (!isEditorGizmoVisible() || !camera) return;
+
+    const applyScreenScale = (obj: THREE.Object3D) => {
+      obj.getWorldPosition(_gizmoWorldPos);
+      const dist = camera.position.distanceTo(_gizmoWorldPos);
+      const s = THREE.MathUtils.clamp(dist * 0.055, 0.4, 2.2);
+      obj.scale.setScalar(s);
+    };
+
+    for (const runtime of sceneLightRuntimes.values()) {
+      if (runtime.gizmo.visible) applyScreenScale(runtime.gizmo);
+    }
+    if (envReflectionProbe?.group.visible) {
+      applyScreenScale(envReflectionProbe.group);
+    }
+  }
+
+  function syncSceneLights() {
+    if (!sceneLightsGroup) return;
+    const ids = new Set(sceneLights.value.map(l => l.id));
+
+    for (const [id, runtime] of sceneLightRuntimes) {
+      if (!ids.has(id)) {
+        disposeSceneLightRuntime(runtime);
+        sceneLightRuntimes.delete(id);
+      }
+    }
+
+    for (const config of sceneLights.value) {
+      const selected = config.id === selectedSceneLightId.value;
+      let runtime = sceneLightRuntimes.get(config.id);
+      if (!runtime) {
+        runtime = buildSceneLightRuntime(config, selected);
+        sceneLightRuntimes.set(config.id, runtime);
+        sceneLightsGroup.add(runtime.group);
+      } else {
+        syncSceneLightRuntime(runtime, config, selected);
+      }
+    }
+    syncEditorGizmosVisibility();
+  }
+
+  function snapSceneLightsToModelDefaults() {
+    const center = getSceneModelCenter();
+    if (!center) return;
+    const typeCounters: Record<SceneLightType, number> = { directional: 0, point: 0, spot: 0 };
+    sceneLights.value = sceneLights.value.map(light => {
+      const variant = typeCounters[light.type]++;
+      return {
+        ...light,
+        position: computeSceneLightPosition(light.type, center, variant)
+      };
+    });
+    syncSceneLights();
+    scheduleSaveSettings();
+  }
+
+  function addSceneLight(type: SceneLightType) {
+    const index = sceneLights.value.filter(l => l.type === type).length + 1;
+    const light = createDefaultSceneLight(type, index, getSceneModelCenter());
+    sceneLights.value.push(light);
+    selectedSceneLightId.value = light.id;
+    syncSceneLights();
+    applyShadow();
+    scheduleSaveSettings();
+  }
+
+  function removeSceneLight(id: string) {
+    const idx = sceneLights.value.findIndex(l => l.id === id);
+    if (idx < 0) return;
+    sceneLights.value.splice(idx, 1);
+    if (selectedSceneLightId.value === id) {
+      selectedSceneLightId.value = sceneLights.value[0]?.id ?? null;
+    }
+    syncSceneLights();
+    applyShadow();
+    scheduleSaveSettings();
+  }
+
+  function selectSceneLight(id: string | null) {
+    selectedSceneLightId.value = id;
+    syncSceneLights();
+  }
+
+  function applySceneLights() {
+    syncSceneLights();
+    applyShadow();
+    scheduleSaveSettings();
+  }
+
+  function disposeEnvTextures() {
+    if (envMapEquirect) {
+      envMapEquirect.dispose();
+      envMapEquirect = null;
+    }
+    disposeViewportEnvironment(envMap);
+    envMap = null;
+  }
+
+  function ensureEnvReflectionSphere() {
+    if (!scene) return;
+    if (!envReflectionProbe) {
+      envReflectionProbe = createEnvReflectionProbe();
+      scene.add(envReflectionProbe.group);
+      layoutEditorGizmosNearScene();
+    }
+    syncEditorGizmosVisibility();
+  }
+
+  function applyBackgroundFromSettings() {
+    if (!scene || !renderer) return;
+    // 背景始终保持编辑器默认背景色；环境贴图仅用于模型反射
+    const bg = new THREE.Color(bgColorVal.value);
+    scene.background = bg;
+    renderer.setClearColor(bg, 1);
+  }
+
+  function applyEnvironmentTexture(equirect: THREE.Texture, isHdr: boolean) {
+    if (!renderer || !scene) return;
+    disposeEnvTextures();
+    equirect.mapping = THREE.EquirectangularReflectionMapping;
+    if (!isHdr) {
+      equirect.colorSpace = THREE.SRGBColorSpace;
+    }
+    envMapEquirect = equirect;
+
+    const pmrem = new THREE.PMREMGenerator(renderer);
+    pmrem.compileEquirectangularShader();
+    envMap = pmrem.fromEquirectangular(equirect).texture;
+    pmrem.dispose();
+
+    scene.environment = envMap;
+    applyBackgroundFromSettings();
+    ensureEnvReflectionSphere();
+    applyEnv();
+  }
+
   let SETTINGS_KEY = SCENE_SETTINGS_STORAGE_KEY;
+  let skipStoredSceneSettings = false;
+  function collectSceneSettingsData() {
+    return {
+      ambIntensity: ambIntensity.value,
+      sceneLights: sceneLights.value,
+      matColor: matColor.value,
+      matRoughness: matRoughness.value,
+      matMetalness: matMetalness.value,
+      matNormalStr: matNormalStr.value,
+      matEmissiveInt: matEmissiveInt.value,
+      bloomIntensity: bloomIntensity.value,
+      bloomThreshold: bloomThreshold.value,
+      bloomRadius: bloomRadius.value,
+      ppExposure: ppExposure.value,
+      ppContrast: ppContrast.value,
+      ppSaturation: ppSaturation.value,
+      toneMapping: toneMapping.value,
+      envIntensityVal: envIntensityVal.value,
+      envReflectionIntensity: envReflectionIntensity.value,
+      envRotation: envRotation.value,
+      envReflectionSphereVisible: envReflectionSphereVisible.value,
+      envMapUrl: envMapUrl.value,
+      envMapIsHdr: envMapIsHdr.value,
+      bgColorVal: bgColorVal.value,
+      fogEnabled: fogEnabled.value,
+      fogNear: fogNear.value,
+      fogFar: fogFar.value,
+      shadowEnabled: shadowEnabled.value,
+      shadowIntensity: shadowIntensity.value,
+      shadowMapSize: shadowMapSize.value,
+      shadowBias: shadowBias.value,
+      shadowNormalBias: shadowNormalBias.value,
+      shadowType: shadowType.value,
+      gridVisible: gridVisible.value,
+      gridSize: gridSize.value,
+      gridDivisions: gridDivisions.value,
+      gridHeight: gridHeight.value,
+      msaaEnabled: msaaEnabled.value,
+      antialiasingMode: antialiasingMode.value,
+      maxPixelRatio: maxPixelRatio.value
+    };
+  }
+  function applySceneSettingsData(d: Record<string, any>) {
+    if (d.ambIntensity !== undefined) ambIntensity.value = d.ambIntensity;
+    if (Array.isArray(d.sceneLights) && d.sceneLights.length > 0) {
+      sceneLights.value = d.sceneLights;
+      selectedSceneLightId.value = d.sceneLights[0]?.id ?? null;
+    } else if (d.dirIntensity !== undefined || d.fillIntensity !== undefined) {
+      sceneLights.value = migrateLegacySceneLights(d);
+      selectedSceneLightId.value = sceneLights.value[0]?.id ?? null;
+    }
+    if (d.matColor) matColor.value = d.matColor;
+    if (d.matRoughness !== undefined) matRoughness.value = d.matRoughness;
+    if (d.matMetalness !== undefined) matMetalness.value = d.matMetalness;
+    if (d.matNormalStr !== undefined) matNormalStr.value = d.matNormalStr;
+    if (d.matEmissiveInt !== undefined) matEmissiveInt.value = d.matEmissiveInt;
+    if (d.bloomIntensity !== undefined) bloomIntensity.value = d.bloomIntensity;
+    if (d.bloomThreshold !== undefined) bloomThreshold.value = d.bloomThreshold;
+    if (d.bloomRadius !== undefined) bloomRadius.value = d.bloomRadius;
+    if (d.ppExposure !== undefined) ppExposure.value = d.ppExposure;
+    if (d.ppContrast !== undefined) ppContrast.value = d.ppContrast;
+    if (d.ppSaturation !== undefined) ppSaturation.value = d.ppSaturation;
+    if (d.toneMapping) toneMapping.value = d.toneMapping;
+    if (d.envIntensityVal !== undefined) envIntensityVal.value = d.envIntensityVal;
+    if (d.envReflectionIntensity !== undefined) envReflectionIntensity.value = d.envReflectionIntensity;
+    if (d.envRotation !== undefined) envRotation.value = d.envRotation;
+    if (d.envReflectionSphereVisible !== undefined) envReflectionSphereVisible.value = d.envReflectionSphereVisible;
+    if (d.envMapUrl !== undefined) envMapUrl.value = d.envMapUrl;
+    if (d.envMapIsHdr !== undefined) envMapIsHdr.value = d.envMapIsHdr;
+    if (d.fogEnabled !== undefined) fogEnabled.value = d.fogEnabled;
+    if (d.fogNear !== undefined) fogNear.value = d.fogNear;
+    if (d.fogFar !== undefined) fogFar.value = d.fogFar;
+    if (d.bgColorVal) {
+      const normalized = String(d.bgColorVal).toLowerCase();
+      bgColorVal.value = normalized === "#f2f3f5" || normalized === "#0a0c10" ? SCENE_VIEWPORT_BG : d.bgColorVal;
+    }
+    if (d.shadowEnabled !== undefined) shadowEnabled.value = d.shadowEnabled;
+    if (d.shadowIntensity !== undefined) shadowIntensity.value = d.shadowIntensity;
+    if (d.shadowMapSize !== undefined) shadowMapSize.value = d.shadowMapSize;
+    if (d.shadowBias !== undefined) shadowBias.value = d.shadowBias;
+    if (d.shadowNormalBias !== undefined) shadowNormalBias.value = d.shadowNormalBias;
+    if (d.shadowType) shadowType.value = d.shadowType;
+    if (d.gridVisible !== undefined) gridVisible.value = d.gridVisible;
+    if (d.gridSize !== undefined) {
+      gridSize.value = d.gridSize > 30 ? SCENE_GRID_SIZE : d.gridSize;
+    }
+    if (d.gridDivisions !== undefined) {
+      gridDivisions.value = d.gridDivisions > 60 ? SCENE_GRID_DIVISIONS : d.gridDivisions;
+    }
+    if (d.gridHeight !== undefined) gridHeight.value = d.gridHeight;
+    if (d.msaaEnabled !== undefined) msaaEnabled.value = d.msaaEnabled;
+    if (d.antialiasingMode !== undefined) {
+      antialiasingMode.value = d.antialiasingMode as AntialiasingMode;
+    } else if (d.fxaaEnabled === true) {
+      antialiasingMode.value = "fxaa";
+    } else if (d.fxaaEnabled === false) {
+      antialiasingMode.value = "smaa";
+    }
+    if (d.maxPixelRatio !== undefined) maxPixelRatio.value = normalizeAntialiasRatio(d.maxPixelRatio);
+  }
   function saveAllSettings() {
     try {
-      let data = {
-        ambIntensity: ambIntensity.value,
-        dirIntensity: dirIntensity.value,
-        dirPos: [dirPos[0], dirPos[1], dirPos[2]],
-        fillIntensity: fillIntensity.value,
-        fillPos: [fillPos[0], fillPos[1], fillPos[2]],
-        matColor: matColor.value,
-        matRoughness: matRoughness.value,
-        matMetalness: matMetalness.value,
-        matNormalStr: matNormalStr.value,
-        matEmissiveInt: matEmissiveInt.value,
-        matAoInt: matAoInt.value,
-        bloomIntensity: bloomIntensity.value,
-        bloomThreshold: bloomThreshold.value,
-        bloomRadius: bloomRadius.value,
-        ppExposure: ppExposure.value,
-        ppContrast: ppContrast.value,
-        ppSaturation: ppSaturation.value,
-        toneMapping: toneMapping.value,
-        envIntensityVal: envIntensityVal.value,
-        envMapUrl: envMapUrl.value,
-        envMapIsHdr: envMapIsHdr.value,
-        bgColorVal: bgColorVal.value,
-        fogEnabled: fogEnabled.value,
-        fogNear: fogNear.value,
-        fogFar: fogFar.value,
-        shadowEnabled: shadowEnabled.value,
-        shadowIntensity: shadowIntensity.value,
-        shadowMapSize: shadowMapSize.value,
-        shadowBias: shadowBias.value,
-        shadowNormalBias: shadowNormalBias.value,
-        shadowType: shadowType.value,
-        gridVisible: gridVisible.value,
-        gridSize: gridSize.value,
-        gridDivisions: gridDivisions.value,
-        gridHeight: gridHeight.value
-      };
-      localStorage.setItem(SETTINGS_KEY, JSON.stringify(data));
+      localStorage.setItem(SETTINGS_KEY, JSON.stringify(collectSceneSettingsData()));
     } catch (e) {}
   }
   function loadAllSettings() {
     try {
+      if (skipStoredSceneSettings) return;
       let raw = localStorage.getItem(SETTINGS_KEY);
       if (!raw) return;
-      let d = JSON.parse(raw);
-      if (d.ambIntensity !== undefined) ambIntensity.value = d.ambIntensity;
-      if (d.dirIntensity !== undefined) dirIntensity.value = d.dirIntensity;
-      if (d.dirPos) {
-        dirPos[0] = d.dirPos[0];
-        dirPos[1] = d.dirPos[1];
-        dirPos[2] = d.dirPos[2];
+      const data = JSON.parse(raw);
+      if (data.envMapUrl === "/hdr/default.hdr") {
+        data.envMapUrl = null;
+        data.envReflectionSphereVisible = false;
       }
-      if (d.fillIntensity !== undefined) fillIntensity.value = d.fillIntensity;
-      if (d.fillPos) {
-        fillPos[0] = d.fillPos[0];
-        fillPos[1] = d.fillPos[1];
-        fillPos[2] = d.fillPos[2];
-      }
-      if (d.matColor) matColor.value = d.matColor;
-      if (d.matRoughness !== undefined) matRoughness.value = d.matRoughness;
-      if (d.matMetalness !== undefined) matMetalness.value = d.matMetalness;
-      if (d.matNormalStr !== undefined) matNormalStr.value = d.matNormalStr;
-      if (d.matEmissiveInt !== undefined) matEmissiveInt.value = d.matEmissiveInt;
-      if (d.matAoInt !== undefined) matAoInt.value = d.matAoInt;
-      if (d.bloomIntensity !== undefined) bloomIntensity.value = d.bloomIntensity;
-      if (d.bloomThreshold !== undefined) bloomThreshold.value = d.bloomThreshold;
-      if (d.bloomRadius !== undefined) bloomRadius.value = d.bloomRadius;
-      if (d.ppExposure !== undefined) ppExposure.value = d.ppExposure;
-      if (d.ppContrast !== undefined) ppContrast.value = d.ppContrast;
-      if (d.ppSaturation !== undefined) ppSaturation.value = d.ppSaturation;
-      if (d.toneMapping) toneMapping.value = d.toneMapping;
-      if (d.envIntensityVal !== undefined) envIntensityVal.value = d.envIntensityVal;
-      if (d.envMapUrl !== undefined) envMapUrl.value = d.envMapUrl;
-      if (d.envMapIsHdr !== undefined) envMapIsHdr.value = d.envMapIsHdr;
-      if (d.fogEnabled !== undefined) fogEnabled.value = d.fogEnabled;
-      if (d.fogNear !== undefined) fogNear.value = d.fogNear;
-      if (d.fogFar !== undefined) fogFar.value = d.fogFar;
-      if (d.bgColorVal) {
-        const normalized = String(d.bgColorVal).toLowerCase();
-        bgColorVal.value = normalized === "#f2f3f5" || normalized === "#0a0c10" ? SCENE_VIEWPORT_BG : d.bgColorVal;
-      }
-      if (d.shadowEnabled !== undefined) shadowEnabled.value = d.shadowEnabled;
-      if (d.shadowIntensity !== undefined) shadowIntensity.value = d.shadowIntensity;
-      if (d.shadowMapSize !== undefined) shadowMapSize.value = d.shadowMapSize;
-      if (d.shadowBias !== undefined) shadowBias.value = d.shadowBias;
-      if (d.shadowNormalBias !== undefined) shadowNormalBias.value = d.shadowNormalBias;
-      if (d.shadowType) shadowType.value = d.shadowType;
-      if (d.gridVisible !== undefined) gridVisible.value = d.gridVisible;
-      if (d.gridSize !== undefined) {
-        gridSize.value = d.gridSize > 30 ? SCENE_GRID_SIZE : d.gridSize;
-      }
-      if (d.gridDivisions !== undefined) {
-        gridDivisions.value = d.gridDivisions > 60 ? SCENE_GRID_DIVISIONS : d.gridDivisions;
-      }
-      if (d.gridHeight !== undefined) gridHeight.value = d.gridHeight;
+      applySceneSettingsData(data);
     } catch (e) {}
+  }
+  async function applySceneSettingsFromServer(sceneSettings: unknown) {
+    if (!sceneSettings || typeof sceneSettings !== "object") return;
+    applySceneSettingsData(sceneSettings as Record<string, any>);
+    applySettings();
+    applyGrid();
+    applyFog();
+    if (shadowEnabled.value) applyShadow();
+    if (bloomIntensity.value > 0 || ppContrast.value !== 0 || ppSaturation.value !== 0) {
+      toggleBloom();
+      toggleColor();
+    }
+    saveAllSettings();
+    const settings = sceneSettings as { envMapUrl?: string; envMapIsHdr?: boolean };
+    if (settings.envMapUrl) {
+      loadEnvironmentMapFromUrl(settings.envMapUrl, !!settings.envMapIsHdr);
+    }
+    applyAntialiasing();
   }
 
   function resetSceneSettings() {
     const d = DEFAULT_SCENE_SETTINGS;
     ambIntensity.value = d.ambIntensity;
-    dirIntensity.value = d.dirIntensity;
-    dirPos[0] = d.dirPos[0];
-    dirPos[1] = d.dirPos[1];
-    dirPos[2] = d.dirPos[2];
-    fillIntensity.value = d.fillIntensity;
-    fillPos[0] = d.fillPos[0];
-    fillPos[1] = d.fillPos[1];
-    fillPos[2] = d.fillPos[2];
+    sceneLights.value = migrateLegacySceneLights({
+      dirIntensity: d.dirIntensity,
+      fillIntensity: d.fillIntensity
+    }, getSceneModelCenter());
+    selectedSceneLightId.value = sceneLights.value[0]?.id ?? null;
     matColor.value = d.matColor;
     matRoughness.value = d.matRoughness;
     matMetalness.value = d.matMetalness;
     matNormalStr.value = d.matNormalStr;
     matEmissiveInt.value = d.matEmissiveInt;
-    matAoInt.value = d.matAoInt;
     bloomIntensity.value = d.bloomIntensity;
     bloomThreshold.value = d.bloomThreshold;
     bloomRadius.value = d.bloomRadius;
@@ -969,6 +1245,9 @@ export function useMovieEditor() {
     ppSaturation.value = d.ppSaturation;
     toneMapping.value = d.toneMapping;
     envIntensityVal.value = d.envIntensityVal;
+    envReflectionIntensity.value = d.envReflectionIntensity;
+    envRotation.value = d.envRotation;
+    envReflectionSphereVisible.value = d.envReflectionSphereVisible;
     envMapUrl.value = d.envMapUrl;
     envMapIsHdr.value = d.envMapIsHdr;
     fogEnabled.value = d.fogEnabled;
@@ -985,6 +1264,9 @@ export function useMovieEditor() {
     gridSize.value = d.gridSize;
     gridDivisions.value = d.gridDivisions;
     gridHeight.value = d.gridHeight;
+    msaaEnabled.value = d.msaaEnabled;
+    antialiasingMode.value = d.antialiasingMode;
+    maxPixelRatio.value = normalizeAntialiasRatio(d.maxPixelRatio);
 
     applySettings();
     toggleBloom();
@@ -993,6 +1275,7 @@ export function useMovieEditor() {
     applyGrid();
     void resetEnvironmentMap();
     applyFog();
+    applyAntialiasing();
     if (selModel.value) syncMaterialUiFromModel();
     toastShow("场景参数已重置");
   }
@@ -1002,13 +1285,13 @@ export function useMovieEditor() {
     envMapPreview.value = isHdr ? "" : url;
     envMapSourceUrl = url;
     const onLoaded = (texture: THREE.Texture) => {
-      disposeViewportEnvironment(envMap);
-      envMap = buildEnvMapFromTexture(texture);
-      scene.environment = envMap;
-      scene.environmentIntensity = envIntensityVal.value;
+      applyEnvironmentTexture(texture, isHdr);
     };
     const onError = () => {
       console.warn("Environment map load failed", url);
+      if (url === "/hdr/default.hdr") {
+        envMapPreview.value = "";
+      }
     };
     if (isHdr) {
       rgbeLoader.load(url, onLoaded, undefined, onError);
@@ -1027,16 +1310,10 @@ export function useMovieEditor() {
   function applyFog() {
     if (!scene) return;
     const bg = new THREE.Color(bgColorVal.value);
-    scene.background = bg;
-    renderer?.setClearColor(bg, 1);
 
     if (!fogEnabled.value) {
       scene.fog = null;
-      scheduleSaveSettings();
-      return;
-    }
-
-    if (!(scene.fog instanceof THREE.Fog)) {
+    } else if (!(scene.fog instanceof THREE.Fog)) {
       scene.fog = new THREE.Fog(bg.getHex(), fogNear.value, fogFar.value);
     } else {
       scene.fog.color.copy(bg);
@@ -1044,13 +1321,16 @@ export function useMovieEditor() {
       scene.fog.far = Math.max(fogFar.value, fogNear.value + 0.5);
     }
 
+    scene.background = bg;
+    renderer?.setClearColor(bg, 1);
+
     meshes.forEach(group => {
       group.traverse(child => {
         const mesh = child as THREE.Mesh;
         if (!mesh.isMesh || !mesh.material) return;
         const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
         mats.forEach(mat => {
-          (mat as THREE.Material).fog = true;
+          (mat as THREE.Material & { fog?: boolean }).fog = fogEnabled.value;
         });
       });
     });
@@ -1061,42 +1341,37 @@ export function useMovieEditor() {
         if (line.material) {
           const mats = Array.isArray(line.material) ? line.material : [line.material];
           mats.forEach(mat => {
-            (mat as THREE.Material).fog = true;
+            (mat as THREE.Material & { fog?: boolean }).fog = true;
           });
         }
       });
+    }
+
+    if (envReflectionProbe) {
+      const mat = envReflectionProbe.ball.material as THREE.MeshStandardMaterial;
+      (mat as THREE.MeshStandardMaterial & { fog?: boolean }).fog = true;
     }
 
     scheduleSaveSettings();
   }
 
   async function resetEnvironmentMap() {
-    envMapUrl.value = null;
-    envMapIsHdr.value = false;
-    envMapPreview.value = "";
     if (envMapSourceUrl?.startsWith("blob:")) URL.revokeObjectURL(envMapSourceUrl);
-    envMapSourceUrl = null;
-    if (!renderer) return;
-    disposeViewportEnvironment(envMap);
-    envMap = createViewportEnvironment(renderer);
-    scene.environment = envMap;
-    scene.environmentIntensity = envIntensityVal.value;
-    saveAllSettings();
-  }
-
-  function buildEnvMapFromTexture(texture: THREE.Texture): THREE.Texture {
-    if (!renderer) return texture;
-    texture.mapping = THREE.EquirectangularReflectionMapping;
-    const isHdr = texture.type === THREE.HalfFloatType || texture.type === THREE.FloatType;
-    if (!isHdr) {
-      texture.colorSpace = THREE.SRGBColorSpace;
+    envMapUrl.value = DEFAULT_SCENE_SETTINGS.envMapUrl;
+    envMapIsHdr.value = DEFAULT_SCENE_SETTINGS.envMapIsHdr;
+    envMapPreview.value = "";
+    envMapSourceUrl = envMapUrl.value;
+    if (!renderer || !scene) return;
+    if (envMapUrl.value) {
+      loadEnvironmentMapFromUrl(envMapUrl.value, envMapIsHdr.value);
+    } else {
+      disposeEnvTextures();
+      envMap = createViewportEnvironment(renderer);
+      scene.environment = envMap;
+      applyBackgroundFromSettings();
+      applyEnv();
     }
-    const pmrem = new THREE.PMREMGenerator(renderer);
-    pmrem.compileEquirectangularShader();
-    const env = pmrem.fromEquirectangular(texture).texture;
-    pmrem.dispose();
-    texture.dispose();
-    return env;
+    saveAllSettings();
   }
 
   async function applyEnvironmentMapFile(file: File) {
@@ -1109,10 +1384,7 @@ export function useMovieEditor() {
     envMapIsHdr.value = isHdr;
     envMapPreview.value = isHdr ? "" : url;
     const onLoaded = (texture: THREE.Texture) => {
-      disposeViewportEnvironment(envMap);
-      envMap = buildEnvMapFromTexture(texture);
-      scene.environment = envMap;
-      scene.environmentIntensity = envIntensityVal.value;
+      applyEnvironmentTexture(texture, isHdr);
       scheduleSaveSettings();
     };
     const onError = () => {
@@ -1172,8 +1444,6 @@ export function useMovieEditor() {
       if (mat.normalScale) matNormalStr.value = mat.normalScale.x;
       if (mat.emissiveIntensity !== undefined) matEmissiveInt.value = mat.emissiveIntensity;
       else matEmissiveInt.value = 0;
-      if (mat.aoMapIntensity !== undefined) matAoInt.value = mat.aoMapIntensity;
-      else matAoInt.value = mat.aoMap ? 1 : 0;
       found = true;
     });
   }
@@ -1184,14 +1454,13 @@ export function useMovieEditor() {
   }
 
   function applySettings() {
-    if (!scene || !renderer || !ambientLight || !dirLight || !fillLight) return;
+    if (!scene || !renderer || !ambientLight) return;
     ambientLight.intensity = ambIntensity.value;
-    dirLight.intensity = dirIntensity.value;
-    dirLight.position.set(dirPos[0], dirPos[1], dirPos[2]);
-    fillLight.intensity = fillIntensity.value;
-    fillLight.position.set(fillPos[0], fillPos[1], fillPos[2]);
+    syncSceneLights();
     applyToneMapping();
+    applyBackgroundFromSettings();
     applyFog();
+    ensureEnvReflectionSphere();
     scheduleSaveSettings();
   }
 
@@ -1209,11 +1478,264 @@ export function useMovieEditor() {
         if (m.metalness !== undefined) m.metalness = matMetalness.value;
         if (m.normalScale) m.normalScale.setScalar(matNormalStr.value);
         if (m.emissiveIntensity !== undefined) m.emissiveIntensity = matEmissiveInt.value;
-        if (m.aoMapIntensity !== undefined) m.aoMapIntensity = matAoInt.value;
         m.needsUpdate = true;
       });
     });
+    // 保持材质参数变更后，反射强度附加效果仍然生效
+    applyModelEnvReflectionIntensity(root);
     scheduleSaveSettings();
+  }
+
+  let presentationGpuProfile: GpuTierProfile | null = null;
+  let presentationPerfScale = 1;
+  let presentationFrameDts: number[] = [];
+  let lastPresentationRatioSyncAt = 0;
+  let lastPresentationHeavyMotion = false;
+  let lastFramePresentAt = 0;
+
+  function ensurePresentationGpuProfile() {
+    if (!renderer) return null;
+    if (!presentationGpuProfile) {
+      presentationGpuProfile = detectGpuTierProfile(renderer, isCoarsePointerDevice());
+    }
+    return presentationGpuProfile;
+  }
+
+  /** 展示模式：章节/镜头/视频播放等重负载运动（不含 GLTF 循环动画） */
+  function isPresentationHeavyMotion() {
+    return !!(
+      isPlaying.value ||
+      chapterPlayTarget.value ||
+      camTrans ||
+      cameraAnimating ||
+      chAnimRafId !== null
+    );
+  }
+
+  /** 展示模式动画播放掉帧时仅降低渲染分辨率，不影响动画计算 */
+  function adaptPresentationRenderPerf(frameDtSec: number) {
+    if (!isPresentationMode() || !isCoarsePointerDevice()) {
+      if (presentationPerfScale !== 1 || lastPresentationHeavyMotion) {
+        presentationPerfScale = 1;
+        lastPresentationHeavyMotion = false;
+        presentationFrameDts = [];
+        syncPresentationMotionRenderProfile(false);
+      }
+      return;
+    }
+
+    const heavyMotion = isPresentationHeavyMotion();
+    if (heavyMotion !== lastPresentationHeavyMotion) {
+      lastPresentationHeavyMotion = heavyMotion;
+      syncPresentationMotionRenderProfile(heavyMotion);
+    }
+
+    if (!heavyMotion) {
+      if (presentationPerfScale < 1) {
+        presentationPerfScale = 1;
+        syncRenderPixelRatio();
+      }
+      presentationFrameDts = [];
+      return;
+    }
+
+    presentationFrameDts.push(frameDtSec);
+    if (presentationFrameDts.length > 36) presentationFrameDts.shift();
+    if (presentationFrameDts.length < 18) return;
+
+    const avgMs = (presentationFrameDts.reduce((a, b) => a + b, 0) / presentationFrameDts.length) * 1000;
+    const prev = presentationPerfScale;
+    if (avgMs > 22) presentationPerfScale = Math.max(0.82, presentationPerfScale - 0.03);
+    else if (avgMs < 17) presentationPerfScale = Math.min(1, presentationPerfScale + 0.03);
+
+    const now = performance.now();
+    if (Math.abs(prev - presentationPerfScale) > 0.02 && now - lastPresentationRatioSyncAt > 800) {
+      lastPresentationRatioSyncAt = now;
+      syncRenderPixelRatio();
+    }
+  }
+
+  /** 展示模式运动期间：移动端临时关 MSAA 保帧率，静止时恢复清晰度 */
+  function syncPresentationMotionRenderProfile(heavyMotion: boolean) {
+    if (!isPresentationMode()) return;
+    syncComposerMsaaSamples(heavyMotion);
+    if (!heavyMotion && presentationPerfScale < 1) {
+      presentationPerfScale = 1;
+      syncRenderPixelRatio();
+    }
+  }
+
+  function isPresentationMode() {
+    return viewOnly.value || isPreviewMode.value;
+  }
+
+  function getRenderPixelRatio() {
+    if (isPresentationMode()) {
+      const w = viewportEl.value?.clientWidth ?? 0;
+      const h = viewportEl.value?.clientHeight ?? 0;
+      const maxTex = renderer?.capabilities.maxTextureSize ?? 4096;
+      const gpu = ensurePresentationGpuProfile() ?? {
+        tier: 1 as const,
+        maxPresentationDpr: isCoarsePointerDevice() ? 1.75 : 2,
+        enableComposerMsaa: false
+      };
+      return resolvePresentationPixelRatio(
+        maxPixelRatio.value,
+        w,
+        h,
+        maxTex,
+        gpu,
+        presentationPerfScale
+      );
+    }
+    return resolveEditorRenderPixelRatio(maxPixelRatio.value);
+  }
+
+  /** 展示模式：SMAA + MSAA 轻量后处理（对齐 Oxide PostProcessing 思路） */
+  function renderViewportFrame() {
+    if (!renderer || !scene || !camera) return;
+    syncRendererPresentationState();
+    if (composer) {
+      applyPostProcessing();
+      composer.render();
+    } else {
+      renderer.render(scene, camera);
+    }
+  }
+
+  /** 展示模式关闭编辑器专用 Pass，强制 SMAA 抗锯齿 */
+  function syncPresentationRenderProfile() {
+    const presentation = isPresentationMode();
+    if (outlinePass) {
+      outlinePass.enabled = !presentation;
+      if (presentation) outlinePass.selectedObjects = [];
+    }
+    if (hoverOutlinePass) {
+      hoverOutlinePass.enabled = !presentation;
+      if (presentation) hoverOutlinePass.selectedObjects = [];
+    }
+    if (modelConfigOutlinePass) {
+      modelConfigOutlinePass.enabled = !presentation;
+      if (presentation) modelConfigOutlinePass.selectedObjects = [];
+    }
+    if (bloomPass) bloomPass.enabled = !presentation && bloomIntensity.value > 0;
+    if (colorPass) colorPass.enabled = !presentation;
+    if (hueSatPass) hueSatPass.enabled = !presentation;
+    if (brightContrastPass) brightContrastPass.enabled = !presentation;
+    if (presentation) {
+      if (fxaaPass) fxaaPass.enabled = false;
+      if (smaaPass) smaaPass.enabled = true;
+    } else {
+      syncAntialiasingPasses();
+    }
+    syncComposerMsaaSamples();
+    syncRenderPixelRatio();
+    if (presentation && renderer) {
+      ensurePresentationGpuProfile();
+      meshes.forEach(root => applyMeshTextureQuality(root, renderer));
+    }
+  }
+
+  function syncComposerMsaaSamples(presentationHeavyMotion = isPresentationHeavyMotion()) {
+    if (!composer || !renderer) return;
+    const gl = renderer.getContext();
+    const gpu = isPresentationMode() ? ensurePresentationGpuProfile() : null;
+    const presentation = isPresentationMode();
+    const msaaBase = presentation ? gpu?.enableComposerMsaa ?? false : msaaEnabled.value;
+    const msaaAllowed =
+      msaaBase &&
+      gl instanceof WebGL2RenderingContext &&
+      !(presentation && isCoarsePointerDevice() && presentationHeavyMotion);
+    let samples = 0;
+    if (msaaAllowed) {
+      const tier = gpu?.tier ?? 0;
+      samples = presentation && tier < 2 ? 2 : 4;
+    }
+    if (composer.renderTarget1.samples === samples) return;
+
+    const ratio = renderer.getPixelRatio();
+    const size = renderer.getSize(new THREE.Vector2());
+    const pw = Math.max(Math.round(size.width * ratio), 1);
+    const ph = Math.max(Math.round(size.height * ratio), 1);
+    const rt = new THREE.WebGLRenderTarget(pw, ph, {
+      type: THREE.HalfFloatType,
+      samples
+    });
+    rt.texture.name = "EffectComposer.rt1";
+    composer.reset(rt);
+    for (const pass of composer.passes) {
+      pass.setSize?.(pw, ph);
+    }
+  }
+
+  function syncRenderPixelRatio() {
+    if (!renderer) return;
+    const ratio = getRenderPixelRatio();
+    renderer.setPixelRatio(ratio);
+    composer?.setPixelRatio(ratio);
+    effectiveRenderPixelRatio.value = ratio;
+  }
+
+  function syncAntialiasingPasses() {
+    const mode = antialiasingMode.value;
+    const presentation = isPresentationMode();
+    // 展示直渲走 WebGL MSAA，不再叠 FXAA/SMAA（避免模糊）
+    if (fxaaPass) fxaaPass.enabled = !presentation && mode === "fxaa";
+    if (smaaPass) smaaPass.enabled = !presentation && mode === "smaa";
+  }
+
+  function syncRendererPresentationState() {
+    if (!renderer) return;
+    renderer.shadowMap.enabled = shadowEnabled.value;
+    switch (shadowType.value) {
+      case "basic":
+        renderer.shadowMap.type = THREE.BasicShadowMap;
+        break;
+      case "vsm":
+        renderer.shadowMap.type = THREE.VSMShadowMap;
+        break;
+      case "pcf":
+        renderer.shadowMap.type = THREE.PCFShadowMap;
+        break;
+      default:
+        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    }
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    renderer.toneMapping = TONE_MAPPING_MAP[toneMapping.value] ?? THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = ppExposure.value;
+    renderer.setClearColor(new THREE.Color(bgColorVal.value), 1);
+  }
+
+  let pendingAntialiasingApply = 0;
+
+  function applyAntialiasingNow() {
+    if (!renderer) return;
+    const attrs = renderer.getContext().getContextAttributes();
+    if (attrs && attrs.antialias !== msaaEnabled.value) {
+      toastShow("MSAA 需要刷新页面后生效", "warning");
+    }
+
+    syncRenderPixelRatio();
+    syncPresentationRenderProfile();
+    syncAntialiasingPasses();
+    if (viewportEl.value) {
+      const vw = viewportEl.value.clientWidth;
+      const vh = viewportEl.value.clientHeight;
+      if (vw > 0 && vh > 0) {
+        renderer.setSize(vw, vh);
+        composer?.setSize(vw, vh);
+      }
+    }
+    effectiveRenderPixelRatio.value = getRenderPixelRatio();
+    scheduleSaveSettings();
+  }
+
+  function applyAntialiasing() {
+    if (pendingAntialiasingApply) cancelAnimationFrame(pendingAntialiasingApply);
+    pendingAntialiasingApply = requestAnimationFrame(() => {
+      pendingAntialiasingApply = 0;
+      applyAntialiasingNow();
+    });
   }
 
   function initComposer() {
@@ -1230,27 +1752,45 @@ export function useMovieEditor() {
     brightContrastPass = new ShaderPass(BrightnessContrastShader);
     composer.addPass(brightContrastPass);
 
-    // 选中轮廓（蓝色实线）
+    // 选中轮廓（蓝色实线）— downSampleRatio 保持 2，过高会导致描边锯齿
     outlinePass = new OutlinePass(size, scene, camera);
+    outlinePass.downSampleRatio = 2;
     outlinePass.visibleEdgeColor.set(SELECTION_COLOR);
     outlinePass.hiddenEdgeColor.set(HIDDEN_EDGE_COLOR);
-    outlinePass.edgeStrength = 3.5;
-    outlinePass.edgeThickness = 1.5;
-    outlinePass.edgeGlow = 0;
+    outlinePass.edgeStrength = 6.5;
+    outlinePass.edgeThickness = 2.4;
+    outlinePass.edgeGlow = 0.15;
     outlinePass.pulsePeriod = 0;
     composer.addPass(outlinePass);
 
     // 悬停轮廓（浅蓝）
     hoverOutlinePass = new OutlinePass(size, scene, camera);
+    hoverOutlinePass.downSampleRatio = 2;
     hoverOutlinePass.visibleEdgeColor.set(HOVER_EDGE_COLOR);
     hoverOutlinePass.hiddenEdgeColor.set(HIDDEN_EDGE_COLOR);
-    hoverOutlinePass.edgeStrength = 2.5;
-    hoverOutlinePass.edgeThickness = 1;
-    hoverOutlinePass.edgeGlow = 0;
+    hoverOutlinePass.edgeStrength = 4;
+    hoverOutlinePass.edgeThickness = 1.6;
+    hoverOutlinePass.edgeGlow = 0.08;
     hoverOutlinePass.pulsePeriod = 0;
     composer.addPass(hoverOutlinePass);
 
+    // 模型配置轮廓高亮（与点击选中同款 OutlinePass 强度）
+    modelConfigOutlinePass = new OutlinePass(size, scene, camera);
+    modelConfigOutlinePass.downSampleRatio = 2;
+    composer.addPass(modelConfigOutlinePass);
+    applyModelConfigOutlinePassStyle(DEFAULT_OUTLINE_COLOR);
+
+    smaaPass = new SMAAPass();
+    smaaPass.enabled = antialiasingMode.value === "smaa";
+    composer.addPass(smaaPass);
+
+    fxaaPass = new FXAAPass();
+    fxaaPass.enabled = antialiasingMode.value === "fxaa";
+    composer.addPass(fxaaPass);
+
     composer.addPass(new OutputPass());
+    syncAntialiasingPasses();
+    syncPresentationRenderProfile();
   }
 
   function collectOutlineMeshes(objects: THREE.Object3D[]): THREE.Object3D[] {
@@ -1259,7 +1799,14 @@ export function useMovieEditor() {
     for (const root of objects) {
       root.traverse(child => {
         if (seen.has(child)) return;
-        if (child.userData?.isEdgeLine || child.userData?.isSelectionHelper) return;
+        if (
+          child.userData?.isEdgeLine ||
+          child.userData?.isSelectionHelper ||
+          child.userData?.isOutlineShell ||
+          child.userData?.isBodyHighlightOverlay
+        ) {
+          return;
+        }
         if (pickOnlyVisible.value && !isObjectVisibleChain(child)) return;
         if ((child as THREE.Mesh).isMesh && child.visible !== false) {
           seen.add(child);
@@ -1276,28 +1823,34 @@ export function useMovieEditor() {
 
   function toggleBloom() {
     if (bloomIntensity.value > 0 && !composer) initComposer();
-    if (composer) {
+    if (composer && bloomPass) {
       bloomPass.strength = bloomIntensity.value;
       bloomPass.threshold = bloomThreshold.value;
       bloomPass.radius = bloomRadius.value;
+      bloomPass.enabled = !isPresentationMode() && bloomIntensity.value > 0;
     }
     scheduleSaveSettings();
   }
 
   function toggleColor() {
     if (!composer) initComposer();
+    const colorEnabled = !isPresentationMode();
     if (composer) {
-      if (hueSatPass.uniforms) {
-        hueSatPass.uniforms.saturation.value = ppSaturation.value;
+      if (colorPass) colorPass.enabled = colorEnabled;
+      if (hueSatPass) {
+        hueSatPass.enabled = colorEnabled;
+        if (hueSatPass.uniforms) hueSatPass.uniforms.saturation.value = ppSaturation.value;
       }
-      if (brightContrastPass.uniforms) {
-        brightContrastPass.uniforms.contrast.value = ppContrast.value;
+      if (brightContrastPass) {
+        brightContrastPass.enabled = colorEnabled;
+        if (brightContrastPass.uniforms) brightContrastPass.uniforms.contrast.value = ppContrast.value;
       }
     }
     scheduleSaveSettings();
   }
 
   function applyGrid() {
+    if (!scene) return;
     if (gridHelper) {
       scene.remove(gridHelper);
       disposeViewportGrid(gridHelper);
@@ -1310,9 +1863,84 @@ export function useMovieEditor() {
     scheduleSaveSettings();
   }
 
+  watch(gridHeight, () => {
+    applyGrid();
+  });
+
+  function applyModelEnvReflectionIntensity(targetRoot?: THREE.Object3D) {
+    const reflectK = THREE.MathUtils.clamp(envReflectionIntensity.value / 5, 0, 1);
+    const reflectBoost = Math.pow(reflectK, 0.5);
+    const applyToRoot = (root: THREE.Object3D) => {
+      root.traverse(child => {
+        const mesh = child as THREE.Mesh;
+        if (!mesh.isMesh || !mesh.material) return;
+        const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+        mats.forEach(mat => {
+          const m = mat as THREE.Material & {
+            envMapIntensity?: number;
+            roughness?: number;
+            metalness?: number;
+            needsUpdate?: boolean;
+            userData?: Record<string, unknown>;
+          };
+          if (typeof m.envMapIntensity !== "number") return;
+
+          const envKey = "__baseEnvMapIntensity";
+          const roughKey = "__baseRoughness";
+          const metalKey = "__baseMetalness";
+
+          const baseEnv =
+            typeof m.userData?.[envKey] === "number" ? (m.userData[envKey] as number) : m.envMapIntensity;
+          const baseRough =
+            typeof m.roughness === "number"
+              ? (typeof m.userData?.[roughKey] === "number" ? (m.userData[roughKey] as number) : m.roughness)
+              : undefined;
+          const baseMetal =
+            typeof m.metalness === "number"
+              ? (typeof m.userData?.[metalKey] === "number" ? (m.userData[metalKey] as number) : m.metalness)
+              : undefined;
+
+          if (!m.userData) m.userData = {};
+          m.userData[envKey] = baseEnv;
+          if (typeof baseRough === "number") m.userData[roughKey] = baseRough;
+          if (typeof baseMetal === "number") m.userData[metalKey] = baseMetal;
+
+          // 反射滑杆：在独立通道内增强“反光感”
+          // 强化反射映射：2 左右即明显，5 为极强反光
+          m.envMapIntensity = baseEnv * (0.2 + reflectBoost * 20);
+          if (typeof baseRough === "number") {
+            m.roughness = THREE.MathUtils.clamp(baseRough * (1 - 0.985 * reflectBoost), 0.002, 1);
+          }
+          if (typeof baseMetal === "number") {
+            m.metalness = THREE.MathUtils.clamp(baseMetal + 1.0 * reflectBoost, 0, 1);
+          }
+          m.needsUpdate = true;
+        });
+      });
+    };
+    if (targetRoot) {
+      applyToRoot(targetRoot);
+      return;
+    }
+    meshes.forEach(root => applyToRoot(root));
+  }
+
   function applyEnv() {
     if (!scene) return;
+    const rotY = THREE.MathUtils.degToRad(envRotation.value);
+    scene.environmentRotation.set(0, rotY, 0);
+    scene.backgroundRotation.set(0, rotY, 0);
+    // 环境贴图强度：全局环境主强度（影响 IBL 主通道）
     scene.environmentIntensity = envIntensityVal.value;
+    scene.backgroundIntensity = envIntensityVal.value;
+    // 模型反射强度：仅作用在材质 envMapIntensity
+    applyModelEnvReflectionIntensity();
+    if (envReflectionProbe?.ball.material instanceof THREE.MeshStandardMaterial) {
+      envReflectionProbe.ball.material.envMapIntensity = envReflectionIntensity.value;
+      envReflectionProbe.ball.material.needsUpdate = true;
+    }
+    ensureEnvReflectionSphere();
+    syncEditorGizmosVisibility();
     scheduleSaveSettings();
   }
 
@@ -1331,20 +1959,26 @@ export function useMovieEditor() {
       default:
         renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     }
-    dirLight.castShadow = shadowEnabled.value;
-    fillLight.castShadow = false; // Only main light casts shadow to avoid double shadows
-    if (shadowEnabled.value && dirLight.shadow) {
-      dirLight.shadow.mapSize.set(shadowMapSize.value, shadowMapSize.value);
-      dirLight.shadow.bias = shadowBias.value;
-      dirLight.shadow.normalBias = shadowNormalBias.value;
-      dirLight.shadow.camera.near = 0.5;
-      dirLight.shadow.camera.far = 60;
-      dirLight.shadow.camera.left = -15;
-      dirLight.shadow.camera.right = 15;
-      dirLight.shadow.camera.top = 15;
-      dirLight.shadow.camera.bottom = -15;
-      dirLight.shadow.camera.updateProjectionMatrix();
-      dirLight.shadow.map = null;
+
+    let shadowCaster: THREE.DirectionalLight | null = null;
+    for (const runtime of sceneLightRuntimes.values()) {
+      const light = runtime.light;
+      light.castShadow = false;
+      if (shadowEnabled.value && runtime.config.castShadow && light instanceof THREE.DirectionalLight && !shadowCaster) {
+        shadowCaster = light;
+        light.castShadow = true;
+        light.shadow.mapSize.set(shadowMapSize.value, shadowMapSize.value);
+        light.shadow.bias = shadowBias.value;
+        light.shadow.normalBias = shadowNormalBias.value;
+        light.shadow.camera.near = 0.5;
+        light.shadow.camera.far = 60;
+        light.shadow.camera.left = -15;
+        light.shadow.camera.right = 15;
+        light.shadow.camera.top = 15;
+        light.shadow.camera.bottom = -15;
+        light.shadow.camera.updateProjectionMatrix();
+        light.shadow.map = null;
+      }
     }
     // Shadow ground plane
     if (shadowEnabled.value) {
@@ -1384,6 +2018,10 @@ export function useMovieEditor() {
   function animate() {
     afid = requestAnimationFrame(animate);
     if (camTrans) {
+      if (camTrans.arm) {
+        camTrans.start = performance.now() / 1000;
+        camTrans.arm = false;
+      }
       const el = performance.now() / 1000 - camTrans.start;
       const t = Math.min(el / camTrans.dur, 1);
       const ease = t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t;
@@ -1398,6 +2036,8 @@ export function useMovieEditor() {
         camera.updateProjectionMatrix();
         camTrans = null;
         cameraAnimating = false;
+        isCameraTransitioning.value = false;
+        completeCameraTransition();
       }
     }
     controls.update();
@@ -1442,19 +2082,34 @@ export function useMovieEditor() {
     // and did not follow pivot center settings correctly.
 
     syncTransformVisualOverlays();
-    if (composer) {
-      applyPostProcessing();
-      composer.render();
-    } else {
-      renderer.render(scene, camera);
-    }
+    updateEditorGizmoScales();
+    const frameNow = performance.now();
+    const frameDtSec = lastFramePresentAt ? Math.min((frameNow - lastFramePresentAt) / 1000, 0.05) : 0.016;
+    lastFramePresentAt = frameNow;
+    adaptPresentationRenderPerf(frameDtSec);
+    renderViewportFrame();
     updateModelIntroLabelPositions();
   }
 
   let camTrans: any = null;
+  let afterCameraChapterId: string | null = null;
+  let afterCameraCallback: (() => void) | null = null;
+
+  function completeCameraTransition() {
+    if (!afterCameraCallback) return;
+    const chapterId = afterCameraChapterId;
+    const fn = afterCameraCallback;
+    afterCameraChapterId = null;
+    afterCameraCallback = null;
+    requestAnimationFrame(() => {
+      if (chapterId && selectedChapterId.value !== chapterId) return;
+      fn();
+    });
+  }
 
   function animCam(pos: number[], tgt: number[], fov: number, dur = CHAPTER_CAMERA_TRANSITION_SEC) {
     cameraAnimating = true;
+    isCameraTransitioning.value = true;
     clearHoverTarget();
     camTrans = {
       sp: camera.position.clone(),
@@ -1463,37 +2118,31 @@ export function useMovieEditor() {
       ep: new THREE.Vector3(...pos),
       et: new THREE.Vector3(...tgt),
       tf: fov,
-      start: performance.now() / 1000,
-      dur
+      start: 0,
+      dur,
+      arm: true
     };
   }
 
   function snapCam(pos: number[], tgt: number[], fov: number) {
     camTrans = null;
     cameraAnimating = false;
+    isCameraTransitioning.value = false;
     camera.position.set(pos[0], pos[1], pos[2]);
     controls.target.set(tgt[0], tgt[1], tgt[2]);
     camera.fov = fov;
     camera.updateProjectionMatrix();
+    completeCameraTransition();
   }
 
   function defaultModelCfg() {
-    return {
-      visible: true,
-      posOffset: [0, 0, 0],
-      scale: 1,
-      highlight: false,
-      highlightColor: "#00ff00",
-      outline: false,
-      animation: true,
-      intro: ""
-    };
+    return JSON.parse(JSON.stringify(createDefaultModelConfig()));
   }
 
   function chapterModelCfg(ch: Chapter, modelId: string) {
     const raw = ch.modelConfigs?.[modelId];
     if (!raw) return null;
-    return { ...defaultModelCfg(), ...raw };
+    return getModelConfig(raw);
   }
 
   function resetObject3DToDefaultState(m: Model, obj: THREE.Object3D, isRoot: boolean) {
@@ -1520,7 +2169,14 @@ export function useMovieEditor() {
     resetObject3DToDefaultState(m, root, true);
     root.traverse(child => {
       if (child === root) return;
-      if (child.userData?.isEdgeLine || child.userData?.isSelectionHelper) return;
+      if (
+        child.userData?.isEdgeLine ||
+        child.userData?.isSelectionHelper ||
+        child.userData?.isOutlineShell ||
+        child.userData?.isBodyHighlightOverlay
+      ) {
+        return;
+      }
       if (!child.userData?.nodeId) return;
       resetObject3DToDefaultState(m, child, false);
     });
@@ -1532,7 +2188,47 @@ export function useMovieEditor() {
     return !!(cfg.nodeConfigs[displayId] || cfg.nodeConfigs[nodeId]);
   }
 
-  function applyChapterModelVisibility(ch: Chapter) {
+  function applyModelVisualOnly(m: Model, obj: THREE.Object3D, cfg: ModelConfig) {
+    obj.visible = cfg.visible !== false;
+    rebuildOutlineForObject(m, obj, cfg);
+  }
+
+  function applyStaticModelTransform(m: Model, obj: THREE.Object3D, cfg: ModelConfig, isRoot: boolean) {
+    obj.scale.setScalar(cfg.scale || 1);
+    if (isRoot) {
+      const bp = obj.userData.basePos || m.basePosition || DEFAULT_MODEL_BASE_POSITION;
+      obj.position.set(
+        bp[0] + (cfg.posOffset?.[0] || 0),
+        bp[1] + (cfg.posOffset?.[1] || 0),
+        bp[2] + (cfg.posOffset?.[2] || 0)
+      );
+      obj.rotation.set(0, 0, 0);
+    } else {
+      const bp = obj.userData.baseLocalPos || [0, 0, 0];
+      const br = obj.userData.baseLocalRot || [0, 0, 0];
+      obj.position.set(
+        bp[0] + (cfg.posOffset?.[0] || 0),
+        bp[1] + (cfg.posOffset?.[1] || 0),
+        bp[2] + (cfg.posOffset?.[2] || 0)
+      );
+      obj.rotation.set(br[0], br[1], br[2]);
+    }
+  }
+
+  function shouldUseLiveAnimSegments(modelId: string, nodeId: string | null): boolean {
+    if (viewOnly.value || isPreviewMode.value || chapterPlayTarget.value) return false;
+    const video = videoEl.value;
+    if (video && !video.paused) return false;
+    if (_chAnimLock && !chAnimWallclock) return false;
+    if (selModel.value?.id !== modelId) return false;
+    if (nodeId) {
+      return resolveDisplayNodeId(getModelHierarchy(modelId), selModelNodeId.value ?? "") === nodeId;
+    }
+    return !selModelNodeId.value;
+  }
+
+  /** 统一应用节点下的模型可见性、材质效果与变换（含动画进度） */
+  function applyChapterModelState(ch: Chapter, elapsedSec = 0) {
     models.value.forEach(m => {
       const root = meshes.get(m.id);
       if (!root) return;
@@ -1541,24 +2237,57 @@ export function useMovieEditor() {
         resetModelTreeToDefault(m);
         return;
       }
-      applyConfigToObject(m, root, cfg, true);
+
+      applyModelVisualOnly(m, root, cfg);
+      if (cfg.animation && cfg.animConfig?.segments?.length) {
+        const liveSegs = shouldUseLiveAnimSegments(m.id, null) ? animSegments : undefined;
+        applyElapsedAnimToObject(root, cfg, elapsedSec, liveSegs);
+      } else {
+        applyStaticModelTransform(m, root, cfg, true);
+      }
+
       root.traverse(child => {
         if (child === root) return;
-        if (child.userData?.isEdgeLine || child.userData?.isSelectionHelper) return;
+        if (
+          child.userData?.isEdgeLine ||
+          child.userData?.isSelectionHelper ||
+          child.userData?.isOutlineShell ||
+          child.userData?.isBodyHighlightOverlay
+        ) {
+          return;
+        }
         const nodeId = child.userData?.nodeId as string | undefined;
         if (nodeId && !isNodeConfiguredInChapter(cfg, m.id, nodeId)) {
           resetObject3DToDefaultState(m, child, false);
         }
       });
+
       if (cfg.nodeConfigs) {
+        const seenDisplayIds = new Set<string>();
+        const tree = getModelHierarchy(m.id);
         for (const [nodeId, nodeCfg] of Object.entries(cfg.nodeConfigs)) {
-          for (const obj of collectObjectsForNodeId(root, nodeId)) {
-            applyConfigToObject(m, obj, { ...defaultModelCfg(), ...nodeCfg }, false);
+          const displayId = resolveDisplayNodeId(tree, nodeId);
+          if (seenDisplayIds.has(displayId)) continue;
+          seenDisplayIds.add(displayId);
+          const merged = { ...defaultModelCfg(), ...nodeCfg } as ModelConfig;
+          const liveSegs = shouldUseLiveAnimSegments(m.id, displayId) ? animSegments : undefined;
+          for (const obj of collectObjectsForNodeId(root, displayId)) {
+            applyModelVisualOnly(m, obj, merged);
+            if (merged.animation && merged.animConfig?.segments?.length) {
+              applyElapsedAnimToObject(obj, merged, elapsedSec, liveSegs);
+            } else {
+              applyStaticModelTransform(m, obj, merged, false);
+            }
           }
         }
       }
     });
     invalidatePickMeshCache();
+    syncTransformVisualOverlays();
+  }
+
+  function applyChapterModelVisibility(ch: Chapter) {
+    applyChapterModelState(ch, 0);
   }
 
   function getChapterCameraTransitionSec(ch: Chapter) {
@@ -1579,15 +2308,18 @@ export function useMovieEditor() {
     };
   }
 
-  function applyChapter(ch: Chapter) {
-    applyChapterModelVisibility(ch);
+  function transitionChapterCamera(ch: Chapter, after?: () => void) {
+    afterCameraChapterId = ch.id;
+    afterCameraCallback = after ?? null;
     const frame = resolveChapterCameraFrame(ch);
     const dur = getChapterCameraTransitionSec(ch);
-    if (viewOnly.value || isPreviewMode.value) {
-      snapCam(frame.position, frame.target, ch.camera.fov);
-    } else {
-      animCam(frame.position, frame.target, ch.camera.fov, dur);
-    }
+    animCam(frame.position, frame.target, ch.camera.fov, dur);
+  }
+
+  function applyChapter(ch: Chapter) {
+    const resolved = resolveChapter(ch);
+    if (!resolved) return;
+    navigateToChapter(resolved.chapter, resolved.idx, { seek: false });
   }
 
   // ── Model helpers ──
@@ -1609,10 +2341,12 @@ export function useMovieEditor() {
     mesh.userData = { modelId: m.id, basePos: [0, 0.5, 0], isCustom: false };
     scene.add(mesh);
     meshes.set(m.id, mesh);
+    invalidateSceneModelCenterCache();
     return mesh;
   }
 
   function onGLTFLoaded(m: Model, gltf: { scene: THREE.Group; animations: THREE.AnimationClip[] }) {
+    const isFirstModel = meshes.size === 0;
     const root = gltf.scene;
     const origPos = root.position.clone();
     const basePos = alignLoadedModelToGround(m, root);
@@ -1625,6 +2359,9 @@ export function useMovieEditor() {
     };
     scene.add(root);
     meshes.set(m.id, root);
+    if (renderer) applyMeshTextureQuality(root, renderer);
+    invalidateSceneModelCenterCache();
+    applyModelEnvReflectionIntensity(root);
     registerModelHierarchy(m.id, root, m.name);
     if (gltf.animations.length > 0 && !importingModel.value) {
       attachModelMixer(m.id, root, gltf.animations);
@@ -1642,6 +2379,10 @@ export function useMovieEditor() {
     }
     syncSceneOrbitLimits();
     applyFog();
+    layoutEditorGizmosNearScene();
+    if (isFirstModel) {
+      snapSceneLightsToModelDefaults();
+    }
   }
 
   function registerModelHierarchy(modelId: string, root: THREE.Object3D, modelDisplayName?: string) {
@@ -1669,11 +2410,6 @@ export function useMovieEditor() {
   function getModelHierarchy(modelId: string): ModelHierarchyNode[] {
     hierarchyRevision.value;
     return modelHierarchies[modelId] ?? [];
-  }
-
-  function togglePickOnlyVisible() {
-    pickOnlyVisible.value = !pickOnlyVisible.value;
-    invalidatePickMeshCache();
   }
 
   function findObject3DByNodeId(modelId: string, nodeId: string): THREE.Object3D | null {
@@ -1774,6 +2510,7 @@ export function useMovieEditor() {
     const rootEdited =
       cfg.visible !== def.visible ||
       cfg.scale !== def.scale ||
+      !!cfg.wireframe !== !!def.wireframe ||
       cfg.highlight !== def.highlight ||
       cfg.outline !== def.outline ||
       cfg.intro !== def.intro ||
@@ -1792,6 +2529,7 @@ export function useMovieEditor() {
     return (
       cfg.visible !== def.visible ||
       cfg.scale !== def.scale ||
+      !!cfg.wireframe !== !!def.wireframe ||
       cfg.highlight !== def.highlight ||
       cfg.outline !== def.outline ||
       !!cfg.intro ||
@@ -1810,6 +2548,30 @@ export function useMovieEditor() {
     return modelHasEditsForConfig(nodeCfg, createDefaultModelConfig());
   }
 
+  function getChapterAnimDuration(ch: Chapter): number {
+    let maxDur = 0;
+    for (const { cfg } of collectChapterAnimTargets(ch)) {
+      if (!cfg.animation || !cfg.animConfig?.segments?.length) continue;
+      const segs = resolvePlaybackSegments(cfg.animConfig.segments);
+      let total = 0;
+      for (const seg of segs) total += (seg.pauseTime || 0) + (seg.animTime || 3);
+      maxDur = Math.max(maxDur, total);
+    }
+    return maxDur;
+  }
+
+  function resolvePlaybackChapterAtTime(t: number): Chapter | null {
+    const video = videoEl.value;
+    const followVideoTime = viewOnly.value || isPreviewMode.value || !!(video && !video.paused) || !!chapterPlayTarget.value;
+    if (!followVideoTime) {
+      const selected = chapters.value.find(c => c.id === selectedChapterId.value);
+      if (selected && t >= selected.startTime - CHAPTER_TIME_EPS && t < selected.endTime) {
+        return selected;
+      }
+    }
+    return resolveActiveChapterAtTime(chapters.value, t);
+  }
+
   function collectChapterAnimTargets(ch: Chapter): Array<{ objs: THREE.Object3D[]; cfg: ModelConfig; liveSegs?: any[] }> {
     const targets: Array<{ objs: THREE.Object3D[]; cfg: ModelConfig; liveSegs?: any[] }> = [];
     if (!ch.modelConfigs) return targets;
@@ -1819,12 +2581,11 @@ export function useMovieEditor() {
       if (!root) continue;
 
       const rootCfgTyped = rootCfg as ModelConfig;
-      const isEditingRoot = selModel.value?.id === cmid && !selModelNodeId.value;
       if (rootCfgTyped.animation && rootCfgTyped.animConfig?.segments?.length) {
         targets.push({
           objs: [root],
           cfg: rootCfgTyped,
-          liveSegs: isEditingRoot && animSegments.length > 0 ? animSegments : undefined
+          liveSegs: shouldUseLiveAnimSegments(cmid, null) && animSegments.length > 0 ? animSegments : undefined
         });
       }
 
@@ -1838,13 +2599,12 @@ export function useMovieEditor() {
         seenDisplayIds.add(displayId);
         const nodeObjs = collectObjectsForNodeId(root, displayId);
         if (!nodeObjs.length) continue;
-        const isEditingNode = selModel.value?.id === cmid && resolveDisplayNodeId(tree, selModelNodeId.value ?? "") === displayId;
         const nodeCfgTyped = ((nodeConfigs[displayId] as ModelConfig) ?? nodeCfg) as ModelConfig;
         if (!nodeCfgTyped.animation || !nodeCfgTyped.animConfig?.segments?.length) continue;
         targets.push({
           objs: nodeObjs,
           cfg: nodeCfgTyped,
-          liveSegs: isEditingNode && animSegments.length > 0 ? animSegments : undefined
+          liveSegs: shouldUseLiveAnimSegments(cmid, displayId) && animSegments.length > 0 ? animSegments : undefined
         });
       }
     }
@@ -1865,13 +2625,15 @@ export function useMovieEditor() {
     const elapsed = Math.max(0, elapsedSec);
     if (elapsed <= 0) {
       const cfirst = csegs[0];
-      applyPivotRotation(
+      const pc = getSegPivotCache(cfirst, obj);
+      applyPivotPathFrame(
         obj,
         [cfirst.startPos[0], cfirst.startPos[1], cfirst.startPos[2]],
         [cfirst.startRot[0], cfirst.startRot[1], cfirst.startRot[2]],
-        cfirst.pivot || "center",
-        cfirst.startScale
+        pc,
+        0
       );
+      obj.scale.setScalar(cfirst.startScale);
       return;
     }
 
@@ -2031,6 +2793,7 @@ export function useMovieEditor() {
     scene.remove(o);
     disposeObject3D(o);
     meshes.delete(mid);
+    invalidateSceneModelCenterCache();
     invalidatePickMeshCache();
     const model = models.value.find(m => m.id === mid);
     if (model?.url?.startsWith("blob:")) URL.revokeObjectURL(model.url);
@@ -2139,7 +2902,14 @@ export function useMovieEditor() {
   function isPickExemptObject(obj: THREE.Object3D): boolean {
     let current: THREE.Object3D | null = obj;
     while (current) {
-      if (current.userData?.isSelectionHelper || current.userData?.isEdgeLine) return true;
+      if (
+        current.userData?.isSelectionHelper ||
+        current.userData?.isEdgeLine ||
+        current.userData?.isOutlineShell ||
+        current.userData?.isBodyHighlightOverlay
+      ) {
+        return true;
+      }
       current = current.parent;
     }
     return false;
@@ -2387,7 +3157,20 @@ export function useMovieEditor() {
 
   function applyConfigToObject(m: Model, obj: THREE.Object3D, cfg: ModelConfig, isRoot: boolean) {
     const hasAnim = !!(cfg.animation && (cfg.animConfig?.segments?.length ?? 0) > 0);
-    if (!hasAnim) {
+    if (hasAnim) {
+      const rawSeg = cfg.animConfig!.segments![0];
+      const seg = mapStoredAnimSegment(rawSeg);
+      invalidateSegPivotCache(seg);
+      getSegPivotCache(seg, obj);
+      applyPivotPathFrame(
+        obj,
+        seg.startPos,
+        seg.startRot,
+        seg._animPivotCache,
+        0
+      );
+      obj.scale.setScalar(seg.startScale);
+    } else {
       obj.scale.setScalar(cfg.scale || 1);
       if (isRoot) {
         const bp = obj.userData.basePos || DEFAULT_MODEL_BASE_POSITION;
@@ -2453,13 +3236,22 @@ export function useMovieEditor() {
     const target = clampVideoTime(time, video);
     if (!Number.isFinite(target)) return;
 
+    const gen = ++seekGeneration;
+
+    video.pause();
+    try {
+      video.currentTime = target;
+    } catch {
+      /* ignore */
+    }
+
     if (Math.abs(video.currentTime - target) < CHAPTER_TIME_EPS) {
-      currentTime.value = video.currentTime;
+      if (gen === seekGeneration) currentTime.value = video.currentTime;
       return;
     }
 
-    video.pause();
     await waitUntilSeekable(video, target);
+    if (gen !== seekGeneration) return;
 
     await new Promise<void>(resolve => {
       let settled = false;
@@ -2467,7 +3259,7 @@ export function useMovieEditor() {
         if (settled) return;
         settled = true;
         video.removeEventListener("seeked", onSeeked);
-        currentTime.value = video.currentTime;
+        if (gen === seekGeneration) currentTime.value = video.currentTime;
         resolve();
       };
       const onSeeked = () => finish();
@@ -2483,25 +3275,7 @@ export function useMovieEditor() {
   }
 
   function resetChapterModelsToStart(chapter: Chapter) {
-    for (const { objs, cfg, liveSegs } of collectChapterAnimTargets(chapter)) {
-      for (const obj of objs) {
-        if (cfg.animation && cfg.animConfig?.segments?.length) {
-          applyElapsedAnimToObject(obj, cfg, 0, liveSegs);
-        } else if (!obj.userData?.nodeId) {
-          const bp = obj.userData.basePos || DEFAULT_MODEL_BASE_POSITION;
-          obj.position.set(bp[0], bp[1], bp[2]);
-          obj.rotation.set(0, 0, 0);
-          obj.scale.setScalar(1);
-        } else {
-          const bp = obj.userData.baseLocalPos || [0, 0, 0];
-          const br = obj.userData.baseLocalRot || [0, 0, 0];
-          const bs = obj.userData.baseLocalScale ?? 1;
-          obj.position.set(bp[0], bp[1], bp[2]);
-          obj.rotation.set(br[0], br[1], br[2]);
-          obj.scale.setScalar(bs);
-        }
-      }
-    }
+    applyChapterModelState(chapter, 0);
   }
 
   function syncPausedChapterAnimation(v: HTMLVideoElement, _ci: number) {
@@ -2509,7 +3283,7 @@ export function useMovieEditor() {
     const ch = getPlaybackChapterAtTime(v.currentTime);
     if (!ch) return;
     stopChapterAnimation();
-    applyChapterAnimationAtElapsed(ch, getChapterAnimElapsed(ch, v.currentTime));
+    applyChapterModelState(ch, getChapterAnimElapsed(ch, v.currentTime));
   }
 
   function syncChapterSubtitle(v: HTMLVideoElement) {
@@ -2527,23 +3301,11 @@ export function useMovieEditor() {
   }
 
   function chapterAtTime(t: number): Chapter | null {
-    const hit = timelineChapters.value.find(c => t >= c.startTime && t < c.endTime);
-    if (hit) return hit;
-    let last: Chapter | null = null;
-    for (const ch of timelineChapters.value) {
-      if (ch.startTime <= t + CHAPTER_TIME_EPS) last = ch;
-      else break;
-    }
-    return last ?? timelineChapters.value[0] ?? null;
+    return resolveActiveChapterAtTime(chapters.value, t);
   }
 
   function getPlaybackChapterAtTime(t: number): Chapter | null {
-    const selected = chapters.value.find(c => c.id === selectedChapterId.value);
-    if (selected && t >= selected.startTime - CHAPTER_TIME_EPS && t < selected.endTime) {
-      return selected;
-    }
-    const ci = findChIdx(t);
-    return ci >= 0 ? timelineChapters.value[ci] : null;
+    return resolvePlaybackChapterAtTime(t);
   }
 
   function getTimelineChapterIndex(ch: Chapter): number {
@@ -2792,10 +3554,14 @@ export function useMovieEditor() {
     }
 
     const ci = findChIdx(v.currentTime);
-    const locked = chapterNavLock.value || chapterPlayTarget.value;
+    const locked = videoChapterSyncPaused || chapterNavLock.value || chapterPlayTarget.value;
 
     if (locked) {
-      syncPausedChapterAnimation(v, ci);
+      if (!v.paused && !isCameraTransitioning.value) {
+        ensureVideoSyncedChapterAnimation();
+      } else if (!videoChapterSyncPaused && !chapterNavLock.value && !isCameraTransitioning.value) {
+        syncPausedChapterAnimation(v, ci);
+      }
       syncChapterSubtitle(v);
       return;
     }
@@ -2807,17 +3573,17 @@ export function useMovieEditor() {
         const selected = chapters.value.find(c => c.id === selectedChapterId.value);
         const keepChildSelection = !!(selected?.parentId && isChapterInPlaybackRange(selected, v.currentTime));
         if (!keepChildSelection && ch.id !== selectedChapterId.value) {
-          _chAnimLock = false;
-          selectedChapterId.value = ch.id;
-          applyChapter(ch);
-          syncChapterForm(ch);
-          syncModelSelectionForChapter(ch);
+          navigateToChapter(ch, ci);
           if (!v.paused) ensureVideoSyncedChapterAnimation();
         }
       }
+    } else if (!v.paused && !locked && !isCameraTransitioning.value) {
+      ensureVideoSyncedChapterAnimation();
     }
 
-    syncPausedChapterAnimation(v, ci);
+    if (!isCameraTransitioning.value && !videoChapterSyncPaused && !chapterNavLock.value) {
+      syncPausedChapterAnimation(v, ci);
+    }
     syncChapterSubtitle(v);
     syncIntroPresentation();
   }
@@ -2930,6 +3696,7 @@ export function useMovieEditor() {
           currProj.value.videoDuration = 0;
           currProj.value.videoWidth = 0;
           currProj.value.videoHeight = 0;
+          currProj.value.videoDisplayWidth = 0;
           currProj.value.chapters = [];
           currProj.value.subtitles = [];
           currProj.value.models = [];
@@ -2994,7 +3761,9 @@ export function useMovieEditor() {
         mAni.value = true;
         mScl.value = 1;
         mRot.splice(0, 3, 0, 0, 0);
-        mHLColor.value = "#00ff00";
+        mOutlineColor.value = DEFAULT_OUTLINE_COLOR;
+        mWireColor.value = DEFAULT_WIREFRAME_COLOR;
+        mHLColor.value = DEFAULT_MODEL_HIGHLIGHT_COLOR;
         mIntro.value = "";
         modelIntroLabels.value = [];
 
@@ -3112,6 +3881,30 @@ export function useMovieEditor() {
 
   function createDefaultAnimSegment(model?: Model | null) {
     const m = model ?? selModel.value;
+    const o = m ? getTransformTarget(m.id, selModelNodeId.value) : null;
+    if (o) {
+      const pos = [round3(o.position.x), round3(o.position.y), round3(o.position.z)];
+      const rot = [
+        round3((o.rotation.x * 180) / Math.PI),
+        round3((o.rotation.y * 180) / Math.PI),
+        round3((o.rotation.z * 180) / Math.PI)
+      ];
+      const scale = round3(o.scale.x);
+      return {
+        id: nextAnimSegmentId(),
+        pauseTime: 0,
+        animTime: 3,
+        easing: "easeInOut",
+        pivot: "center",
+        startPos: [...pos],
+        endPos: [...pos],
+        startScale: scale,
+        endScale: scale,
+        startRot: [...rot],
+        endRot: [...rot],
+        _expandedPanels: ["start", "end"] as string[]
+      };
+    }
     const { pos, scale, rot } = m
       ? getDefaultTransformForAnimTarget(m, selModelNodeId.value)
       : { pos: [...DEFAULT_MODEL_BASE_POSITION], scale: 1, rot: [0, 0, 0] };
@@ -3159,6 +3952,7 @@ export function useMovieEditor() {
     animEasing.value = "easeInOut";
     animDirty.value = true;
     modelFormRevision.value++;
+    if (animSegments[0]) focusSegTransform(animSegments[0], "start");
   }
 
   function recalcAnimDuration() {
@@ -3181,12 +3975,12 @@ export function useMovieEditor() {
         animTime: s.animTime || 3,
         easing: s.easing || animEasing.value,
         pivot: s.pivot || "center",
-        startPos: [...s.startPos],
-        endPos: [...s.endPos],
+        startPos: [...s.startPos].map((n: number) => round3(n)),
+        endPos: [...s.endPos].map((n: number) => round3(n)),
         startScale: s.startScale,
         endScale: s.endScale,
-        startRot: [...s.startRot],
-        endRot: [...s.endRot]
+        startRot: [...s.startRot].map((n: number) => round3(n)),
+        endRot: [...s.endRot].map((n: number) => round3(n))
       }))
     } as any;
     cfg.animation = true;
@@ -3200,7 +3994,7 @@ export function useMovieEditor() {
     const ch = getActiveChapter();
     if (!m || !ch) return;
     const cfg = getActiveModelConfig(ch);
-    if (!cfg.highlight && !cfg.outline) return;
+    if (!cfg.highlight && !cfg.outline && !cfg.wireframe) return;
     for (const target of getNodeObjects(m.id, selModelNodeId.value, true)) {
       rebuildOutlineForObject(m, target, cfg);
     }
@@ -3230,35 +4024,8 @@ export function useMovieEditor() {
     let er = { x: seg.endRot[0], y: seg.endRot[1], z: seg.endRot[2] };
     let dur = (seg.animTime || 3) * 1000;
     let easingType = seg.easing || animEasing.value;
-    // Pre-compute pivot path correction for non-center pivot
-    let pivot = seg.pivot || "center";
-    let pivotCache: any = null;
-    if (pivot !== "center") {
-      let sp2 = o.position.clone();
-      let sq2 = o.quaternion.clone();
-      o.position.set(0, 0, 0);
-      o.quaternion.identity();
-      o.updateMatrixWorld(true);
-      let bbox = calcModelBBox(o);
-      o.position.copy(sp2);
-      o.quaternion.copy(sq2);
-      o.updateMatrixWorld(true);
-      if (bbox.min.x !== Infinity) {
-        let gc = new THREE.Vector3();
-        bbox.getCenter(gc);
-        let pl = getPivotLocal(bbox, pivot);
-        let L = gc.add(pl);
-        let sRad = [(sr.x * Math.PI) / 180, (sr.y * Math.PI) / 180, (sr.z * Math.PI) / 180];
-        let eRad = [(er.x * Math.PI) / 180, (er.y * Math.PI) / 180, (er.z * Math.PI) / 180];
-        let sq_ = new THREE.Quaternion().setFromEuler(new THREE.Euler(sRad[0], sRad[1], sRad[2]));
-        let eq_ = new THREE.Quaternion().setFromEuler(new THREE.Euler(eRad[0], eRad[1], eRad[2]));
-        pivotCache = {
-          L: L.clone(),
-          startOffset: L.clone().applyQuaternion(sq_),
-          endOffset: L.clone().applyQuaternion(eq_)
-        };
-      }
-    }
+    invalidateSegPivotCache(seg);
+    getSegPivotCache(seg, o);
     let st = performance.now();
     function tick() {
       try {
@@ -3268,24 +4035,13 @@ export function useMovieEditor() {
         let ep2 = applyEasingInline(t, easingType);
         let midPos = [sp.x + (ep.x - sp.x) * ep2, sp.y + (ep.y - sp.y) * ep2, sp.z + (ep.z - sp.z) * ep2];
         let midRot = [sr.x + (er.x - sr.x) * ep2, sr.y + (er.y - sr.y) * ep2, sr.z + (er.z - sr.z) * ep2];
-        if (pivotCache) {
-          let rad = [(midRot[0] * Math.PI) / 180, (midRot[1] * Math.PI) / 180, (midRot[2] * Math.PI) / 180];
-          let cq = new THREE.Quaternion().setFromEuler(new THREE.Euler(rad[0], rad[1], rad[2]));
-          let curOff = pivotCache.L.clone().applyQuaternion(cq);
-          let interpOff = new THREE.Vector3().copy(pivotCache.startOffset).lerp(pivotCache.endOffset, ep2);
-          o.position.set(
-            midPos[0] + interpOff.x - curOff.x,
-            midPos[1] + interpOff.y - curOff.y,
-            midPos[2] + interpOff.z - curOff.z
-          );
-          o.quaternion.copy(cq);
-        } else {
-          applyPivotRotation(o, midPos, midRot, pivot);
-        }
+        applyPivotPathFrame(o, midPos, midRot, seg._animPivotCache, ep2);
+        o.scale.setScalar(ss + (es - ss) * ep2);
         syncTransformVisualOverlays();
         if (t >= 1) {
           seg._progress = 1;
           seg._playing = false;
+          liveSeg(seg, editingSegMode.value);
           return;
         }
       } catch (e) {
@@ -3296,38 +4052,30 @@ export function useMovieEditor() {
     }
     tick();
   }
-  function getSegPivotCache(seg: any, mesh: any): any {
-    if (seg._animPivotCache) return seg._animPivotCache;
-    let pivot = seg.pivot || "center";
+  function invalidateSegPivotCache(seg: any) {
+    delete seg._animPivotCache;
+  }
+  function getSegPivotCache(seg: any, mesh: THREE.Object3D): any {
+    const pivot = seg.pivot || "center";
+    if (seg._animPivotCache && seg._animPivotCache.pivot === pivot) return seg._animPivotCache;
     if (pivot === "center") {
-      seg._animPivotCache = { center: true };
+      seg._animPivotCache = { center: true, pivot };
       return seg._animPivotCache;
     }
-    let sp = mesh.position.clone();
-    let sq = mesh.quaternion.clone();
-    mesh.position.set(0, 0, 0);
-    mesh.quaternion.identity();
-    mesh.updateMatrixWorld(true);
-    let bbox = calcModelBBox(mesh);
-    mesh.position.copy(sp);
-    mesh.quaternion.copy(sq);
-    mesh.updateMatrixWorld(true);
-    if (bbox.min.x === Infinity) {
-      seg._animPivotCache = { center: true };
-      return seg._animPivotCache;
-    }
-    let gc = new THREE.Vector3();
-    bbox.getCenter(gc);
-    let pl = getPivotLocal(bbox, pivot);
-    let L = gc.add(pl);
-    let sRad = [(seg.startRot[0] * Math.PI) / 180, (seg.startRot[1] * Math.PI) / 180, (seg.startRot[2] * Math.PI) / 180];
-    let eRad = [(seg.endRot[0] * Math.PI) / 180, (seg.endRot[1] * Math.PI) / 180, (seg.endRot[2] * Math.PI) / 180];
-    let sq_ = new THREE.Quaternion().setFromEuler(new THREE.Euler(sRad[0], sRad[1], sRad[2]));
-    let eq_ = new THREE.Quaternion().setFromEuler(new THREE.Euler(eRad[0], eRad[1], eRad[2]));
+    const L = getPivotPointLocal(mesh, pivot);
+    const sRad = [(seg.startRot[0] * Math.PI) / 180, (seg.startRot[1] * Math.PI) / 180, (seg.startRot[2] * Math.PI) / 180];
+    const eRad = [(seg.endRot[0] * Math.PI) / 180, (seg.endRot[1] * Math.PI) / 180, (seg.endRot[2] * Math.PI) / 180];
+    const sq_ = new THREE.Quaternion().setFromEuler(new THREE.Euler(sRad[0], sRad[1], sRad[2], "XYZ"));
+    const eq_ = new THREE.Quaternion().setFromEuler(new THREE.Euler(eRad[0], eRad[1], eRad[2], "XYZ"));
+    const startScale = seg.startScale ?? 1;
+    const endScale = seg.endScale ?? 1;
     seg._animPivotCache = {
+      pivot,
       L: L.clone(),
-      startOffset: L.clone().applyQuaternion(sq_),
-      endOffset: L.clone().applyQuaternion(eq_)
+      startScale,
+      endScale,
+      startOffset: pivotOffsetVector(L, sq_, startScale),
+      endOffset: pivotOffsetVector(L, eq_, endScale)
     };
     return seg._animPivotCache;
   }
@@ -3337,11 +4085,15 @@ export function useMovieEditor() {
       return;
     }
     let rad = [(midRot[0] * Math.PI) / 180, (midRot[1] * Math.PI) / 180, (midRot[2] * Math.PI) / 180];
-    let cq = new THREE.Quaternion().setFromEuler(new THREE.Euler(rad[0], rad[1], rad[2]));
-    let curOff = pivotCache.L.clone().applyQuaternion(cq);
+    let cq = new THREE.Quaternion().setFromEuler(new THREE.Euler(rad[0], rad[1], rad[2], "XYZ"));
+    const startScale = pivotCache.startScale ?? pivotCache.scale ?? 1;
+    const endScale = pivotCache.endScale ?? pivotCache.scale ?? 1;
+    const scale = startScale + (endScale - startScale) * ep2;
+    let curOff = pivotCache.L.clone().multiplyScalar(scale).applyQuaternion(cq);
     let interpOff = new THREE.Vector3().copy(pivotCache.startOffset).lerp(pivotCache.endOffset, ep2);
     o.position.set(midPos[0] + interpOff.x - curOff.x, midPos[1] + interpOff.y - curOff.y, midPos[2] + interpOff.z - curOff.z);
     o.quaternion.copy(cq);
+    o.rotation.set(rad[0], rad[1], rad[2], "XYZ");
   }
   function playAllSegments() {
     if (totalPlaying.value) return;
@@ -3366,9 +4118,16 @@ export function useMovieEditor() {
     }
     // Set initial position to first seg start
     let first = animSegments[0];
-    o.position.set(first.startPos[0], first.startPos[1], first.startPos[2]);
+    invalidateSegPivotCache(first);
+    getSegPivotCache(first, o);
+    applyPivotPathFrame(
+      o,
+      first.startPos,
+      first.startRot,
+      first._animPivotCache,
+      0
+    );
     o.scale.setScalar(first.startScale);
-    o.rotation.set((first.startRot[0] * Math.PI) / 180, (first.startRot[1] * Math.PI) / 180, (first.startRot[2] * Math.PI) / 180);
     // Pre-compute pivot cache for all segments
     for (let si = 0; si < animSegments.length; si++) getSegPivotCache(animSegments[si], o);
     let st = performance.now();
@@ -3437,13 +4196,14 @@ export function useMovieEditor() {
     if (!m) return;
     let o = getTransformTarget(m.id, selModelNodeId.value);
     if (!o) return;
-    // Animate to end state
-    let sp = { x: o.position.x, y: o.position.y, z: o.position.z };
-    let ss = o.scale.x;
-    let sr = { x: o.rotation.x, y: o.rotation.y, z: o.rotation.z };
+    invalidateSegPivotCache(seg);
+    getSegPivotCache(seg, o);
+    let sp = { x: seg.startPos[0], y: seg.startPos[1], z: seg.startPos[2] };
+    let ss = seg.startScale;
+    let sr = { x: seg.startRot[0], y: seg.startRot[1], z: seg.startRot[2] };
     let ep = { x: seg.endPos[0], y: seg.endPos[1], z: seg.endPos[2] };
     let es = seg.endScale;
-    let er = { x: (seg.endRot[0] * Math.PI) / 180, y: (seg.endRot[1] * Math.PI) / 180, z: (seg.endRot[2] * Math.PI) / 180 };
+    let er = { x: seg.endRot[0], y: seg.endRot[1], z: seg.endRot[2] };
     let dur = (seg.animTime || 3) * 1000;
     let easingType = seg.easing || animEasing.value;
     let st = performance.now();
@@ -3451,10 +4211,13 @@ export function useMovieEditor() {
       let el = performance.now() - st;
       let t = Math.min(el / dur, 1);
       let ep2 = applyEasingInline(t, easingType);
-      o.position.set(sp.x + (ep.x - sp.x) * ep2, sp.y + (ep.y - sp.y) * ep2, sp.z + (ep.z - sp.z) * ep2);
+      let midPos = [sp.x + (ep.x - sp.x) * ep2, sp.y + (ep.y - sp.y) * ep2, sp.z + (ep.z - sp.z) * ep2];
+      let midRot = [sr.x + (er.x - sr.x) * ep2, sr.y + (er.y - sr.y) * ep2, sr.z + (er.z - sr.z) * ep2];
+      applyPivotPathFrame(o, midPos, midRot, seg._animPivotCache, ep2);
       o.scale.setScalar(ss + (es - ss) * ep2);
-      o.rotation.set(sr.x + (er.x - sr.x) * ep2, sr.y + (er.y - sr.y) * ep2, sr.z + (er.z - sr.z) * ep2);
+      syncTransformVisualOverlays();
       if (t < 1) requestAnimationFrame(tick);
+      else liveSeg(seg, editingSegMode.value);
     }
     tick();
   }
@@ -3489,53 +4252,109 @@ export function useMovieEditor() {
         return t;
     }
   }
-  function syncSegToMesh(seg: any, mesh: any, mode?: string) {
-    // Sync seg pos to mesh's current world position (pos IS the mesh position).
-    // mode="start"/"end" = only that mode; undefined = update both.
+  function syncSegToMesh(seg: any, mesh: THREE.Object3D, mode?: "start" | "end") {
     if (!mesh) return;
-    let p = mesh.position;
-    let pos = [p.x, p.y, p.z];
+    const pos = [round3(mesh.position.x), round3(mesh.position.y), round3(mesh.position.z)];
+    const rot = [
+      round3((mesh.rotation.x * 180) / Math.PI),
+      round3((mesh.rotation.y * 180) / Math.PI),
+      round3((mesh.rotation.z * 180) / Math.PI)
+    ];
+    const scale = round3(mesh.scale.x);
     if (mode === "start") {
       seg.startPos = pos;
+      seg.startRot = rot;
+      seg.startScale = scale;
     } else if (mode === "end") {
       seg.endPos = pos;
+      seg.endRot = rot;
+      seg.endScale = scale;
     } else {
       seg.startPos = pos;
       seg.endPos = pos;
+      seg.startRot = rot;
+      seg.endRot = rot;
+      seg.startScale = scale;
+      seg.endScale = scale;
     }
+    invalidateSegPivotCache(seg);
+    bumpAnimSegmentRevision();
+  }
+
+  function bumpAnimSegmentRevision() {
+    animSegmentRevision.value++;
   }
   function focusSegTransform(seg: any, mode: "start" | "end") {
     editingSeg.value = seg;
     editingSegMode.value = mode;
     if (selModel.value) {
       showPivotHelpers(selModel.value.id, seg);
-      updateActivePivotHelper(selModel.value.id);
+      liveSeg(seg, mode);
     }
   }
-  function calcModelBBox(mesh: any): THREE.Box3 {
-    let bbox = new THREE.Box3();
-    let first = true;
-    mesh.traverse(function (child: any) {
-      if (child.isMesh && child.geometry && child.geometry.attributes.position) {
-        let pos = child.geometry.attributes.position;
-        let arr = pos.array;
-        let localBox = new THREE.Box3();
-        let v = new THREE.Vector3();
-        let w = new THREE.Vector3();
-        for (let i = 0; i < arr.length; i += 3) {
-          v.set(arr[i], arr[i + 1], arr[i + 2]);
-          v.applyMatrix4(child.matrixWorld);
-          if (first) {
-            localBox.min.copy(v);
-            localBox.max.copy(v);
-            first = false;
-          } else localBox.expandByPoint(v);
+  function calcObjectLocalBBox(object: THREE.Object3D): THREE.Box3 {
+    const box = new THREE.Box3();
+    const temp = new THREE.Vector3();
+    const relMatrix = new THREE.Matrix4();
+    object.updateWorldMatrix(true, false);
+    const invRoot = new THREE.Matrix4().copy(object.matrixWorld).invert();
+    object.traverse(child => {
+      const mesh = child as THREE.Mesh;
+      if (!mesh.isMesh || !mesh.geometry) return;
+      const geo = mesh.geometry;
+      if (!geo.boundingBox) geo.computeBoundingBox();
+      if (!geo.boundingBox) return;
+      relMatrix.multiplyMatrices(invRoot, child.matrixWorld);
+      const bb = geo.boundingBox;
+      const mins = bb.min;
+      const maxs = bb.max;
+      for (let xi = 0; xi <= 1; xi++) {
+        for (let yi = 0; yi <= 1; yi++) {
+          for (let zi = 0; zi <= 1; zi++) {
+            temp.set(xi ? maxs.x : mins.x, yi ? maxs.y : mins.y, zi ? maxs.z : mins.z).applyMatrix4(relMatrix);
+            box.expandByPoint(temp);
+          }
         }
-        bbox.expandByPoint(localBox.min);
-        bbox.expandByPoint(localBox.max);
       }
     });
-    return bbox;
+    return box;
+  }
+
+  function getPivotPointLocal(object: THREE.Object3D, pivotType: string): THREE.Vector3 {
+    if (pivotType === "center") return new THREE.Vector3(0, 0, 0);
+    const bbox = calcObjectLocalBBox(object);
+    if (bbox.isEmpty()) return new THREE.Vector3(0, 0, 0);
+    const geoCenter = bbox.getCenter(new THREE.Vector3());
+    return geoCenter.clone().add(getPivotLocal(bbox, pivotType));
+  }
+
+  function pivotOffsetVector(L: THREE.Vector3, quat: THREE.Quaternion, scale = 1): THREE.Vector3 {
+    return L.clone().multiplyScalar(scale).applyQuaternion(quat);
+  }
+
+  function shouldBootstrapSegFromMesh(seg: any, mesh: THREE.Object3D, mode: "start" | "end") {
+    const pos = mode === "start" ? seg.startPos : seg.endPos;
+    const rot = mode === "start" ? seg.startRot : seg.endRot;
+    const scale = mode === "start" ? seg.startScale : seg.endScale;
+    if (!pos || !rot) return true;
+    const posDefault = pos.every((v: number) => Math.abs(v) < 1e-4);
+    const rotDefault = rot.every((v: number) => Math.abs(v) < 1e-4);
+    const scaleDefault = Math.abs((scale ?? 1) - 1) < 1e-4;
+    if (!posDefault || !rotDefault || !scaleDefault) return false;
+    const moved =
+      Math.abs(mesh.position.x) > 1e-3 || Math.abs(mesh.position.y) > 1e-3 || Math.abs(mesh.position.z) > 1e-3;
+    const rotated =
+      Math.abs(mesh.rotation.x) > 1e-3 || Math.abs(mesh.rotation.y) > 1e-3 || Math.abs(mesh.rotation.z) > 1e-3;
+    return moved || rotated;
+  }
+
+  function alignAnimSegmentWithMesh(seg: any, mode: "start" | "end" = "start") {
+    const m = selModel.value;
+    if (!m) return;
+    const mesh = getTransformTarget(m.id, selModelNodeId.value);
+    if (!mesh || !shouldBootstrapSegFromMesh(seg, mesh, mode)) return;
+    syncSegToMesh(seg, mesh, mode);
+    if (mode === "start") syncSegToMesh(seg, mesh, "end");
   }
 
   function getPivotLocal(bbox: THREE.Box3, pivotType: string): THREE.Vector3 {
@@ -3567,73 +4386,81 @@ export function useMovieEditor() {
     return pl;
   }
   function applyPivotRotation(mesh: any, pos: number[], rot: number[], pivotType: string, scaleVal?: number) {
-    // pos = mesh world position. Rotation centering handled by onRotChange.
     let rad = [(rot[0] * Math.PI) / 180, (rot[1] * Math.PI) / 180, (rot[2] * Math.PI) / 180];
     if (scaleVal !== undefined) mesh.scale.setScalar(scaleVal);
+    mesh.rotation.set(rad[0], rad[1], rad[2], "XYZ");
     mesh.position.set(pos[0], pos[1], pos[2]);
-    mesh.rotation.set(rad[0], rad[1], rad[2]);
   }
   function onPivotChange(seg: any, mode: "start" | "end" = editingSegMode.value) {
     if (!selModel.value) return;
-    focusSegTransform(seg, mode);
-    liveSeg(seg, mode);
+    const mesh = getTransformTarget(selModel.value.id, selModelNodeId.value);
+    if (mesh) syncSegToMesh(seg, mesh, mode);
+    invalidateSegPivotCache(seg);
+    editingSeg.value = seg;
+    editingSegMode.value = mode;
+    showPivotHelpers(selModel.value.id, seg);
+    updateActivePivotHelper(selModel.value.id);
+    markAnimDirty();
+    bumpAnimSegmentRevision();
   }
   function onRotChange(seg: any, mode: "start" | "end" = editingSegMode.value) {
-    // Rotation with non-center pivot: adjust mesh position so rotation appears around pivot
     if (!selModel.value) return;
-    let mesh = getTransformTarget(selModel.value.id, selModelNodeId.value);
+    editingSeg.value = seg;
+    editingSegMode.value = mode;
+    const mesh = getTransformTarget(selModel.value.id, selModelNodeId.value);
     if (!mesh) return;
-    let pivotType = seg.pivot || "center";
-    if (pivotType === "center") {
-      liveSeg(seg, mode);
-      return;
+    const rotKey = mode === "start" ? "startRot" : "endRot";
+    const posKey = mode === "start" ? "startPos" : "endPos";
+    const scaleKey = mode === "start" ? "startScale" : "endScale";
+    const nextRot = (seg[rotKey] || [0, 0, 0]).map((n: number) => round3(n));
+    seg[rotKey] = [...nextRot];
+    const pivotType = seg.pivot || "center";
+    invalidateSegPivotCache(seg);
+    if (pivotType !== "center") {
+      const oldQuat = mesh.quaternion.clone();
+      const oldPos = mesh.position.clone();
+      const scale = seg[scaleKey] ?? mesh.scale.x ?? 1;
+      const L = getPivotPointLocal(mesh, pivotType);
+      const rad = [(nextRot[0] * Math.PI) / 180, (nextRot[1] * Math.PI) / 180, (nextRot[2] * Math.PI) / 180];
+      const newQuat = new THREE.Quaternion().setFromEuler(new THREE.Euler(rad[0], rad[1], rad[2], "XYZ"));
+      const oldOff = pivotOffsetVector(L, oldQuat, scale);
+      const newOff = pivotOffsetVector(L, newQuat, scale);
+      const newPos = oldPos.clone().add(oldOff).sub(newOff);
+      seg[posKey] = [round3(newPos.x), round3(newPos.y), round3(newPos.z)];
     }
-    // Save old transform
-    let oldPos = mesh.position.clone();
-    let oldQuat = mesh.quaternion.clone();
-    // Get new rotation from seg (already updated by v-model)
-    let rot = mode === "start" ? seg.startRot : seg.endRot;
-    let rad = [(rot[0] * Math.PI) / 180, (rot[1] * Math.PI) / 180, (rot[2] * Math.PI) / 180];
-    let newQuat = new THREE.Quaternion().setFromEuler(new THREE.Euler(rad[0], rad[1], rad[2]));
-    // Compute bbox at identity for pivot calculation
-    let sp = mesh.position.clone();
-    let sq = mesh.quaternion.clone();
-    mesh.position.set(0, 0, 0);
-    mesh.quaternion.identity();
-    mesh.updateMatrixWorld(true);
-    let bbox = calcModelBBox(mesh);
-    mesh.position.copy(sp);
-    mesh.quaternion.copy(sq);
-    mesh.updateMatrixWorld(true);
-    if (bbox.min.x !== Infinity) {
-      let geoCenter = new THREE.Vector3();
-      bbox.getCenter(geoCenter);
-      let pivotLocal = getPivotLocal(bbox, pivotType);
-      let L = new THREE.Vector3().copy(geoCenter).add(pivotLocal);
-      let oldOff = L.clone().applyQuaternion(oldQuat);
-      let newOff = L.clone().applyQuaternion(newQuat);
-      // newPos = oldPos + oldOff - newOff  (pivot stays fixed in world)
-      mesh.position.copy(oldPos).add(oldOff).sub(newOff);
-    }
-    mesh.quaternion.copy(newQuat);
-    // Update seg pos to reflect pivot-adjusted mesh position
-    let np = [mesh.position.x, mesh.position.y, mesh.position.z];
-    if (mode === "start") seg.startPos = np;
-    else seg.endPos = np;
-    updateActivePivotHelper(selModel.value.id);
+    liveSeg(seg, mode);
+    markAnimDirty();
   }
   function liveSeg(seg: any, mode: "start" | "end" = editingSegMode.value) {
     const m = selModel.value;
     if (!m) return;
+    editingSeg.value = seg;
+    editingSegMode.value = mode;
     const objs = getNodeObjects(m.id, selModelNodeId.value);
     if (!objs.length) return;
-    const pos = mode === "start" ? seg.startPos : seg.endPos;
-    const rot = mode === "start" ? seg.startRot : seg.endRot;
-    const scale = mode === "start" ? seg.startScale : seg.endScale;
+    const posKey = mode === "start" ? "startPos" : "endPos";
+    const rotKey = mode === "start" ? "startRot" : "endRot";
+    const scaleKey = mode === "start" ? "startScale" : "endScale";
+    const pos = (seg[posKey] || [0, 0, 0]).map((n: number) => round3(n));
+    const rot = (seg[rotKey] || [0, 0, 0]).map((n: number) => round3(n));
+    seg[posKey] = [...pos];
+    seg[rotKey] = [...rot];
+    const scale = round3(seg[scaleKey] ?? 1);
+    seg[scaleKey] = scale;
+    const pivot = seg.pivot || "center";
+    invalidateSegPivotCache(seg);
     for (const o of objs) {
-      applyPivotRotation(o, pos, rot, seg.pivot || "center", scale);
+      if (pivot === "center") {
+        applyPivotRotation(o, pos, rot, "center", scale);
+      } else {
+        const pc = getSegPivotCache(seg, o);
+        pc.scale = scale;
+        applyPivotPathFrame(o, pos, rot, pc, mode === "end" ? 1 : 0);
+        o.scale.setScalar(scale);
+      }
     }
     updateActivePivotHelper(m.id);
+    bumpAnimSegmentRevision();
   }
 
   const PIVOT_COLORS: Record<string, number> = {
@@ -3647,44 +4474,13 @@ export function useMovieEditor() {
   };
   const pivotHelpers = new Map<string, THREE.Object3D[]>();
   function showPivotHelpers(modelId: string, seg?: any) {
+    if (!isEditorGizmoVisible()) return;
     hidePivotHelpers(modelId);
     const mesh = getTransformTarget(modelId, selModelId.value === modelId ? selModelNodeId.value : null);
     if (!mesh) return;
-    let pivotType = seg?.pivot || editingSeg.value?.pivot || "center";
-    let sp = mesh.position.clone();
-    let sq = mesh.quaternion.clone();
-    mesh.position.set(0, 0, 0);
-    mesh.quaternion.identity();
-    mesh.updateMatrixWorld(true);
-    const bbox = calcModelBBox(mesh);
-    mesh.position.copy(sp);
-    mesh.quaternion.copy(sq);
-    mesh.updateMatrixWorld(true);
-    if (bbox.min.x === Infinity || bbox.max.x === -Infinity) return;
-    const ctr = new THREE.Vector3();
-    bbox.getCenter(ctr);
-    let localPt = new THREE.Vector3(ctr.x, ctr.y, ctr.z);
-    switch (pivotType) {
-      case "top":
-        localPt.y = bbox.max.y;
-        break;
-      case "bottom":
-        localPt.y = bbox.min.y;
-        break;
-      case "left":
-        localPt.x = bbox.min.x;
-        break;
-      case "right":
-        localPt.x = bbox.max.x;
-        break;
-      case "front":
-        localPt.z = bbox.max.z;
-        break;
-      case "back":
-        localPt.z = bbox.min.z;
-        break;
-    }
-    let worldPt = localPt.clone().applyQuaternion(mesh.quaternion).add(mesh.position);
+    const pivotType = seg?.pivot || editingSeg.value?.pivot || "center";
+    const localPt = getPivotPointLocal(mesh, pivotType);
+    const worldPt = mesh.localToWorld(localPt.clone());
     // Smaller pivot indicator so it doesn't block the model
     let sphere = new THREE.Mesh(
       new THREE.SphereGeometry(PIVOT_HELPER_RADIUS, 8, 8),
@@ -3720,106 +4516,362 @@ export function useMovieEditor() {
     const target = getTransformTarget(modelId, selModelId.value === modelId ? selModelNodeId.value : null);
     if (!target) return;
     // Recompute the pivot point in current transform
-    let pivotType = editingSeg.value?.pivot || "center";
-    let sp = target.position.clone();
-    let sq = target.quaternion.clone();
-    target.position.set(0, 0, 0);
-    target.quaternion.identity();
-    target.updateMatrixWorld(true);
-    const bbox = calcModelBBox(target);
-    target.position.copy(sp);
-    target.quaternion.copy(sq);
-    target.updateMatrixWorld(true);
-    if (bbox.min.x === Infinity || bbox.max.x === -Infinity) return;
-    const ctr = new THREE.Vector3();
-    bbox.getCenter(ctr);
-    let localPt = new THREE.Vector3(ctr.x, ctr.y, ctr.z);
-    switch (pivotType) {
-      case "top":
-        localPt.y = bbox.max.y;
-        break;
-      case "bottom":
-        localPt.y = bbox.min.y;
-        break;
-      case "left":
-        localPt.x = bbox.min.x;
-        break;
-      case "right":
-        localPt.x = bbox.max.x;
-        break;
-      case "front":
-        localPt.z = bbox.max.z;
-        break;
-      case "back":
-        localPt.z = bbox.min.z;
-        break;
-    }
-    const worldPt = localPt.clone().applyQuaternion(target.quaternion).add(target.position);
+    const pivotType = editingSeg.value?.pivot || "center";
+    const localPt = getPivotPointLocal(target, pivotType);
+    const worldPt = target.localToWorld(localPt.clone());
     sphere.position.copy(worldPt);
   }
-  function rebuildOutlineForObject(m: Model, obj: THREE.Object3D, cfg: ModelConfig) {
-    const ownerKey = (obj.userData?.nodeId as string | undefined) || `root:${m.id}`;
-    const toRemove: THREE.Object3D[] = [];
-    obj.traverse(c => {
-      if (c.userData?.isEdgeLine && c.userData.outlineOwner === ownerKey) toRemove.push(c);
-    });
-    toRemove.forEach(c => c.parent?.remove(c));
 
-    obj.traverse(c => {
-      if (c instanceof THREE.Mesh && !c.userData?.isEdgeLine) {
-        c.visible = true;
-        delete c.userData.pickHiddenForOutline;
+  function meshBelongsToVisualOwner(mesh: THREE.Mesh, ownerObj: THREE.Object3D): boolean {
+    const ownerNodeId = ownerObj.userData?.nodeId as string | undefined;
+    if (!ownerNodeId) return true;
+    const meshNodeId = mesh.userData?.nodeId as string | undefined;
+    if (meshNodeId !== ownerNodeId) return false;
+    let cur: THREE.Object3D | null = mesh;
+    while (cur) {
+      if (cur === ownerObj) return true;
+      cur = cur.parent;
+    }
+    return false;
+  }
+
+  function registerModelConfigOutlineMesh(mesh: THREE.Mesh, color: string, ownerKey: string) {
+    mesh.userData.configOutlineOwner = ownerKey;
+    modelConfigOutlineRegistry.set(mesh, color);
+  }
+
+  function unregisterModelConfigOutlineForOwner(modelRoot: THREE.Object3D, ownerKey: string) {
+    const toDelete: THREE.Mesh[] = [];
+    modelConfigOutlineRegistry.forEach((_color, mesh) => {
+      if (mesh.userData.configOutlineOwner === ownerKey) {
+        delete mesh.userData.configOutlineOwner;
+        toDelete.push(mesh);
       }
     });
+    toDelete.forEach(mesh => modelConfigOutlineRegistry.delete(mesh));
+  }
+
+  function applyModelConfigOutlinePassStyle(color: string) {
+    if (!modelConfigOutlinePass) return;
+    modelConfigOutlinePass.visibleEdgeColor.set(new THREE.Color(color));
+    modelConfigOutlinePass.hiddenEdgeColor.set(HIDDEN_EDGE_COLOR);
+    modelConfigOutlinePass.edgeStrength = 9.5;
+    modelConfigOutlinePass.edgeThickness = 3.4;
+    modelConfigOutlinePass.edgeGlow = 0.38;
+    modelConfigOutlinePass.pulsePeriod = 0;
+  }
+
+  function attachOutlineEdgeGlow(
+    attachOwner: THREE.Object3D,
+    sourceMesh: THREE.Mesh,
+    color: string,
+    ownerKey: string,
+    thresholdAngle = 28
+  ) {
+    const glow = createContourEdgeLines(sourceMesh, color, 0.55, thresholdAngle, {
+      isOutlineShell: true,
+      outlineOwner: ownerKey
+    });
+    const core = createContourEdgeLines(sourceMesh, color, 1.85, thresholdAngle, {
+      isOutlineShell: true,
+      outlineOwner: ownerKey
+    });
+    if (glow) {
+      glow.renderOrder = 10;
+      attachOverlayToOwner(attachOwner, sourceMesh, glow);
+    }
+    if (core) {
+      core.renderOrder = 11;
+      attachOverlayToOwner(attachOwner, sourceMesh, core);
+    }
+  }
+
+  function syncModelConfigOutlinePass() {
+    if (!modelConfigOutlinePass) return;
+    const selectedSet = new Set<THREE.Object3D>();
+    let color = DEFAULT_OUTLINE_COLOR;
+    modelConfigOutlineRegistry.forEach((outlineColor, mesh) => {
+      if (!isObjectVisibleChain(mesh)) return;
+      for (const obj of collectOutlineMeshes([mesh])) {
+        selectedSet.add(obj);
+      }
+      color = outlineColor;
+    });
+    modelConfigOutlinePass.selectedObjects = [...selectedSet];
+    if (selectedSet.size) applyModelConfigOutlinePassStyle(color);
+  }
+
+  function clearModelConfigOutlineRegistry() {
+    modelConfigOutlineRegistry.forEach((_color, mesh) => {
+      delete mesh.userData.configOutlineOwner;
+    });
+    modelConfigOutlineRegistry.clear();
+    if (modelConfigOutlinePass) modelConfigOutlinePass.selectedObjects = [];
+  }
+
+  function isModelVisualOverlay(obj: THREE.Object3D): boolean {
+    return !!(
+      obj.userData?.isOutlineShell ||
+      obj.userData?.isBodyHighlightOverlay ||
+      obj.userData?.isWireframeOnly ||
+      obj.userData?.isEdgeLine
+    );
+  }
+
+  function disposeVisualOverlay(obj: THREE.Object3D) {
+    obj.parent?.remove(obj);
+    const mesh = obj as THREE.Mesh;
+    const line = obj as THREE.LineSegments;
+    const geo = mesh.isMesh ? mesh.geometry : line.isLineSegments ? line.geometry : null;
+    if (geo?.userData?.isOverlayGeometry) geo.dispose();
+    const mat = mesh.isMesh ? mesh.material : line.isLineSegments ? line.material : null;
+    if (mat) {
+      if (Array.isArray(mat)) mat.forEach(item => item.dispose());
+      else mat.dispose();
+    }
+  }
+
+  function disposeOverlayMaterial(material: THREE.Material | THREE.Material[]) {
+    if (Array.isArray(material)) material.forEach(item => item.dispose());
+    else material.dispose();
+  }
+
+  function attachOverlayToOwner(owner: THREE.Object3D, sourceMesh: THREE.Mesh, overlay: THREE.Object3D) {
+    sourceMesh.updateWorldMatrix(true, false);
+    owner.updateWorldMatrix(true, false);
+    _overlayAttachMat.copy(owner.matrixWorld).invert().multiply(sourceMesh.matrixWorld);
+    _overlayAttachMat.decompose(_overlayAttachPos, _overlayAttachQuat, _overlayAttachScale);
+    overlay.position.copy(_overlayAttachPos);
+    overlay.quaternion.copy(_overlayAttachQuat);
+    overlay.scale.copy(_overlayAttachScale);
+    overlay.visible = true;
+    owner.add(overlay);
+  }
+
+  /** 线框/轮廓不能挂在已 hidden 的 mesh 上，需挂到可见父级或模型根 */
+  function resolveOverlayAttachOwner(
+    modelRoot: THREE.Object3D,
+    ownerObj: THREE.Object3D,
+    sourceMesh: THREE.Mesh
+  ): THREE.Object3D {
+    if (ownerObj !== sourceMesh) return ownerObj;
+    let parent = sourceMesh.parent;
+    while (parent && parent !== modelRoot) {
+      if (parent.visible !== false) return parent;
+      parent = parent.parent;
+    }
+    return modelRoot;
+  }
+
+  function restoreWireframeSurface(mesh: THREE.Mesh) {
+    if (mesh.userData.wireframeSavedMaterials !== undefined) {
+      const temp = mesh.material;
+      mesh.material = mesh.userData.wireframeSavedMaterials;
+      delete mesh.userData.wireframeSavedMaterials;
+      if (temp !== mesh.material) disposeOverlayMaterial(temp);
+    }
+    if (mesh.userData.wireframeSurfaceHidden) {
+      mesh.visible = mesh.userData.wireframeSavedVisible ?? true;
+      delete mesh.userData.wireframeSavedVisible;
+    }
+    delete mesh.userData.wireframeSurfaceHidden;
+    delete mesh.userData.wireframeMaterialApplied;
+    delete mesh.userData.wireframeOwner;
+    delete mesh.userData.pickHiddenForOutline;
+  }
+
+  function removeVisualOverlaysForOwner(modelRoot: THREE.Object3D, ownerKey: string) {
+    const toRemove: THREE.Object3D[] = [];
+    modelRoot.traverse(c => {
+      if (isModelVisualOverlay(c) && c.userData.outlineOwner === ownerKey) {
+        toRemove.push(c);
+      }
+    });
+    toRemove.forEach(disposeVisualOverlay);
+    unregisterModelConfigOutlineForOwner(modelRoot, ownerKey);
+
+    modelRoot.traverse(c => {
+      if (c instanceof THREE.Mesh && c.userData.wireframeOwner === ownerKey) {
+        restoreWireframeSurface(c);
+      }
+      if (c instanceof THREE.Mesh && c.userData.bodyHighlightOwner === ownerKey) {
+        restoreBodyHighlight(c);
+      }
+    });
+  }
+
+  function createCenteredOverlayMesh(
+    sourceMesh: THREE.Mesh,
+    material: THREE.Material,
+    scale: number
+  ): THREE.Mesh {
+    const geometry = sourceMesh.geometry.clone();
+    geometry.computeBoundingBox();
+    const center = new THREE.Vector3();
+    if (geometry.boundingBox) geometry.boundingBox.getCenter(center);
+    geometry.translate(-center.x, -center.y, -center.z);
+    geometry.userData.isOverlayGeometry = true;
+
+    const overlay = new THREE.Mesh(geometry, material);
+    overlay.position.copy(center);
+    overlay.scale.setScalar(scale);
+    return overlay;
+  }
+
+  function hideMeshSurfaceForWireframe(mesh: THREE.Mesh, ownerKey: string) {
+    if (mesh.userData.wireframeSavedVisible === undefined) {
+      mesh.userData.wireframeSavedVisible = mesh.visible;
+    }
+    mesh.visible = false;
+    mesh.userData.wireframeSurfaceHidden = true;
+    mesh.userData.wireframeOwner = ownerKey;
+    delete mesh.userData.pickHiddenForOutline;
+  }
+
+  function createContourEdgeLines(
+    sourceMesh: THREE.Mesh,
+    color: string,
+    opacity: number,
+    thresholdAngle: number,
+    userData: Record<string, unknown>
+  ): THREE.LineSegments | null {
+    const edges = new THREE.EdgesGeometry(sourceMesh.geometry, thresholdAngle);
+    if (edges.attributes.position.count > 200000) {
+      edges.dispose();
+      return null;
+    }
+    edges.userData.isOverlayGeometry = true;
+    const line = new THREE.LineSegments(
+      edges,
+      new THREE.LineBasicMaterial({
+        color: new THREE.Color(color),
+        transparent: opacity < 1,
+        opacity,
+        depthTest: true,
+        depthWrite: false
+      })
+    );
+    line.frustumCulled = false;
+    line.renderOrder = 10;
+    Object.assign(line.userData, userData);
+    line.userData.isEdgeLine = true;
+    return line;
+  }
+
+  /** 轮廓高亮：仅外壳外轮廓光晕（BackSide 描边），不绘制模型内部棱线 */
+  function applyOutlineHighlight(mesh: THREE.Mesh, color: string, ownerKey: string, _attachOwner?: THREE.Object3D) {
+    registerModelConfigOutlineMesh(mesh, color, ownerKey);
+  }
+
+  function applyBodyHighlightToMesh(mesh: THREE.Mesh, color: string, ownerKey: string) {
+    if (mesh.userData.bodyHighlightSaved === undefined) {
+      mesh.userData.bodyHighlightSaved = mesh.material;
+    }
+    const src = mesh.userData.bodyHighlightSaved;
+    const list = Array.isArray(src) ? src : [src];
+    const tint = new THREE.Color(color);
+    const next = list.map(mat => {
+      const cloned = mat.clone();
+      if (cloned instanceof THREE.MeshStandardMaterial || cloned instanceof THREE.MeshPhysicalMaterial) {
+        cloned.emissive.copy(tint);
+        cloned.emissiveIntensity = 1.15;
+        cloned.color.lerp(tint, 0.25);
+      } else if (cloned instanceof THREE.MeshLambertMaterial || cloned instanceof THREE.MeshPhongMaterial) {
+        cloned.emissive.copy(tint);
+        cloned.emissiveIntensity = 0.85;
+        cloned.color.lerp(tint, 0.3);
+      } else if (cloned instanceof THREE.MeshBasicMaterial) {
+        cloned.color.copy(tint);
+      }
+      return cloned;
+    });
+    mesh.material = Array.isArray(src) ? next : next[0];
+    mesh.userData.bodyHighlightOwner = ownerKey;
+  }
+
+  function restoreBodyHighlight(mesh: THREE.Mesh) {
+    if (mesh.userData.bodyHighlightOwner === undefined) return;
+    const current = mesh.material;
+    if (mesh.userData.bodyHighlightSaved !== undefined) {
+      mesh.material = mesh.userData.bodyHighlightSaved;
+      delete mesh.userData.bodyHighlightSaved;
+    }
+    const savedList = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+    const currentList = Array.isArray(current) ? current : [current];
+    for (const mat of currentList) {
+      if (!savedList.includes(mat)) mat.dispose();
+    }
+    delete mesh.userData.bodyHighlightOwner;
+  }
+
+  function collectMeshesForVisualOwner(obj: THREE.Object3D): THREE.Mesh[] {
+    const meshesToOutline: THREE.Mesh[] = [];
+    const visit = (mesh: THREE.Mesh) => {
+      if (mesh.geometry && !isModelVisualOverlay(mesh) && meshBelongsToVisualOwner(mesh, obj)) {
+        meshesToOutline.push(mesh);
+      }
+    };
+    if ((obj as THREE.Mesh).isMesh && obj.geometry) visit(obj as THREE.Mesh);
+    obj.traverse(c => {
+      if (c !== obj && c instanceof THREE.Mesh) visit(c);
+    });
+    return meshesToOutline;
+  }
+
+  function rebuildOutlineForObject(m: Model, obj: THREE.Object3D, cfg: ModelConfig) {
+    const modelRoot = meshes.get(m.id);
+    if (!modelRoot) return;
+
+    const ownerKey = (obj.userData?.nodeId as string | undefined) || `root:${m.id}`;
+    removeVisualOverlaysForOwner(modelRoot, ownerKey);
 
     if (!cfg.visible) {
       obj.visible = false;
+      invalidatePickMeshCache();
       return;
     }
     obj.visible = true;
-    if (!cfg.outline && !cfg.highlight) return;
+    if (!cfg.outline && !cfg.highlight && !cfg.wireframe) {
+      syncModelConfigOutlinePass();
+      invalidatePickMeshCache();
+      return;
+    }
 
-    const meshesToOutline: THREE.Mesh[] = [];
-    if ((obj as THREE.Mesh).isMesh && obj.geometry) meshesToOutline.push(obj as THREE.Mesh);
-    obj.traverse(c => {
-      if (c !== obj && c instanceof THREE.Mesh && c.geometry && !c.userData?.isEdgeLine) {
-        meshesToOutline.push(c);
-      }
-    });
+    const resolvedCfg = getModelConfig(cfg);
+    const outlineColor = resolvedCfg.outlineColor;
+    const wireframeColor = resolvedCfg.wireframeColor;
+    const modelHighlightColor = resolvedCfg.modelHighlightColor;
+    const meshesToOutline = collectMeshesForVisualOwner(obj);
 
     for (const c of meshesToOutline) {
       try {
-        const edges = new THREE.EdgesGeometry(c.geometry, 15);
-        if (edges.attributes.position.count > 50000) continue;
+        if (cfg.wireframe) {
+          hideMeshSurfaceForWireframe(c, ownerKey);
+          const attachOwner = resolveOverlayAttachOwner(modelRoot, obj, c);
 
-        if (cfg.outline && !cfg.highlight) {
-          c.visible = false;
-          c.userData.pickHiddenForOutline = true;
-          const line = new THREE.LineSegments(
-            edges,
-            new THREE.LineBasicMaterial({ color: 0x888888, transparent: true, opacity: 0.5 })
-          );
-          line.userData.isEdgeLine = true;
-          line.userData.outlineOwner = ownerKey;
-          line.position.copy(c.position);
-          line.quaternion.copy(c.quaternion);
-          line.scale.copy(c.scale);
-          c.parent?.add(line);
-          continue;
+          const wireContour = createContourEdgeLines(c, wireframeColor, 1, 24, {
+            isWireframeOnly: true,
+            outlineOwner: ownerKey
+          });
+          if (wireContour) attachOverlayToOwner(attachOwner, c, wireContour);
+
+          if (cfg.outline) {
+            attachOutlineEdgeGlow(attachOwner, c, outlineColor, ownerKey);
+          }
+        } else if (cfg.outline) {
+          applyOutlineHighlight(c, outlineColor, ownerKey);
+          const attachOwner = resolveOverlayAttachOwner(modelRoot, obj, c);
+          attachOutlineEdgeGlow(attachOwner, c, outlineColor, ownerKey, 12);
         }
 
-        const line = new THREE.LineSegments(
-          edges,
-          new THREE.LineBasicMaterial({ color: new THREE.Color(cfg.highlightColor || "#00ff00") })
-        );
-        line.userData.isEdgeLine = true;
-        line.userData.outlineOwner = ownerKey;
-        // 作为 mesh 子节点，随动画变换一起移动
-        c.add(line);
+        if (cfg.highlight && !cfg.wireframe) {
+          applyBodyHighlightToMesh(c, modelHighlightColor, ownerKey);
+        }
       } catch {
         /* ignore */
       }
     }
+    syncModelConfigOutlinePass();
     invalidatePickMeshCache();
   }
 
@@ -3850,27 +4902,25 @@ export function useMovieEditor() {
     const autoplay = options?.autoplay ?? !isCoarsePointerDevice();
     chapterPlayTarget.value = chapter;
     chapterAutoNext.value = true;
-    _chAnimLock = false;
 
-    await withChapterNavLock(async () => {
-      focusChapter(chapter, idx);
-      applyChapter(chapter);
-      syncModelSelectionForChapter(chapter);
-      video.pause();
-      await seekVideoTo(chapter.startTime);
-      currentTime.value = video.currentTime;
-    });
+    navigateToChapter(chapter, idx, { seek: false });
 
-    // 模型动画与节点视频同步播放（由 onVideoPlay 启动，从当前进度续播）
-    _chAnimLock = false;
+    video.pause();
+    await seekVideoTo(chapter.startTime);
+    currentTime.value = video.currentTime;
+
     if (autoplay) {
       try {
         await video.play();
+        ensureVideoSyncedChapterAnimation();
+        syncCurrentChapterAnimationFromVideo();
       } catch {
         /* ignore autoplay restrictions */
+        syncCurrentChapterAnimationFromVideo();
       }
     } else {
       video.pause();
+      syncCurrentChapterAnimationFromVideo();
     }
   }
 
@@ -3953,13 +5003,111 @@ export function useMovieEditor() {
     return null;
   }
 
+  function normalizeModelAssetKey(input: { path?: string | null; url?: string | null; name?: string | null }): string {
+    const raw = input.path || input.url || "";
+    if (raw) {
+      try {
+        const pathname = raw.startsWith("http") ? new URL(raw).pathname : raw;
+        return pathname.replace(/\\/g, "/").replace(/^\/+/, "").toLowerCase();
+      } catch {
+        return raw.replace(/\\/g, "/").replace(/^\/+/, "").toLowerCase();
+      }
+    }
+    return (input.name || "").replace(/\..*$/, "").trim().toLowerCase();
+  }
+
+  function findExistingModelByAsset(item: { path?: string; name?: string }): Model | undefined {
+    if (!currProj.value) return undefined;
+    const key = normalizeModelAssetKey({ path: item.path, name: item.name });
+    if (!key) return undefined;
+    return currProj.value.models.find(m => normalizeModelAssetKey({ path: getModelSourcePath(m), url: m.url, name: m.name }) === key);
+  }
+
+  function dedupeProjectModelsByAsset() {
+    if (!currProj.value) return;
+    const seen = new Set<string>();
+    const keep: Model[] = [];
+    for (const m of currProj.value.models) {
+      const key = normalizeModelAssetKey({ path: getModelSourcePath(m), url: m.url, name: m.name });
+      if (!key) {
+        keep.push(m);
+        continue;
+      }
+      if (seen.has(key)) {
+        rmMesh(m.id);
+        continue;
+      }
+      seen.add(key);
+      keep.push(m);
+    }
+    currProj.value.models = keep;
+  }
+
+  function pruneProjectModelsOutsideModelSet(setItems: Array<{ path?: string; name?: string }>) {
+    if (!currProj.value) return;
+    const allowed = new Set(
+      setItems.map(item => normalizeModelAssetKey({ path: item.path, name: item.name })).filter(Boolean)
+    );
+    if (allowed.size === 0) return;
+    currProj.value.models = currProj.value.models.filter(m => {
+      const key = normalizeModelAssetKey({ path: getModelSourcePath(m), url: m.url, name: m.name });
+      if (key && allowed.has(key)) return true;
+      rmMesh(m.id);
+      return false;
+    });
+  }
+
+  async function ensureModelLoaded(m: Model) {
+    if (!meshes.has(m.id)) await loadGLB(m);
+    if (meshes.has(m.id)) refreshModelHierarchyIfLoaded(m.id, m.name);
+  }
+
   function buildShareLink(code: string) {
     return buildScenePreviewLink(code);
+  }
+
+  function stripRuntimeAnimFieldsFromChapters(chapterList: Chapter[]) {
+    for (const ch of chapterList) {
+      if (!ch.modelConfigs) continue;
+      for (const cfg of Object.values(ch.modelConfigs)) {
+        stripRuntimeAnimFieldsFromConfig(cfg as ModelConfig);
+      }
+    }
+  }
+
+  function stripRuntimeAnimFieldsFromConfig(cfg: ModelConfig) {
+    const segs = cfg.animConfig?.segments;
+    if (segs) {
+      for (const seg of segs as any[]) {
+        delete seg._animPivotCache;
+        delete seg._playing;
+        delete seg._progress;
+        delete seg._expandedPanels;
+      }
+    }
+    if (cfg.nodeConfigs) {
+      for (const nodeCfg of Object.values(cfg.nodeConfigs)) {
+        stripRuntimeAnimFieldsFromConfig(nodeCfg as ModelConfig);
+      }
+    }
+  }
+
+  function sanitizeChaptersForModels(chapterList: Chapter[], modelIds: Set<string>) {
+    for (const ch of chapterList) {
+      if (!ch.modelConfigs) continue;
+      for (const id of Object.keys(ch.modelConfigs)) {
+        if (!modelIds.has(id)) delete ch.modelConfigs[id];
+      }
+    }
   }
 
   function buildScenePayload() {
     const proj = currProj.value;
     if (!proj) return null;
+    const modelIds = new Set(proj.models.map(m => m.id));
+    const chapters = JSON.parse(JSON.stringify(proj.chapters)) as Chapter[];
+    sanitizeChaptersForModels(chapters, modelIds);
+    stripRuntimeAnimFieldsFromChapters(chapters);
     return {
       title: syncProjectTitleToStore(),
       modelSetCode: modelSetCode.value || undefined,
@@ -3967,7 +5115,8 @@ export function useMovieEditor() {
       videoDuration: proj.videoDuration,
       videoWidth: proj.videoWidth,
       videoHeight: proj.videoHeight,
-      chapters: JSON.parse(JSON.stringify(proj.chapters)),
+      videoDisplayWidth: proj.videoDisplayWidth || 0,
+      chapters,
       subtitles: JSON.parse(JSON.stringify(proj.subtitles)),
       models: proj.models.map(m => ({
         id: m.id,
@@ -3976,11 +5125,13 @@ export function useMovieEditor() {
         color: m.color,
         path: getModelSourcePath(m),
         basePosition: m.basePosition
-      }))
+      })),
+      sceneSettings: collectSceneSettingsData()
     };
   }
 
   function clearAllEditorModels() {
+    clearModelConfigOutlineRegistry();
     [...meshes.keys()].forEach(id => rmMesh(id));
     mixers.forEach(m => m.stopAllAction());
     mixers = [];
@@ -3992,6 +5143,7 @@ export function useMovieEditor() {
       currProj.value.videoDuration = 0;
       currProj.value.videoWidth = 0;
       currProj.value.videoHeight = 0;
+      currProj.value.videoDisplayWidth = 0;
     }
     selectedChapterId.value = null;
     selModelId.value = null;
@@ -4015,38 +5167,100 @@ export function useMovieEditor() {
 
   async function loadModelSetByCode(code: string) {
     if (!currProj.value || modelSetModelsLoaded.value) return;
-    const set = await fetchModelSet(code);
-    modelSetCode.value = set.code;
-    editSceneCompanyName.value = set.companyName || "";
-    editSceneToolName.value = set.name || "";
-    modelSetModelsLoaded.value = true;
-
-    suspendProjectPersist();
-    importingModel.value = true;
+    sceneBootstrapBusy.value = true;
     try {
-      for (const item of set.models || []) {
-        const url = resolveAssetUrl(item.path);
-        const m = mStore.createCustomModel(currProj.value.id, item.name, url);
-        (m as any).sourcePath = item.path;
-        if (Array.isArray(item.basePosition)) m.basePosition = item.basePosition as [number, number, number];
-        await loadGLB(m);
-        if (meshes.has(m.id)) {
-          currProj.value.models.push(m);
-          refreshModelHierarchyIfLoaded(m.id, m.name);
+      const set = await fetchModelSet(code);
+      modelSetCode.value = set.code;
+      editSceneCompanyName.value = set.companyName || "";
+      editSceneToolName.value = set.name || "";
+      modelSetModelsLoaded.value = true;
+      pendingModelSetCode.value = null;
+
+      const setItems = set.models || [];
+      dedupeProjectModelsByAsset();
+      pruneProjectModelsOutsideModelSet(setItems);
+
+      suspendProjectPersist();
+      importingModel.value = true;
+      try {
+        for (const item of setItems) {
+          const existing = findExistingModelByAsset(item);
+          if (existing) {
+            adoptSceneModelIdentity(existing, item);
+            await ensureModelLoaded(existing);
+            continue;
+          }
+          const url = resolveAssetUrl(item.path);
+          const m = mStore.createCustomModel(currProj.value.id, item.name, url);
+          adoptSceneModelIdentity(m, item);
+          await loadGLB(m);
+          if (meshes.has(m.id)) {
+            currProj.value.models.push(m);
+            refreshModelHierarchyIfLoaded(m.id, m.name);
+          }
+        }
+        dedupeProjectModelsByAsset();
+        ensureAllModelMixers();
+        if (meshes.size > 0) applyChapterCameraForLoadedModels();
+      } finally {
+        importingModel.value = false;
+        resumeProjectPersist();
+      }
+    } finally {
+      sceneBootstrapBusy.value = false;
+    }
+  }
+
+  function adoptSceneModelIdentity(
+    m: Model,
+    item: { id?: string; path?: string; basePosition?: [number, number, number] }
+  ) {
+    if (item.id) {
+      m.id = item.id;
+      const match = /^model_(\d+)$/.exec(item.id);
+      if (match) {
+        const num = Number(match[1]);
+        if (Number.isFinite(num)) {
+          mStore.modelIdCounter = Math.max(mStore.modelIdCounter, num);
         }
       }
-      ensureAllModelMixers();
-      applyChapterCameraForLoadedModels();
-    } finally {
-      importingModel.value = false;
-      resumeProjectPersist();
+    }
+    if (item.path) (m as any).sourcePath = item.path;
+    if (Array.isArray(item.basePosition)) m.basePosition = item.basePosition;
+  }
+
+  function flushActiveModelConfigToChapter() {
+    if (!selModel.value || !selectedChapter.value) return;
+    const snapshot = getModelFormSnapshot();
+    const targetCfg = getActiveModelConfig(selectedChapter.value);
+    targetCfg.visible = snapshot.visible;
+    targetCfg.outline = snapshot.outline;
+    targetCfg.wireframe = snapshot.wireframe;
+    targetCfg.highlight = snapshot.highlight;
+    targetCfg.outlineColor = snapshot.outlineColor;
+    targetCfg.wireframeColor = snapshot.wireframeColor;
+    targetCfg.modelHighlightColor = snapshot.modelHighlightColor;
+    targetCfg.animation = snapshot.animation;
+    targetCfg.intro = snapshot.intro;
+    targetCfg.posOffset = [snapshot.posOffsetX, snapshot.posOffsetY, snapshot.posOffsetZ];
+    targetCfg.scale = snapshot.scale;
+    if (animDirty.value && animSegments.length > 0) {
+      saveAnimConfig();
     }
   }
 
   async function tryLoadPendingModelSet() {
     const code = pendingModelSetCode.value;
-    if (!code || viewOnly.value || !hasVideo.value || !currProj.value || modelSetModelsLoaded.value) return;
-    pendingModelSetCode.value = null;
+    if (
+      !code ||
+      viewOnly.value ||
+      !hasVideo.value ||
+      !currProj.value ||
+      modelSetModelsLoaded.value ||
+      sceneBootstrapBusy.value
+    ) {
+      return;
+    }
     await loadModelSetByCode(code);
   }
 
@@ -4069,22 +5283,33 @@ export function useMovieEditor() {
     proj.videoDuration = sceneData.videoDuration || 0;
     proj.videoWidth = sceneData.videoWidth || 0;
     proj.videoHeight = sceneData.videoHeight || 0;
+    proj.videoDisplayWidth = sceneData.videoDisplayWidth || 0;
     proj.chapters = Array.isArray(sceneData.chapters) ? sceneData.chapters : [];
     proj.subtitles = Array.isArray(sceneData.subtitles) ? sceneData.subtitles : [];
     proj.models = [];
 
+    const loadedAssetKeys = new Set<string>();
     for (const item of sceneData.models || []) {
       if (!item.path) continue;
+      const assetKey = normalizeModelAssetKey({ path: item.path, name: item.name });
+      if (assetKey && loadedAssetKeys.has(assetKey)) continue;
       const url = resolveAssetUrl(item.path);
       const m = mStore.createCustomModel(proj.id, item.name, url);
-      (m as any).sourcePath = item.path;
-      if (Array.isArray(item.basePosition)) m.basePosition = item.basePosition;
+      adoptSceneModelIdentity(m, item);
       await loadGLB(m);
       if (meshes.has(m.id)) {
         proj.models.push(m);
         refreshModelHierarchyIfLoaded(m.id, m.name);
+        if (assetKey) loadedAssetKeys.add(assetKey);
       }
     }
+    if (sceneData.sceneSettings) {
+      await applySceneSettingsFromServer(sceneData.sceneSettings);
+    }
+    const loadedModelIds = new Set(proj.models.map(m => m.id));
+    sanitizeChaptersForModels(proj.chapters, loadedModelIds);
+    stripRuntimeAnimFieldsFromChapters(proj.chapters);
+    dedupeProjectModelsByAsset();
   }
 
   async function syncEditorAfterSceneLoad() {
@@ -4095,14 +5320,15 @@ export function useMovieEditor() {
     if (chapters.value.length > 0) {
       const ch = chapters.value[0];
       selectedChapterId.value = ch.id;
+      const dur = getChapterCameraTransitionSec(ch);
       if (meshes.size > 0 && isDefaultChapterCamera(ch)) {
-        frameCameraOnSceneModels(getChapterCameraTransitionSec(ch), ch);
+        applyChapterModelState(ch, 0);
+        frameCameraOnSceneModels(dur, ch);
       } else {
         applyChapter(ch);
       }
       syncChapterForm(ch);
       syncModelSelectionForChapter(ch);
-      resetChapterModelsToStart(ch);
     }
     if (videoEl.value) {
       videoEl.value.pause();
@@ -4110,6 +5336,7 @@ export function useMovieEditor() {
     }
     currentTime.value = 0;
     syncVideoAudioState();
+    applyAntialiasing();
     nextTick(adaptPresentationViewport);
   }
 
@@ -4143,11 +5370,25 @@ export function useMovieEditor() {
     }
   }
 
+  async function tryLoadSavedSceneForModelSet(code: string): Promise<boolean> {
+    sceneBootstrapBusy.value = true;
+    try {
+      const list = await fetchSceneList(code);
+      if (!list.length) return false;
+      return await loadSceneForEdit(list[0].code);
+    } catch {
+      return false;
+    } finally {
+      sceneBootstrapBusy.value = false;
+    }
+  }
+
   async function saveSceneToServer() {
     if (!currProj.value || chapters.value.length === 0) {
       toastShow("请先创建至少一个节点", "warning");
       return null;
     }
+    flushActiveModelConfigToChapter();
     const payload = buildScenePayload();
     if (!payload) return null;
     savingScene.value = true;
@@ -4175,27 +5416,84 @@ export function useMovieEditor() {
     }
   }
 
-  // Chapters
-  async function selectChapter(ch: Chapter) {
-    const resolved = resolveChapter(ch);
-    if (!resolved) return;
-    const { chapter, idx } = resolved;
+  // Chapters — 点击瞬间：UI + 运镜；模型动画/可见性下一帧执行，避免阻塞渲染
+  function cancelPendingChapterNavWork() {
+    if (chapterNavAnimRaf) {
+      cancelAnimationFrame(chapterNavAnimRaf);
+      chapterNavAnimRaf = 0;
+    }
+  }
 
-    await withChapterNavLock(async () => {
-      focusChapter(chapter, idx);
-      applyChapter(chapter);
-      syncModelSelectionForChapter(chapter);
-      if (videoEl.value) await seekVideoTo(chapter.startTime);
-    });
+  function prefersVideoSyncedChapterAnim() {
+    return viewOnly.value || isPreviewMode.value || !!chapterPlayTarget.value;
+  }
+
+  function startChapterAnimPlayback(chapter: Chapter, gen: number) {
+    if (gen !== chapterNavGeneration) return;
 
     const video = videoEl.value;
-    if (!video) return;
-    if (!video.paused) {
-      _chAnimLock = false;
+    if (video && !video.paused) {
+      const elapsed = getChapterAnimElapsed(chapter, video.currentTime);
+      applyChapterModelState(chapter, elapsed);
       ensureVideoSyncedChapterAnimation();
-    } else {
-      resetChapterModelsToStart(chapter);
+      return;
     }
+
+    if (prefersVideoSyncedChapterAnim() && video) {
+      applyChapterModelState(chapter, getChapterAnimElapsed(chapter, video.currentTime));
+      return;
+    }
+
+    if (chapterHasAnimation(chapter)) {
+      runChapterAnimationWallclock(chapter);
+    } else {
+      applyChapterModelState(chapter, 0);
+    }
+  }
+
+  function navigateToChapter(chapter: Chapter, idx: number, options?: { seek?: boolean }) {
+    stopChapterAnimation();
+    cancelPendingChapterNavWork();
+    const gen = ++chapterNavGeneration;
+
+    selectedChapterId.value = chapter.id;
+    playingIdx.value = idx;
+    currentTime.value = chapter.startTime;
+
+    transitionChapterCamera(chapter);
+
+    chapterNavAnimRaf = requestAnimationFrame(() => {
+      chapterNavAnimRaf = 0;
+      if (gen !== chapterNavGeneration) return;
+      const video = videoEl.value;
+      const elapsed =
+        video && isChapterInPlaybackRange(chapter, video.currentTime)
+          ? getChapterAnimElapsed(chapter, video.currentTime)
+          : 0;
+      applyChapterModelState(chapter, elapsed);
+      startChapterAnimPlayback(chapter, gen);
+    });
+
+    queueMicrotask(() => {
+      if (gen !== chapterNavGeneration) return;
+      lastIntroStateKey = "";
+      syncChapterForm(chapter);
+      syncModelSelectionForChapter(chapter);
+      syncIntroPresentation();
+    });
+
+    if (options?.seek !== false) {
+      videoChapterSyncPaused = true;
+      void seekVideoTo(chapter.startTime).finally(() => {
+        if (gen === chapterNavGeneration) videoChapterSyncPaused = false;
+      });
+    }
+  }
+
+  function selectChapter(ch: Chapter) {
+    const resolved = resolveChapter(ch);
+    if (!resolved) return;
+    navigateToChapter(resolved.chapter, resolved.idx);
   }
 
   function getChapterAnimElapsed(ch: Chapter, t: number) {
@@ -4225,38 +5523,29 @@ export function useMovieEditor() {
     if (!video) return;
     const ch = getPlaybackChapterAtTime(video.currentTime);
     if (!ch) return;
-    applyChapterAnimationAtElapsed(ch, getChapterAnimElapsed(ch, video.currentTime));
+    applyChapterModelState(ch, getChapterAnimElapsed(ch, video.currentTime));
   }
 
   function applyChapterAnimationAtElapsed(ch: Chapter, elapsedSec: number) {
-    for (const { objs, cfg, liveSegs } of collectChapterAnimTargets(ch)) {
-      for (const obj of objs) {
-        applyElapsedAnimToObject(obj, cfg, elapsedSec, liveSegs);
-      }
-    }
+    applyChapterModelState(ch, elapsedSec);
   }
 
   function syncChapterAnimationToVideo(ch: Chapter, t: number) {
-    if (_chAnimLock) return;
-    applyChapterAnimationAtElapsed(ch, getChapterAnimElapsed(ch, t));
+    if (_chAnimLock && !chAnimWallclock) return;
+    applyChapterModelState(ch, getChapterAnimElapsed(ch, t));
   }
 
   function ensureVideoSyncedChapterAnimation() {
     const video = videoEl.value;
     if (!video || video.paused) return false;
-    const ch = getPlaybackChapterAtTime(video.currentTime);
-    if (!ch) return false;
-    if (!chapterHasAnimation(ch)) return false;
-    if (_chAnimLock && chAnimChapterId === ch.id && !chAnimWallclock) return true;
-    return startVideoSyncedChapterAnimation(ch);
+    if (_chAnimLock && !chAnimWallclock) return true;
+    return startVideoSyncedChapterAnimation();
   }
 
-  function startVideoSyncedChapterAnimation(ch: Chapter) {
+  function startVideoSyncedChapterAnimation(_ch?: Chapter) {
     stopChapterAnimation();
-    if (!chapterHasAnimation(ch)) return false;
 
     _chAnimLock = true;
-    chAnimChapterId = ch.id;
     chAnimWallclock = false;
     totalPlaying.value = false;
 
@@ -4278,9 +5567,7 @@ export function useMovieEditor() {
         return;
       }
       chAnimChapterId = activeCh.id;
-      if (chapterHasAnimation(activeCh)) {
-        applyChapterAnimationAtElapsed(activeCh, getChapterAnimElapsed(activeCh, video.currentTime));
-      }
+      applyChapterModelState(activeCh, getChapterAnimElapsed(activeCh, video.currentTime));
       chAnimRafId = requestAnimationFrame(tick);
     };
 
@@ -4290,111 +5577,30 @@ export function useMovieEditor() {
   }
 
   function runChapterAnimationWallclock(ch: Chapter) {
+    const wallclockGen = chapterNavGeneration;
     stopChapterAnimation();
+    if (wallclockGen !== chapterNavGeneration) return false;
+    if (!chapterHasAnimation(ch)) return false;
+
     _chAnimLock = true;
-    totalPlaying.value = false;
-    const animEntries: Array<{ objs: THREE.Object3D[]; segs: any[]; totalDur: number }> = [];
-
-    for (const { objs, cfg, liveSegs } of collectChapterAnimTargets(ch)) {
-      if (!cfg.animation || !cfg.animConfig?.segments?.length) continue;
-      const rawSegs = liveSegs?.length ? liveSegs : cfg.animConfig.segments;
-      const csegs = resolvePlaybackSegments(rawSegs);
-      let ctotal = 0;
-      for (let cs = 0; cs < csegs.length; cs++) ctotal += (csegs[cs].pauseTime || 0) + (csegs[cs].animTime || 3);
-      for (const obj of objs) {
-        for (let cs2 = 0; cs2 < csegs.length; cs2++) getSegPivotCache(csegs[cs2], obj);
-        const cfirst = csegs[0];
-        applyPivotRotation(
-          obj,
-          [cfirst.startPos[0], cfirst.startPos[1], cfirst.startPos[2]],
-          [cfirst.startRot[0], cfirst.startRot[1], cfirst.startRot[2]],
-          cfirst.pivot || "center",
-          cfirst.startScale
-        );
-      }
-      animEntries.push({ objs, segs: csegs, totalDur: ctotal });
-    }
-
-    if (animEntries.length === 0) {
-      _chAnimLock = false;
-      chAnimWallclock = false;
-      return false;
-    }
-    refreshActiveHighlightOutline();
     chAnimWallclock = true;
-    let chAnimStart = performance.now();
+    chAnimChapterId = ch.id;
+    totalPlaying.value = false;
+    const maxDur = getChapterAnimDuration(ch);
+    applyChapterModelState(ch, 0);
+    refreshActiveHighlightOutline();
+    const animStart = performance.now();
+
     function chTick() {
-      let cel = performance.now() - chAnimStart;
-      let allDone = true;
-      for (let ce = 0; ce < animEntries.length; ce++) {
-        try {
-          let ae = animEntries[ce];
-          let at = Math.min(cel / (ae.totalDur * 1000), 1);
-          if (at >= 1) continue;
-          allDone = false;
-          let aabs = at * ae.totalDur;
-          let acum = 0;
-          for (let aseg = 0; aseg < ae.segs.length; aseg++) {
-            let as = ae.segs[aseg];
-            let asTotal = (as.pauseTime || 0) + (as.animTime || 3);
-            if (aabs >= acum && aabs <= acum + asTotal) {
-              let alocal = aabs - acum;
-              let apause = as.pauseTime || 0;
-              let apc = as._animPivotCache;
-              if (alocal < apause) {
-                for (const o of ae.objs) {
-                  applyPivotPathFrame(
-                    o,
-                    [as.startPos[0], as.startPos[1], as.startPos[2]],
-                    [as.startRot[0], as.startRot[1], as.startRot[2]],
-                    apc,
-                    0
-                  );
-                }
-              } else {
-                let aAnimT = (alocal - apause) / (as.animTime || 3);
-                let aep2 = applyEasingInline(Math.min(1, aAnimT), as.easing || animEasing.value);
-                let apos = [
-                  as.startPos[0] + (as.endPos[0] - as.startPos[0]) * aep2,
-                  as.startPos[1] + (as.endPos[1] - as.startPos[1]) * aep2,
-                  as.startPos[2] + (as.endPos[2] - as.startPos[2]) * aep2
-                ];
-                let arot = [
-                  as.startRot[0] + (as.endRot[0] - as.startRot[0]) * aep2,
-                  as.startRot[1] + (as.endRot[1] - as.startRot[1]) * aep2,
-                  as.startRot[2] + (as.endRot[2] - as.startRot[2]) * aep2
-                ];
-                for (const o of ae.objs) {
-                  applyPivotPathFrame(o, apos, arot, apc, aep2);
-                }
-              }
-              break;
-            }
-            acum += asTotal;
-          }
-        } catch (e) {
-          /* per-model error — skip this model's frame */
-        }
+      if (wallclockGen !== chapterNavGeneration) {
+        stopChapterAnimation();
+        return;
       }
-      if (allDone) {
-        for (let ce2 = 0; ce2 < animEntries.length; ce2++) {
-          let ae2 = animEntries[ce2];
-          let alast = ae2.segs[ae2.segs.length - 1];
-          try {
-            for (const o of ae2.objs) {
-              applyPivotPathFrame(
-                o,
-                [alast.endPos[0], alast.endPos[1], alast.endPos[2]],
-                [alast.endRot[0], alast.endRot[1], alast.endRot[2]],
-                alast._animPivotCache,
-                1
-              );
-            }
-          } catch (e) {}
-        }
-        _chAnimLock = false;
-        chAnimWallclock = false;
-        chAnimRafId = null;
+      const elapsed = (performance.now() - animStart) / 1000;
+      applyChapterModelState(ch, elapsed);
+      if (elapsed >= maxDur) {
+        applyChapterModelState(ch, maxDur);
+        stopChapterAnimation();
         syncTransformVisualOverlays();
         return;
       }
@@ -4413,7 +5619,7 @@ export function useMovieEditor() {
   function playChapter(ch: Chapter) {
     if (videoEl.value) videoEl.value.pause();
     selectChapter(ch);
-    if (runChapterAnimation(ch, { wallclock: true })) toastShow("正在播放节点动画", "success");
+    if (chapterHasAnimation(ch)) toastShow("正在播放节点动画", "success");
     else toastShow("当前节点没有动画", "warning");
   }
 
@@ -4422,12 +5628,12 @@ export function useMovieEditor() {
     chForm.startTime = ch.startTime;
     chForm.endTime = ch.endTime;
     const frame = resolveChapterCameraFrame(ch);
-    camP[0] = frame.position[0];
-    camP[1] = frame.position[1];
-    camP[2] = frame.position[2];
-    camT[0] = frame.target[0];
-    camT[1] = frame.target[1];
-    camT[2] = frame.target[2];
+    camP[0] = round3(frame.position[0]);
+    camP[1] = round3(frame.position[1]);
+    camP[2] = round3(frame.position[2]);
+    camT[0] = round3(frame.target[0]);
+    camT[1] = round3(frame.target[1]);
+    camT[2] = round3(frame.target[2]);
     camFov.value = ch.camera.fov;
     camTransitionSec.value = ch.camera.transitionSec ?? CHAPTER_CAMERA_TRANSITION_SEC;
     chapterFormRevision.value++;
@@ -4450,28 +5656,30 @@ export function useMovieEditor() {
 
   function getCameraFormSnapshot() {
     return {
-      posX: camP[0],
-      posY: camP[1],
-      posZ: camP[2],
-      targetX: camT[0],
-      targetY: camT[1],
-      targetZ: camT[2],
+      posX: round3(camP[0]),
+      posY: round3(camP[1]),
+      posZ: round3(camP[2]),
+      targetX: round3(camT[0]),
+      targetY: round3(camT[1]),
+      targetZ: round3(camT[2]),
       fov: camFov.value,
       transitionSec: camTransitionSec.value
     };
   }
 
   function applyCameraFormSnapshot(snapshot: ReturnType<typeof getCameraFormSnapshot>) {
-    camP[0] = snapshot.posX;
-    camP[1] = snapshot.posY;
-    camP[2] = snapshot.posZ;
-    camT[0] = snapshot.targetX;
-    camT[1] = snapshot.targetY;
-    camT[2] = snapshot.targetZ;
+    camP[0] = round3(snapshot.posX);
+    camP[1] = round3(snapshot.posY);
+    camP[2] = round3(snapshot.posZ);
+    camT[0] = round3(snapshot.targetX);
+    camT[1] = round3(snapshot.targetY);
+    camT[2] = round3(snapshot.targetZ);
     camFov.value = snapshot.fov;
     camTransitionSec.value = snapshot.transitionSec;
-    liveCam();
-    liveFov();
+    if (!camTrans && !chapterNavLock.value && !isCameraTransitioning.value && !cameraAnimating) {
+      liveCam();
+      liveFov();
+    }
   }
 
   function restoreModelOutlines(ch: Chapter) {
@@ -4487,9 +5695,13 @@ export function useMovieEditor() {
     mOff[2] = cfg.posOffset?.[2] ?? 0;
     mScl.value = cfg.scale ?? 1;
     mVis.value = cfg.visible ?? true;
+    mWire.value = cfg.wireframe ?? false;
     mHL.value = cfg.highlight ?? false;
     mOut.value = cfg.outline ?? false;
-    mHLColor.value = cfg.highlightColor || "#00ff00";
+    const resolvedCfg = getModelConfig(cfg);
+    mOutlineColor.value = resolvedCfg.outlineColor;
+    mWireColor.value = resolvedCfg.wireframeColor;
+    mHLColor.value = resolvedCfg.modelHighlightColor;
     mAni.value = cfg.animation ?? true;
     mIntro.value = cfg.intro ?? "";
     mRot[0] = 0;
@@ -4508,6 +5720,12 @@ export function useMovieEditor() {
       animDirty.value = false;
     }
     if (mAni.value) ensureSingleAnimSegment(selModel.value);
+    if (animSegments.length > 0) {
+      alignAnimSegmentWithMesh(animSegments[0], "start");
+      focusSegTransform(animSegments[0], "start");
+    }
+    animDirty.value = false;
+    bumpAnimSegmentRevision();
   }
 
   function syncIntroPresentation() {
@@ -4548,20 +5766,9 @@ export function useMovieEditor() {
     lastIntroStateKey = stateKey;
 
     if (!shouldShow || !chapter) {
-      if (introPresentationPlaying || introPresentationChapterId) {
-        modelIntroLabels.value = [];
-        const restoreChapter =
-          chapter ??
-          (introPresentationChapterId
-            ? (sortedChapters.value.find(c => c.id === introPresentationChapterId) ?? getActiveChapter())
-            : getActiveChapter());
-        if (restoreChapter && !viewOnly.value && !isPreviewMode.value) {
-          restoreModelOutlines(restoreChapter);
-        }
-      }
+      modelIntroLabels.value = [];
       introPresentationPlaying = false;
       introPresentationChapterId = null;
-      lastIntroStateKey = "";
       return;
     }
 
@@ -4569,21 +5776,6 @@ export function useMovieEditor() {
     if (!playing && editingModel) {
       if (editingShouldShow) {
         labels.push({ modelId: editingModel.id, text: editingIntro, x: 0, y: 0 });
-      }
-      // 编辑态不强制改 outline/highlight，避免打扰编辑视图
-    } else if (!viewOnly.value && !isPreviewMode.value) {
-      for (const m of models.value) {
-        if (!chapter.modelConfigs?.[m.id]) continue;
-        const cfg = getModelConfig(chapter.modelConfigs[m.id]);
-        const intro = cfg.intro?.trim();
-        if (!intro || !cfg.visible) continue;
-        labels.push({ modelId: m.id, text: intro, x: 0, y: 0 });
-        rebuildOutline(m, { ...cfg, highlight: true });
-      }
-
-      for (const m of models.value) {
-        if (labels.some(label => label.modelId === m.id)) continue;
-        rebuildOutline(m, chapterModelCfg(chapter, m.id));
       }
     } else {
       for (const m of models.value) {
@@ -4663,6 +5855,8 @@ export function useMovieEditor() {
     setSelectedModelId(chapterModelList[0].id, true);
   }
 
+  let lastSyncedModelFormChapterId: string | null = null;
+
   function syncModelForm(ch?: Chapter | null) {
     const model = selModel.value;
     if (!model) {
@@ -4684,9 +5878,15 @@ export function useMovieEditor() {
     const cfg = readActiveModelConfig(activeChapter);
     applyModelConfigToEditor(cfg);
 
-    const target = getTransformTarget(model.id, selModelNodeId.value);
-    if (target && hasActiveModelConfig(activeChapter)) {
-      applyConfigToObject(model, target, cfg, !selModelNodeId.value);
+    const chapterId = activeChapter.id;
+    const chapterChanged = chapterId !== lastSyncedModelFormChapterId;
+    lastSyncedModelFormChapterId = chapterId;
+
+    if (!chapterChanged) {
+      const target = getTransformTarget(model.id, selModelNodeId.value);
+      if (target && hasActiveModelConfig(activeChapter)) {
+        applyConfigToObject(model, target, cfg, !selModelNodeId.value);
+      }
     }
     modelFormRevision.value++;
   }
@@ -4868,31 +6068,26 @@ export function useMovieEditor() {
       startTime,
       endTime
     });
-    selectedChapter.value.camera.position = [...camP] as [number, number, number];
-    selectedChapter.value.camera.target = [...camT] as [number, number, number];
+    selectedChapter.value.camera.position = roundVec3([...camP] as [number, number, number]);
+    selectedChapter.value.camera.target = roundVec3([...camT] as [number, number, number]);
     selectedChapter.value.camera.fov = camFov.value;
     selectedChapter.value.camera.transitionSec = camTransitionSec.value;
     // Capture model states
     for (const m of models.value) {
       if (!selectedChapter.value.modelConfigs) selectedChapter.value.modelConfigs = {};
       if (!selectedChapter.value.modelConfigs[m.id]) {
-        selectedChapter.value.modelConfigs[m.id] = {
-          visible: true,
-          posOffset: [0, 0, 0],
-          scale: 1,
-          highlight: false,
-          highlightColor: "#00ff00",
-          outline: false,
-          animation: true
-        };
+        selectedChapter.value.modelConfigs[m.id] = JSON.parse(JSON.stringify(createDefaultModelConfig()));
       }
       if (selModel.value && m.id === selModel.value.id) {
         const targetCfg = getActiveModelConfig(selectedChapter.value);
         targetCfg.posOffset = [...mOff] as [number, number, number];
         targetCfg.scale = mScl.value;
         targetCfg.highlight = mHL.value;
-        targetCfg.highlightColor = mHLColor.value;
+        targetCfg.outlineColor = mOutlineColor.value;
+        targetCfg.wireframeColor = mWireColor.value;
+        targetCfg.modelHighlightColor = mHLColor.value;
         targetCfg.outline = mOut.value;
+        targetCfg.wireframe = mWire.value;
         targetCfg.animation = mAni.value;
         targetCfg.intro = mIntro.value;
         targetCfg.visible = mVis.value;
@@ -4926,15 +6121,15 @@ export function useMovieEditor() {
 
   function liveCam() {
     if (!camera || !controls) return;
+    if (chapterNavLock.value || camTrans || isCameraTransitioning.value) return;
     camera.position.set(camP[0], camP[1], camP[2]);
     controls.target.set(camT[0], camT[1], camT[2]);
   }
 
   function liveFov() {
-    if (camera) {
-      camera.fov = camFov.value;
-      camera.updateProjectionMatrix();
-    }
+    if (!camera || camTrans || isCameraTransitioning.value) return;
+    camera.fov = camFov.value;
+    camera.updateProjectionMatrix();
   }
 
   function captureCam() {
@@ -4949,10 +6144,10 @@ export function useMovieEditor() {
     }
     controls.update();
     const center = getSceneModelCenter();
-    const position: [number, number, number] = [camera.position.x, camera.position.y, camera.position.z];
+    const position: [number, number, number] = roundVec3([camera.position.x, camera.position.y, camera.position.z]);
     const target: [number, number, number] = center
-      ? [center.x, center.y, center.z]
-      : [controls.target.x, controls.target.y, controls.target.z];
+      ? roundVec3([center.x, center.y, center.z])
+      : roundVec3([controls.target.x, controls.target.y, controls.target.z]);
     const fov = camera.fov;
     chStore.setChapterCamera(ch, position, target, fov);
     if (!selectedChapterId.value) {
@@ -4966,6 +6161,8 @@ export function useMovieEditor() {
     camT[2] = target[2];
     camFov.value = fov;
     camTrans = null;
+    cameraAnimating = false;
+    isCameraTransitioning.value = false;
     cameraFormRevision.value++;
     toastShow("镜头视角已捕获");
   }
@@ -5013,6 +6210,30 @@ export function useMovieEditor() {
     if (root) registerModelHierarchy(modelId, root, modelDisplayName);
   }
 
+  function hasUnsavedAnimChanges() {
+    if (!animDirty.value || animSegments.length === 0) return false;
+    const ch = getActiveChapter();
+    if (!ch || !selModel.value) return animDirty.value;
+    const cfg = getActiveModelConfig(ch);
+    const saved = cfg.animConfig?.segments?.[0];
+    if (!saved) return true;
+    const current = animSegments[0];
+    const norm = (seg: any) =>
+      JSON.stringify({
+        pauseTime: seg.pauseTime ?? 0,
+        animTime: seg.animTime ?? 3,
+        easing: seg.easing ?? "easeInOut",
+        pivot: seg.pivot ?? "center",
+        startPos: seg.startPos ?? [0, 0, 0],
+        endPos: seg.endPos ?? [0, 0, 0],
+        startScale: seg.startScale ?? 1,
+        endScale: seg.endScale ?? 1,
+        startRot: seg.startRot ?? [0, 0, 0],
+        endRot: seg.endRot ?? [0, 0, 0]
+      });
+    return norm(current) !== norm(mapStoredAnimSegment(saved));
+  }
+
   function selectModel(m: Model, opts?: { focusCamera?: boolean; nodeId?: string | null }) {
     refreshModelHierarchyIfLoaded(m.id, m.name);
     const focusCamera = opts?.focusCamera ?? false;
@@ -5049,7 +6270,7 @@ export function useMovieEditor() {
       }
       return;
     }
-    if (animDirty.value) {
+    if (hasUnsavedAnimChanges()) {
       ElMessageBox.confirm("当前模型的动画修改尚未保存，是否放弃？", "提示", {
         type: "warning",
         confirmButtonText: "放弃",
@@ -5155,6 +6376,15 @@ export function useMovieEditor() {
           }
 
           const name = f.name.replace(/\.(glb|gltf)$/i, "");
+          const assetKey = normalizeModelAssetKey({ name });
+          const existing = proj.models.find(
+            m => normalizeModelAssetKey({ path: getModelSourcePath(m), url: m.url, name: m.name }) === assetKey
+          );
+          if (existing) {
+            lastImportedId = existing.id;
+            await yieldImportGap(i);
+            continue;
+          }
           const m = mStore.createCustomModel(proj.id, name, "");
           const buffer = await f.arrayBuffer();
           await loadGLBFromArrayBuffer(m, buffer);
@@ -5211,6 +6441,15 @@ export function useMovieEditor() {
       return false;
     }
     const name = file.name.replace(/\.(glb|gltf)$/i, "");
+    const assetKey = normalizeModelAssetKey({ name });
+    const existing = currProj.value.models.find(
+      m => normalizeModelAssetKey({ path: getModelSourcePath(m), url: m.url, name: m.name }) === assetKey
+    );
+    if (existing) {
+      toastShow(`模型「${name}」已在列表中`, "warning");
+      setSelectedModelId(existing.id, true);
+      return false;
+    }
     const m = mStore.createCustomModel(currProj.value.id, name, "");
     const buffer = await file.arrayBuffer();
     await loadGLBFromArrayBuffer(m, buffer);
@@ -5258,8 +6497,11 @@ export function useMovieEditor() {
     return {
       visible: mVis.value,
       outline: mOut.value,
+      wireframe: mWire.value,
       highlight: mHL.value,
-      highlightColor: mHLColor.value,
+      outlineColor: mOutlineColor.value,
+      wireframeColor: mWireColor.value,
+      modelHighlightColor: mHLColor.value,
       posOffsetX: mOff[0],
       posOffsetY: mOff[1],
       posOffsetZ: mOff[2],
@@ -5275,8 +6517,11 @@ export function useMovieEditor() {
   function applyModelFormSnapshot(snapshot: ReturnType<typeof getModelFormSnapshot>) {
     mVis.value = snapshot.visible;
     mOut.value = snapshot.outline;
+    mWire.value = snapshot.wireframe ?? false;
     mHL.value = snapshot.highlight;
-    mHLColor.value = snapshot.highlightColor;
+    mOutlineColor.value = snapshot.outlineColor;
+    mWireColor.value = snapshot.wireframeColor;
+    mHLColor.value = snapshot.modelHighlightColor;
     mOff[0] = snapshot.posOffsetX;
     mOff[1] = snapshot.posOffsetY;
     mOff[2] = snapshot.posOffsetZ;
@@ -5298,8 +6543,11 @@ export function useMovieEditor() {
           posOffset: [mOff[0], mOff[1], mOff[2]] as [number, number, number],
           scale: mScl.value,
           highlight: mHL.value,
-          highlightColor: mHLColor.value,
+          outlineColor: mOutlineColor.value,
+          wireframeColor: mWireColor.value,
+          modelHighlightColor: mHLColor.value,
           outline: mOut.value,
+          wireframe: mWire.value,
           animation: mAni.value,
           intro: mIntro.value
         };
@@ -5312,12 +6560,25 @@ export function useMovieEditor() {
     } else if (field === "outline") {
       cfg.outline = mOut.value;
       for (const target of targets) rebuildOutlineForObject(selModel.value, target, cfg);
+    } else if (field === "wireframe") {
+      cfg.wireframe = mWire.value;
+      for (const target of targets) rebuildOutlineForObject(selModel.value, target, cfg);
     } else if (field === "highlight") {
       cfg.highlight = mHL.value;
-      cfg.highlightColor = mHLColor.value;
+      cfg.modelHighlightColor = mHLColor.value;
       for (const target of targets) rebuildOutlineForObject(selModel.value, target, cfg);
-    } else if (field === "highlightColor") {
-      cfg.highlightColor = mHLColor.value;
+    } else if (field === "outlineColor") {
+      cfg.outlineColor = mOutlineColor.value;
+      if (cfg.outline) {
+        for (const target of targets) rebuildOutlineForObject(selModel.value, target, cfg);
+      }
+    } else if (field === "wireframeColor") {
+      cfg.wireframeColor = mWireColor.value;
+      if (cfg.wireframe) {
+        for (const target of targets) rebuildOutlineForObject(selModel.value, target, cfg);
+      }
+    } else if (field === "modelHighlightColor") {
+      cfg.modelHighlightColor = mHLColor.value;
       if (cfg.highlight) {
         for (const target of targets) rebuildOutlineForObject(selModel.value, target, cfg);
       }
@@ -5379,11 +6640,16 @@ export function useMovieEditor() {
       toastShow(`字幕文本不能超过 ${SUBTITLE_TEXT_MAX_LENGTH} 个字符`, "warning");
       return;
     }
-    if (subForm.endTime <= subForm.startTime) {
+    const normalizedStart = roundInt(subForm.startTime);
+    const normalizedEnd = roundInt(subForm.endTime);
+    subForm.startTime = normalizedStart;
+    subForm.endTime = normalizedEnd;
+
+    if (normalizedEnd <= normalizedStart) {
       toastShow("结束时间必须大于起始时间", "warning");
       return;
     }
-    if (duration.value > 0 && subForm.endTime > duration.value) {
+    if (duration.value > 0 && normalizedEnd > duration.value) {
       toastShow("结束时间不能超过视频总时长", "warning");
       return;
     }
@@ -5391,8 +6657,8 @@ export function useMovieEditor() {
       const s = subtitles.value.find(x => x.id === editingSId);
       if (s) {
         sStore.updateSubtitle(s, {
-          startTime: subForm.startTime,
-          endTime: subForm.endTime,
+          startTime: normalizedStart,
+          endTime: normalizedEnd,
           text: subForm.text,
           color: subForm.color,
           backgroundColor: subForm.backgroundColor,
@@ -5402,7 +6668,7 @@ export function useMovieEditor() {
       editingSId = null;
     } else {
       if (!currProj.value) return;
-      const s = sStore.createSubtitle(currProj.value.id, subForm.text, subForm.startTime, subForm.endTime);
+      const s = sStore.createSubtitle(currProj.value.id, subForm.text, normalizedStart, normalizedEnd);
       s.color = subForm.color;
       s.backgroundColor = subForm.backgroundColor;
       s.displayMode = "fadeIn";
@@ -5410,16 +6676,16 @@ export function useMovieEditor() {
     }
     // Reset form with smart defaults
     const lastSub = sortedSubtitles.value[sortedSubtitles.value.length - 1];
-    subForm.startTime = lastSub ? lastSub.endTime : 0;
-    subForm.endTime = duration.value > 0 ? duration.value : subForm.startTime + 5;
+    subForm.startTime = roundInt(lastSub ? lastSub.endTime : 0);
+    subForm.endTime = roundInt(duration.value > 0 ? duration.value : subForm.startTime + 5);
     subForm.text = "";
     activeSubId = null;
   }
 
   function editSub(s: Subtitle) {
     editingSId = s.id;
-    subForm.startTime = s.startTime;
-    subForm.endTime = s.endTime;
+    subForm.startTime = roundInt(s.startTime);
+    subForm.endTime = roundInt(s.endTime);
     subForm.text = s.text;
     subForm.color = s.color;
     subForm.backgroundColor = s.backgroundColor ?? SUBTITLE_DEFAULT_BACKGROUND;
@@ -5469,6 +6735,7 @@ export function useMovieEditor() {
       return;
     }
     isPreviewMode.value = !isPreviewMode.value;
+    syncEditorGizmosVisibility();
     syncVideoAudioState();
     if (isPreviewMode.value) {
       if (videoEl.value && chapters.value.length > 0) {
@@ -5506,13 +6773,17 @@ export function useMovieEditor() {
     if (w <= 0 || h <= 0) return;
     camera.aspect = w / h;
     camera.updateProjectionMatrix();
+    syncRenderPixelRatio();
     renderer.setSize(w, h);
     if (composer) composer.setSize(w, h);
+    effectiveRenderPixelRatio.value = getRenderPixelRatio();
     if (viewOnly.value || isPreviewMode.value) adaptPresentationViewport();
   }
 
   watch(isPreviewMode, () => {
+    syncEditorGizmosVisibility();
     syncVideoAudioState();
+    syncPresentationRenderProfile();
     nextTick(() => {
       syncOrbitControlsDom();
       handleResize();
@@ -5527,13 +6798,17 @@ export function useMovieEditor() {
     updateSelectionHighlight();
 
     const ch = getActiveChapter();
-    if (selectedChapterId.value && selectedChapterId.value !== prevChapterId && ch) {
-      applyChapterModelVisibility(ch);
-      syncModelSelectionForChapter(ch);
-    } else if (selModel.value) {
-      syncModelForm(ch);
+    const chapterChanged = !!(selectedChapterId.value && selectedChapterId.value !== prevChapterId);
+
+    if (chapterChanged && ch) {
+      lastIntroStateKey = "";
+      queueMicrotask(() => syncIntroPresentation());
+      return;
     }
 
+    if (selModel.value) {
+      syncModelForm(ch);
+    }
     lastIntroStateKey = "";
     syncIntroPresentation();
   });
@@ -5568,6 +6843,7 @@ export function useMovieEditor() {
     if (isViewMode) {
       viewOnly.value = true;
       isPreviewMode.value = true;
+      skipStoredSceneSettings = true;
       const p = pStore.createProject("");
       projectTitle.value = p.title;
       await nextTick();
@@ -5578,6 +6854,7 @@ export function useMovieEditor() {
         return;
       }
       viewCameraBaseFov = camera?.fov ?? null;
+      syncPresentationRenderProfile();
       adaptPresentationViewport();
       routeGateLoading.value = false;
       handleResize();
@@ -5595,22 +6872,35 @@ export function useMovieEditor() {
       modelSetModelsLoaded.value = false;
       sceneCode.value = null;
       shareLink.value = "";
+      SETTINGS_KEY = getSceneSettingsStorageKey(queryCode);
 
-      const existing = routeProjectId ? (pStore.projects.find(p => p.id === routeProjectId) as any) : null;
-      const canReuse =
-        existing && !existing.videoSrc && (existing.chapters?.length || 0) === 0 && (existing.models?.length || 0) === 0;
-      if (canReuse) {
-        pStore.setCurrentProject(existing as any);
-        projectTitle.value = defaultTitle;
-        existing.title = defaultTitle;
+      if (routeProjectId) {
+        const existing = pStore.projects.find(p => p.id === routeProjectId) as any;
+        const canReuse =
+          existing && !existing.videoSrc && (existing.chapters?.length || 0) === 0 && (existing.models?.length || 0) === 0;
+        if (existing && !canReuse) {
+          pStore.setCurrentProject(existing);
+          projectTitle.value = existing.title || defaultTitle;
+        } else if (canReuse) {
+          pStore.setCurrentProject(existing);
+          projectTitle.value = defaultTitle;
+          existing.title = defaultTitle;
+        } else {
+          pStore.clearCurrentProject();
+          pStore.ensureProject(routeProjectId, defaultTitle);
+          projectTitle.value = defaultTitle;
+        }
       } else {
         pStore.clearCurrentProject();
         const p = pStore.createProject(defaultTitle);
         projectTitle.value = defaultTitle;
-        if (routeProjectId !== p.id) await router.replace({ query: { code: queryCode, id: p.id } });
+        await router.replace({ query: { code: queryCode, id: p.id } });
       }
+      // 带 code 的编辑入口优先走服务端场景，避免不同 origin 的本地缓存造成画面不一致
+      skipStoredSceneSettings = true;
       setPageTitle(defaultTitle);
     } else {
+      skipStoredSceneSettings = false;
       pStore.clearInvalidVideoData();
       if (routeProjectId) {
         const p = pStore.projects.find(p => p.id === routeProjectId);
@@ -5631,7 +6921,15 @@ export function useMovieEditor() {
     await nextTick();
     init3D();
 
-    if (videoSrc.value) {
+    let loadedFromServer = false;
+    if (queryCode) {
+      loadedFromServer = await tryLoadSavedSceneForModelSet(queryCode);
+      if (!loadedFromServer) {
+        await loadModelSetByCode(queryCode);
+      }
+    }
+
+    if (!loadedFromServer && !queryCode && videoSrc.value) {
       syncVideoElementSrc();
       duration.value = currProj.value?.videoDuration || 0;
       if (duration.value > 0) {
@@ -5640,22 +6938,27 @@ export function useMovieEditor() {
       }
     }
 
-    // 模型改为手动添加，不自动注入默认模型
-    for (const m of models.value) {
-      if (m.url && !meshes.has(m.id)) await loadGLB(m);
-    }
-    for (const m of models.value) {
-      refreshModelHierarchyIfLoaded(m.id, m.name);
-    }
-
-    if (chapters.value.length > 0) {
-      selectedChapterId.value = chapters.value[0].id;
-      if (meshes.size > 0) {
-        applyChapterCameraForLoadedModels();
-      } else {
-        applyChapter(chapters.value[0]);
-        syncChapterForm(chapters.value[0]);
+    if (!loadedFromServer && !queryCode) {
+      // 模型改为手动添加，不自动注入默认模型
+      for (const m of models.value) {
+        if (m.url && !meshes.has(m.id)) await loadGLB(m);
       }
+      for (const m of models.value) {
+        refreshModelHierarchyIfLoaded(m.id, m.name);
+      }
+
+      if (chapters.value.length > 0) {
+        selectedChapterId.value = chapters.value[0].id;
+        if (meshes.size > 0) {
+          applyChapterCameraForLoadedModels();
+        } else {
+          applyChapter(chapters.value[0]);
+          syncChapterForm(chapters.value[0]);
+        }
+        syncModelSelectionForChapter(chapters.value[0]);
+      }
+    } else if (loadedFromServer && chapters.value.length > 0 && !selectedChapterId.value) {
+      selectedChapterId.value = chapters.value[0].id;
       syncModelSelectionForChapter(chapters.value[0]);
     }
 
@@ -5665,6 +6968,7 @@ export function useMovieEditor() {
   });
 
   onUnmounted(() => {
+    cancelPendingChapterNavWork();
     cancelAnimationFrame(afid);
     unbindViewportPicking();
     unbindControlsInteraction();
@@ -5736,6 +7040,7 @@ export function useMovieEditor() {
     playingIdx,
     selectedChapterId,
     chapterNavLock,
+    isCameraTransitioning,
     selModelId,
     selModelNodeId,
     hoverModelId,
@@ -5749,10 +7054,9 @@ export function useMovieEditor() {
     getModelHierarchy,
     modelHasEdits,
     modelNodeHasEdits,
-    pickOnlyVisible,
-    togglePickOnlyVisible,
     selectModelNode,
     modelFormRevision,
+    animSegmentRevision,
     cameraFormRevision,
     getChapterFormSnapshot,
     applyChapterFormSnapshot,
@@ -5781,6 +7085,8 @@ export function useMovieEditor() {
     mHL,
     mAni,
     mRot,
+    mOutlineColor,
+    mWireColor,
     mHLColor,
     mIntro,
     mOut,
@@ -5803,16 +7109,13 @@ export function useMovieEditor() {
     showSettings,
     spTab,
     ambIntensity,
-    dirIntensity,
-    dirPos,
-    fillIntensity,
-    fillPos,
+    sceneLights,
+    selectedSceneLightId,
     matColor,
     matRoughness,
     matMetalness,
     matNormalStr,
     matEmissiveInt,
-    matAoInt,
     bloomIntensity,
     bloomThreshold,
     bloomRadius,
@@ -5821,7 +7124,11 @@ export function useMovieEditor() {
     ppSaturation,
     toneMapping,
     envIntensityVal,
+    envReflectionIntensity,
+    envRotation,
+    envReflectionSphereVisible,
     envMapUrl,
+    envMapIsHdr,
     envMapPreview,
     bgColorVal,
     fogEnabled,
@@ -5837,6 +7144,12 @@ export function useMovieEditor() {
     gridSize,
     gridDivisions,
     gridHeight,
+    msaaEnabled,
+    antialiasingMode,
+    ANTIALIASING_MODE_OPTIONS,
+    maxPixelRatio,
+    effectiveRenderPixelRatio,
+    applyAntialiasing,
     camP,
     camT,
     camFov,
@@ -5960,6 +7273,10 @@ export function useMovieEditor() {
     applyGrid,
     applyEnv,
     applyShadow,
+    addSceneLight,
+    removeSceneLight,
+    selectSceneLight,
+    applySceneLights,
     EASING_LIST,
     CURVE_LABELS,
     TONE_MAPPING_OPTIONS

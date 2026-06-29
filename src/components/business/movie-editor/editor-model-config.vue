@@ -15,11 +15,15 @@
         <el-switch v-model="formData.visible" size="small" />
       </div>
       <div class="model-switch-item">
-        <span class="model-switch-label">{{ $t("OpWeb.Editor.ModelOutline", "轮廓") }}</span>
+        <span class="model-switch-label">{{ $t("OpWeb.Editor.ModelOutline", "轮廓高亮") }}</span>
         <el-switch v-model="formData.outline" size="small" />
       </div>
       <div class="model-switch-item">
-        <span class="model-switch-label">{{ $t("OpWeb.Editor.ModelHighlight", "高亮") }}</span>
+        <span class="model-switch-label">{{ $t("OpWeb.Editor.ModelWireframe", "线框") }}</span>
+        <el-switch v-model="formData.wireframe" size="small" />
+      </div>
+      <div class="model-switch-item">
+        <span class="model-switch-label">{{ $t("OpWeb.Editor.ModelHighlight", "模型高亮") }}</span>
         <el-switch v-model="formData.highlight" size="small" />
       </div>
       <div class="model-switch-item">
@@ -29,12 +33,32 @@
     </div>
 
     <div class="model-highlight-color-row">
-      <span class="model-switch-label">{{ $t("OpWeb.Editor.HighlightColor", "高亮颜色") }}</span>
+      <span class="model-switch-label">{{ $t("OpWeb.Editor.OutlineColor", "轮廓颜色") }}</span>
       <el-color-picker
-        v-model="formData.highlightColor"
+        v-model="formData.outlineColor"
+        size="small"
+        :disabled="!formData.outline"
+        @change="onOutlineColorChange"
+      />
+    </div>
+
+    <div class="model-highlight-color-row">
+      <span class="model-switch-label">{{ $t("OpWeb.Editor.WireframeColor", "线框颜色") }}</span>
+      <el-color-picker
+        v-model="formData.wireframeColor"
+        size="small"
+        :disabled="!formData.wireframe"
+        @change="onWireframeColorChange"
+      />
+    </div>
+
+    <div class="model-highlight-color-row">
+      <span class="model-switch-label">{{ $t("OpWeb.Editor.ModelHighlightColor", "模型高亮颜色") }}</span>
+      <el-color-picker
+        v-model="formData.modelHighlightColor"
         size="small"
         :disabled="!formData.highlight"
-        @change="onHighlightColorChange"
+        @change="onModelHighlightColorChange"
       />
     </div>
 
@@ -66,7 +90,7 @@
 <script setup lang="ts" name="editor-model-config">
 import { reactive, unref, watch } from "vue";
 
-import EditorModelAnimation from "@/components/business/movie-editor/editor-model-animation.vue";
+import { createDefaultModelConfig, DEFAULT_OUTLINE_COLOR, DEFAULT_WIREFRAME_COLOR, DEFAULT_MODEL_HIGHLIGHT_COLOR } from "@/composables/movie-editor/utils/modelConfig";
 import { useMovieEditorContext } from "@/composables/useMovieEditorContext";
 import { useTranslate } from "@/hooks/useTranslate";
 
@@ -76,8 +100,11 @@ const $t = useTranslate();
 const formData = reactive({
   visible: true,
   outline: false,
+  wireframe: false,
   highlight: false,
-  highlightColor: "var(--success-color-6)",
+  outlineColor: DEFAULT_OUTLINE_COLOR,
+  wireframeColor: DEFAULT_WIREFRAME_COLOR,
+  modelHighlightColor: DEFAULT_MODEL_HIGHLIGHT_COLOR,
   posOffsetX: 0,
   posOffsetY: 0,
   posOffsetZ: 0,
@@ -121,6 +148,10 @@ watch(
   () => applyLive("outline")
 );
 watch(
+  () => formData.wireframe,
+  () => applyLive("wireframe")
+);
+watch(
   () => formData.highlight,
   () => applyLive("highlight")
 );
@@ -133,9 +164,19 @@ watch(
   () => applyLive("intro")
 );
 
-const onHighlightColorChange = () => {
+const onOutlineColorChange = () => {
+  if (!formData.outline) return;
+  applyLive("outlineColor");
+};
+
+const onWireframeColorChange = () => {
+  if (!formData.wireframe) return;
+  applyLive("wireframeColor");
+};
+
+const onModelHighlightColorChange = () => {
   if (!formData.highlight) return;
-  applyLive("highlightColor");
+  applyLive("modelHighlightColor");
 };
 </script>
 

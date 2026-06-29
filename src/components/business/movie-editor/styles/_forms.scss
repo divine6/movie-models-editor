@@ -902,7 +902,7 @@
   &.is-empty {
     align-items: center;
     justify-content: center;
-    background: #fff;
+    background: rgb(255 255 255 / 3%);
     border: 1px solid var(--border-color-2);
     border-radius: var(--corner-radius-4);
   }

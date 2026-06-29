@@ -13,9 +13,18 @@ export interface UseVideoPipOptions {
   getViewOnly: () => boolean;
   getIsPreviewMode: () => boolean;
   getHasVideo: () => boolean;
+  getVideoDisplayWidth: () => number;
+  setVideoDisplayWidth: (width: number) => void;
 }
 
-export function useVideoPip({ getViewportEl, getViewOnly, getIsPreviewMode, getHasVideo }: UseVideoPipOptions) {
+export function useVideoPip({
+  getViewportEl,
+  getViewOnly,
+  getIsPreviewMode,
+  getHasVideo,
+  getVideoDisplayWidth,
+  setVideoDisplayWidth
+}: UseVideoPipOptions) {
   const pipGroupRef = ref<HTMLElement | null>(null);
   const pipWidth = ref(PIP_DEFAULT_WIDTH);
   const pipLeft = ref(10);
@@ -24,6 +33,12 @@ export function useVideoPip({ getViewportEl, getViewOnly, getIsPreviewMode, getH
   const pipResizing = ref(false);
 
   const pipPresentationMode = computed(() => getViewOnly() || getIsPreviewMode());
+
+  function isDesktopLandscape() {
+    if (typeof window === "undefined") return false;
+    const isCoarse = window.matchMedia?.("(pointer: coarse)")?.matches ?? false;
+    return !isCoarse && window.innerWidth > window.innerHeight;
+  }
 
   const pipStyle = computed(() => {
     const style: Record<string, string> = { width: `${pipWidth.value}px` };
@@ -62,7 +77,15 @@ export function useVideoPip({ getViewportEl, getViewOnly, getIsPreviewMode, getH
     const viewport = getViewportEl();
     if (!viewport) return;
     const presentation = getViewOnly() || getIsPreviewMode();
-    if (resetWidth) pipWidth.value = resolvePipWidth(viewport.clientWidth, presentation);
+    if (resetWidth) {
+      const storedWidth = getVideoDisplayWidth();
+      if (presentation && isDesktopLandscape() && storedWidth > 0) {
+        const maxWidth = Math.max(PIP_MIN_WIDTH, viewport.clientWidth * PIP_MAX_WIDTH_RATIO);
+        pipWidth.value = clamp(storedWidth, PIP_MIN_WIDTH, maxWidth);
+      } else {
+        pipWidth.value = resolvePipWidth(viewport.clientWidth, presentation);
+      }
+    }
     if (!presentation) {
       const inset = { top: 10, right: 10 };
       pipLeft.value = Math.max(inset.right, viewport.clientWidth - pipWidth.value - inset.right);
@@ -136,6 +159,9 @@ export function useVideoPip({ getViewportEl, getViewOnly, getIsPreviewMode, getH
 
     const onUp = () => {
       pipResizing.value = false;
+      if (isDesktopLandscape()) {
+        setVideoDisplayWidth(Math.round(pipWidth.value));
+      }
       document.removeEventListener("mousemove", onMove);
       document.removeEventListener("mouseup", onUp);
       document.body.style.removeProperty("user-select");

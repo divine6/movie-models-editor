@@ -73,6 +73,7 @@
       </el-button>
       <el-button size="default" :disabled="!editor.modelSetCode" @click="sceneListVisible = true"> 场景列表 </el-button>
       <el-button
+        class="editor-topbar__save-btn"
         type="primary"
         size="default"
         :loading="editor.savingScene"

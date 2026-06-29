@@ -51,6 +51,33 @@ export const useProjectStore = defineStore("project", {
   },
 
   actions: {
+    /** 打开已有项目，或按指定 id 创建新项目 */
+    ensureProject(id: string, title: string, videoSrc?: string): ProjectDetail {
+      const existing = this.projects.find(p => p.id === id);
+      if (existing) {
+        this.currentProject = existing as ProjectDetail;
+        return existing as ProjectDetail;
+      }
+      const now = new Date().toISOString();
+      const project: ProjectDetail = {
+        id,
+        title,
+        videoSrc: videoSrc || null,
+        videoDuration: 0,
+        videoWidth: 0,
+        videoHeight: 0,
+        videoDisplayWidth: 0,
+        createdAt: now,
+        updatedAt: now,
+        chapters: [],
+        models: [],
+        subtitles: []
+      };
+      this.projects.push(project);
+      this.currentProject = project;
+      return project;
+    },
+
     /** 创建新项目 */
     createProject(title: string, videoSrc?: string): ProjectDetail {
       const id = `project_${++this.projectIdCounter}`;
@@ -62,6 +89,7 @@ export const useProjectStore = defineStore("project", {
         videoDuration: 0,
         videoWidth: 0,
         videoHeight: 0,
+        videoDisplayWidth: 0,
         createdAt: now,
         updatedAt: now,
         chapters: [],
@@ -123,6 +151,7 @@ export const useProjectStore = defineStore("project", {
           this.currentProject.videoDuration = 0;
           this.currentProject.videoWidth = 0;
           this.currentProject.videoHeight = 0;
+          this.currentProject.videoDisplayWidth = 0;
           // 同时清除相关数据
           this.currentProject.chapters = [];
           this.currentProject.models = [];

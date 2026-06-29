@@ -1,6 +1,6 @@
 <template>
   <div
-    class="movie-editor"
+    class="movie-editor editor-dark-theme"
     :class="{ 'preview-mode': editor.isPreviewMode, 'view-only-route': editor.viewOnly }"
     :tabindex="editor.viewOnly ? -1 : 0"
     :ref="editor.bindRef('rootEl')"
@@ -28,7 +28,10 @@
     <editor-overlays />
   </div>
 
-  <div v-if="editor.routeGateLoading" class="editor-route-gate">
+  <div
+    v-if="editor.routeGateLoading"
+    class="editor-route-gate editor-route-gate--preview"
+  >
     <el-icon class="is-loading" :size="32"><Loading /></el-icon>
     <span>加载中...</span>
   </div>
@@ -67,5 +70,10 @@ providePreviewChapterDrawer();
   background: #fff;
   color: var(--text-color-2);
   font-size: 14px;
+
+  &--preview {
+    background: #0a0b0d;
+    color: rgb(255 255 255 / 72%);
+  }
 }
 </style>

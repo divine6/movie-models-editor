@@ -88,7 +88,11 @@ const { pipGroupRef, pipStyle, pipDragging, pipResizing, onPipDragStart, onPipRe
   getViewportEl: () => editor.viewportEl,
   getViewOnly: () => editor.viewOnly,
   getIsPreviewMode: () => editor.isPreviewMode,
-  getHasVideo: () => editor.hasVideo
+  getHasVideo: () => editor.hasVideo,
+  getVideoDisplayWidth: () => editor.currProj?.videoDisplayWidth || 0,
+  setVideoDisplayWidth: width => {
+    if (editor.currProj) editor.currProj.videoDisplayWidth = width;
+  }
 });
 
 const videoLoading = ref(false);

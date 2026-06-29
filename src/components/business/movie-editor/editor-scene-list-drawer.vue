@@ -154,42 +154,72 @@ async function onDelete(row: EditorServerSceneItem) {
 </script>
 
 <style lang="scss">
-.editor-scene-list-drawer {
+.editor-scene-list-drawer.el-drawer {
+  background: #0a0b0d !important;
+  box-shadow: -12px 0 40px rgb(0 0 0 / 42%);
+
   .el-drawer__header {
     margin-bottom: 0;
     padding: 16px 20px 12px;
-    border-bottom: 1px solid var(--border-color-2);
+    border-bottom: 1px solid rgb(255 255 255 / 8%);
+    background: #0a0b0d;
   }
 
   .el-drawer__title {
     font-size: 16px;
     font-weight: 600;
-    color: var(--text-color-1);
+    color: rgb(255 255 255 / 88%);
+  }
+
+  .el-drawer__close-btn {
+    color: rgb(255 255 255 / 56%);
+
+    &:hover {
+      color: #fff;
+    }
   }
 
   .el-drawer__body {
     padding: 16px 20px 20px;
-    background: var(--fill-color-1);
+    background: #0a0b0d;
+    color: rgb(255 255 255 / 72%);
   }
 
-  &__body {
+  .editor-scene-list-drawer__body {
     min-height: 200px;
   }
 
-  &__table-wrap {
+  .editor-scene-list-drawer__table-wrap {
     overflow: auto;
-    background: #fff;
-    border: 1px solid var(--border-color-2);
+    background: #0d0f12;
+    border: 1px solid rgb(255 255 255 / 8%);
     border-radius: var(--corner-radius-2);
   }
 
-  &__table {
-    --el-table-header-bg-color: var(--fill-color-1);
-    --el-table-tr-bg-color: #fff;
-    --el-table-row-hover-bg-color: var(--primary-color-1);
-    --el-table-border-color: var(--border-color-2);
-    --el-table-text-color: var(--text-color-1);
-    --el-table-header-text-color: var(--text-color-2);
+  .editor-scene-list-drawer__table {
+    --el-table-bg-color: #0d0f12;
+    --el-table-tr-bg-color: #0d0f12;
+    --el-table-header-bg-color: #000;
+    --el-table-row-hover-bg-color: #143024;
+    --el-table-border-color: rgb(255 255 255 / 8%);
+    --el-table-text-color: rgb(255 255 255 / 72%);
+    --el-table-header-text-color: rgb(255 255 255 / 48%);
+    --el-fill-color-lighter: rgb(255 255 255 / 4%);
+    background: #0d0f12;
+
+    .el-table__body tr.el-table__row--striped td.el-table__cell {
+      background: rgb(255 255 255 / 4%) !important;
+    }
+
+    .el-table__body tr td.el-table__cell {
+      background: #0d0f12;
+    }
+
+    .el-table__fixed-right,
+    .el-table__fixed-left,
+    .el-table__fixed-right-patch {
+      background: #0d0f12 !important;
+    }
   }
 
   .scene-code-badge {
@@ -197,19 +227,20 @@ async function onDelete(row: EditorServerSceneItem) {
     align-items: center;
     padding: 2px 8px;
     border-radius: 4px;
-    background: #e8f7ee;
-    color: #18a058;
+    background: rgb(74 222 128 / 12%);
+    color: #4ade80;
     font-family: ui-monospace, Consolas, monospace;
     font-size: 12px;
     word-break: break-all;
   }
 
   .scene-preview-link {
-    color: var(--primary-color-6);
+    color: #6ee7a0;
     text-decoration: none;
     word-break: break-all;
 
     &:hover {
+      color: #4ade80;
       text-decoration: underline;
     }
   }
@@ -224,7 +255,35 @@ async function onDelete(row: EditorServerSceneItem) {
     .el-button {
       margin: 0;
       flex-shrink: 0;
+      --el-button-bg-color: rgb(255 255 255 / 6%);
+      --el-button-border-color: rgb(255 255 255 / 14%);
+      --el-button-text-color: rgb(255 255 255 / 72%);
+      --el-button-hover-bg-color: rgb(255 255 255 / 10%);
+      --el-button-hover-border-color: rgb(255 255 255 / 22%);
+      --el-button-hover-text-color: #fff;
     }
+
+    .el-button--primary.is-plain {
+      --el-button-bg-color: #143024;
+      --el-button-border-color: rgb(74 222 128 / 35%);
+      --el-button-text-color: #4ade80;
+      --el-button-hover-bg-color: rgb(20 48 36 / 92%);
+      --el-button-hover-border-color: rgb(74 222 128 / 50%);
+      --el-button-hover-text-color: #6ee7a0;
+    }
+
+    .el-button--danger.is-plain {
+      --el-button-bg-color: rgb(127 29 29 / 28%);
+      --el-button-border-color: rgb(248 113 113 / 35%);
+      --el-button-text-color: #f87171;
+      --el-button-hover-bg-color: rgb(127 29 29 / 42%);
+      --el-button-hover-border-color: rgb(248 113 113 / 50%);
+      --el-button-hover-text-color: #fca5a5;
+    }
+  }
+
+  .el-empty__description {
+    color: rgb(255 255 255 / 48%);
   }
 
   @media (max-width: 640px) {

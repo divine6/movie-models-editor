@@ -35,48 +35,6 @@
         <div v-show="editor.rightTab === 'model'" class="model-tab">
           <div class="panel-model-head">
             <span>{{ $t("OpWeb.Editor.TabModel", "模型") }}</span>
-            <div class="model-head-actions">
-              <input
-                :ref="editor.bindRef('multiFileInput')"
-                type="file"
-                accept=".glb,.gltf"
-                multiple
-                style="display: none"
-                @change="editor.onMultiFileChange"
-              />
-              <input
-                :ref="editor.bindRef('folderInput')"
-                type="file"
-                accept=".glb,.gltf"
-                multiple
-                webkitdirectory
-                style="display: none"
-                @change="editor.onFolderChange"
-              />
-              <el-tooltip :content="editor.pickOnlyVisible ? '仅拾取可见对象（点击切换为可拾取隐藏）' : '可拾取隐藏对象（点击仅拾取可见）'" placement="top">
-                <el-button
-                  size="small"
-                  plain
-                  :type="editor.pickOnlyVisible ? 'primary' : 'default'"
-                  @click="editor.togglePickOnlyVisible"
-                >
-                  <el-icon><component :is="editor.pickOnlyVisible ? View : Hide" /></el-icon>
-                </el-button>
-              </el-tooltip>
-              <el-dropdown trigger="click" @command="editor.importCmd">
-                <el-button type="primary" size="small" plain>＋</el-button>
-                <template #dropdown>
-                  <el-dropdown-menu>
-                    <el-dropdown-item command="file">
-                      {{ $t("OpWeb.Editor.ImportModelFiles", "选择模型文件（多选）") }}
-                    </el-dropdown-item>
-                    <el-dropdown-item command="folder">
-                      {{ $t("OpWeb.Editor.ImportModelFolder", "选择模型文件夹") }}
-                    </el-dropdown-item>
-                  </el-dropdown-menu>
-                </template>
-              </el-dropdown>
-            </div>
           </div>
 
           <div
@@ -120,7 +78,7 @@
               <base-empty size="small" :text="$t('OpWeb.Editor.NoChapterModels', '当前节点暂无模型')">
                 <template #desc>
                   <span class="model-empty-desc">
-                    {{ $t("OpWeb.Editor.ImportModelHint", "点击 ＋ 导入 GLB/GLTF 模型") }}
+                    {{ $t("OpWeb.Editor.ModelEmptyDesc", "当前节点尚未配置模型") }}
                   </span>
                 </template>
               </base-empty>
@@ -141,7 +99,7 @@
 </template>
 
 <script setup lang="ts" name="editor-config-panel">
-import { Delete, View, Hide } from "@element-plus/icons-vue";
+import { Delete } from "@element-plus/icons-vue";
 
 import EditorModelConfig from "@/components/business/movie-editor/editor-model-config.vue";
 import EditorModelTreeNode from "@/components/business/movie-editor/editor-model-tree-node.vue";

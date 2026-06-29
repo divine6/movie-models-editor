@@ -3,41 +3,38 @@
     <div class="seg-transform-field">
       <label class="seg-transform-label">{{ $t("OpWeb.Editor.PosOffsetX", "位置 X") }}</label>
       <div class="seg-slider-row">
-        <el-slider v-model="seg[posKey][0]" :min="-5" :max="5" :step="0.05" size="small" @input="onLive" />
+        <el-slider v-model="posX" :min="-5" :max="5" :step="0.05" size="small" />
         <el-input-number
-          v-model="seg[posKey][0]"
-          :step="0.05"
+          v-model="posX"
+          :step="0.001"
+          :precision="3"
           :controls="false"
           size="small"
           class="seg-input-num"
-          @input="onLive"
-          @change="onLive"
         />
       </div>
       <label class="seg-transform-label">{{ $t("OpWeb.Editor.PosOffsetY", "位置 Y") }}</label>
       <div class="seg-slider-row">
-        <el-slider v-model="seg[posKey][1]" :min="-5" :max="5" :step="0.05" size="small" @input="onLive" />
+        <el-slider v-model="posY" :min="-5" :max="5" :step="0.05" size="small" />
         <el-input-number
-          v-model="seg[posKey][1]"
-          :step="0.05"
+          v-model="posY"
+          :step="0.001"
+          :precision="3"
           :controls="false"
           size="small"
           class="seg-input-num"
-          @input="onLive"
-          @change="onLive"
         />
       </div>
       <label class="seg-transform-label">{{ $t("OpWeb.Editor.PosOffsetZ", "位置 Z") }}</label>
       <div class="seg-slider-row">
-        <el-slider v-model="seg[posKey][2]" :min="-5" :max="5" :step="0.05" size="small" @input="onLive" />
+        <el-slider v-model="posZ" :min="-5" :max="5" :step="0.05" size="small" />
         <el-input-number
-          v-model="seg[posKey][2]"
-          :step="0.05"
+          v-model="posZ"
+          :step="0.001"
+          :precision="3"
           :controls="false"
           size="small"
           class="seg-input-num"
-          @input="onLive"
-          @change="onLive"
         />
       </div>
     </div>
@@ -45,17 +42,15 @@
     <div class="seg-transform-field">
       <label class="seg-transform-label">{{ $t("OpWeb.Editor.ModelScale", "缩放") }}</label>
       <div class="seg-slider-row">
-        <el-slider v-model="seg[scaleKey]" :min="0.1" :max="5" :step="0.05" size="small" @input="onLive" />
+        <el-slider v-model="scaleVal" :min="0.1" :max="5" :step="0.05" size="small" />
         <el-input-number
-          v-model="seg[scaleKey]"
+          v-model="scaleVal"
           :min="0.1"
           :max="5"
           :step="0.05"
           :controls="false"
           size="small"
           class="seg-input-num"
-          @input="onLive"
-          @change="onLive"
         />
       </div>
     </div>
@@ -63,47 +58,44 @@
     <div class="seg-transform-field">
       <label class="seg-transform-label">{{ $t("OpWeb.Editor.RotX", "旋转 X") }}</label>
       <div class="seg-slider-row">
-        <el-slider v-model="seg[rotKey][0]" :min="-180" :max="180" :step="1" size="small" @input="onRot" />
+        <el-slider v-model="rotX" :min="-180" :max="180" :step="1" size="small" />
         <el-input-number
-          v-model="seg[rotKey][0]"
+          v-model="rotX"
           :min="-180"
           :max="180"
-          :step="1"
+          :step="0.001"
+          :precision="3"
           :controls="false"
           size="small"
           class="seg-input-num"
-          @input="onRot"
-          @change="onRot"
         />
       </div>
       <label class="seg-transform-label">{{ $t("OpWeb.Editor.RotY", "旋转 Y") }}</label>
       <div class="seg-slider-row">
-        <el-slider v-model="seg[rotKey][1]" :min="-180" :max="180" :step="1" size="small" @input="onRot" />
+        <el-slider v-model="rotY" :min="-180" :max="180" :step="1" size="small" />
         <el-input-number
-          v-model="seg[rotKey][1]"
+          v-model="rotY"
           :min="-180"
           :max="180"
-          :step="1"
+          :step="0.001"
+          :precision="3"
           :controls="false"
           size="small"
           class="seg-input-num"
-          @input="onRot"
-          @change="onRot"
         />
       </div>
       <label class="seg-transform-label">{{ $t("OpWeb.Editor.RotZ", "旋转 Z") }}</label>
       <div class="seg-slider-row">
-        <el-slider v-model="seg[rotKey][2]" :min="-180" :max="180" :step="1" size="small" @input="onRot" />
+        <el-slider v-model="rotZ" :min="-180" :max="180" :step="1" size="small" />
         <el-input-number
-          v-model="seg[rotKey][2]"
+          v-model="rotZ"
           :min="-180"
           :max="180"
-          :step="1"
+          :step="0.001"
+          :precision="3"
           :controls="false"
           size="small"
           class="seg-input-num"
-          @input="onRot"
-          @change="onRot"
         />
       </div>
     </div>
@@ -128,32 +120,54 @@ const posKey = computed(() => (props.mode === "start" ? "startPos" : "endPos"));
 const scaleKey = computed(() => (props.mode === "start" ? "startScale" : "endScale"));
 const rotKey = computed(() => (props.mode === "start" ? "startRot" : "endRot"));
 
-const onLive = () => {
-  editor.focusSegTransform(props.seg, props.mode);
+function readVec3(key: string): [number, number, number] {
+  const src = props.seg[key];
+  return [Number(src?.[0] ?? 0), Number(src?.[1] ?? 0), Number(src?.[2] ?? 0)];
+}
+
+function writeVec3(key: string, axis: 0 | 1 | 2, value: number) {
+  const next = readVec3(key);
+  next[axis] = value;
+  props.seg[key] = next;
+}
+
+function makeAxisComputed(keyRef: typeof posKey, axis: 0 | 1 | 2, onChange: () => void) {
+  return computed({
+    get: () => readVec3(keyRef.value)[axis],
+    set: (value: number) => {
+      writeVec3(keyRef.value, axis, value);
+      onChange();
+    }
+  });
+}
+
+const applyPosOrScale = () => {
   editor.liveSeg(props.seg, props.mode);
 };
 
-const onRot = () => {
-  editor.focusSegTransform(props.seg, props.mode);
+const applyRot = () => {
   editor.onRotChange(props.seg, props.mode);
 };
 
-watch(
-  () => {
-    const pk = props.mode === "start" ? "startPos" : "endPos";
-    const sk = props.mode === "start" ? "startScale" : "endScale";
-    return [props.seg[pk], props.seg[sk]];
-  },
-  () => onLive(),
-  { deep: true }
-);
+const posX = makeAxisComputed(posKey, 0, applyPosOrScale);
+const posY = makeAxisComputed(posKey, 1, applyPosOrScale);
+const posZ = makeAxisComputed(posKey, 2, applyPosOrScale);
+const rotX = makeAxisComputed(rotKey, 0, applyRot);
+const rotY = makeAxisComputed(rotKey, 1, applyRot);
+const rotZ = makeAxisComputed(rotKey, 2, applyRot);
+
+const scaleVal = computed({
+  get: () => Number(props.seg[scaleKey.value] ?? 1),
+  set: (value: number) => {
+    props.seg[scaleKey.value] = value;
+    applyPosOrScale();
+  }
+});
 
 watch(
-  () => {
-    const rk = props.mode === "start" ? "startRot" : "endRot";
-    return props.seg[rk];
-  },
-  () => onRot(),
-  { deep: true }
+  () => props.mode,
+  mode => {
+    editor.focusSegTransform(props.seg, mode);
+  }
 );
 </script>

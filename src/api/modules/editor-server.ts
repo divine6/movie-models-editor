@@ -35,6 +35,8 @@ export function editorServerBaseUrl() {
   const envUrl = (import.meta.env.VITE_EDITOR_SERVER_URL as string | undefined)?.trim();
   if (envUrl) return envUrl.replace(/\/$/, "");
   const { protocol, hostname } = window.location;
+  // localhost 与局域网 IP 为不同源，localStorage 不共享；API 默认同页 host。
+  // 若需两端访问同一后端，可在 .env 设置 VITE_EDITOR_SERVER_URL（如 http://192.168.x.x:4000）
   return `${protocol}//${hostname}:${DEFAULT_SERVER_PORT}`;
 }
 
@@ -92,6 +94,7 @@ export function rewireEditorServerHost(url: string) {
 
 async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${editorServerBaseUrl()}${path}`, {
+    cache: init?.cache ?? "no-store",
     ...init,
     headers: {
       ...(init?.body instanceof FormData ? {} : { "Content-Type": "application/json" }),

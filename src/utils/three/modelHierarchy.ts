@@ -45,6 +45,7 @@ function buildNode(
         : "other";
 
   const geometryKey = isMesh ? getGeometryKey(obj as THREE.Mesh) : undefined;
+  const localPosKey = `${obj.position.x.toFixed(4)},${obj.position.y.toFixed(4)},${obj.position.z.toFixed(4)}`;
 
   const children: ModelHierarchyNode[] = [];
   for (let i = 0; i < obj.children.length; i++) {
@@ -52,7 +53,7 @@ function buildNode(
     if (node) children.push(node);
   }
 
-  return { id, modelId, name: segment, path, objectType, children, geometryKey };
+  return { id, modelId, name: segment, path, objectType, children, geometryKey, localPosKey };
 }
 
 function normalizeHierarchyRoots(tree: ModelHierarchyNode): ModelHierarchyNode[] {
@@ -74,6 +75,39 @@ function collapseRedundantModelRoot(nodes: ModelHierarchyNode[], modelDisplayNam
   if (normalizeModelDisplayName(root.name) !== normalizeModelDisplayName(modelDisplayName)) return nodes;
   if (root.children.length > 0) return root.children;
   return [];
+}
+
+/** 多根节点时展开与模型文件名同名的 Group，并去掉与展开子树重名的同级节点 */
+function unwrapNamedModelGroup(nodes: ModelHierarchyNode[], modelDisplayName?: string): ModelHierarchyNode[] {
+  if (!modelDisplayName?.trim()) return nodes;
+  const target = normalizeModelDisplayName(modelDisplayName);
+
+  const hoisted: ModelHierarchyNode[] = [];
+  const others: ModelHierarchyNode[] = [];
+  for (const node of nodes) {
+    if (
+      normalizeModelDisplayName(node.name) === target &&
+      node.objectType === "group" &&
+      node.children.length > 0
+    ) {
+      hoisted.push(...node.children);
+    } else {
+      others.push(node);
+    }
+  }
+  if (hoisted.length === 0) return nodes;
+
+  const namesInHoisted = new Set<string>();
+  const collectNames = (list: ModelHierarchyNode[]) => {
+    for (const n of list) {
+      namesInHoisted.add(normalizeModelDisplayName(n.name));
+      collectNames(n.children);
+    }
+  };
+  collectNames(hoisted);
+
+  const filteredOthers = others.filter(n => !namesInHoisted.has(normalizeModelDisplayName(n.name)));
+  return [...filteredOthers, ...hoisted];
 }
 
 function getMeshBaseName(name: string): string {
@@ -112,16 +146,17 @@ function getGeometryKey(mesh: THREE.Mesh): string | undefined {
   return `v${pos.count}:i${idxCount}:a${attrKeys}:bb${bbKey}`;
 }
 
-function meshesShareSameGeometry(a: ModelHierarchyNode, b: ModelHierarchyNode): boolean {
-  if (a.geometryKey && b.geometryKey) return a.geometryKey === b.geometryKey;
-  return false;
-}
-
+/** 仅合并多材质拆分（X / X_1 / X_2），不合并同几何体的批量实例（如 48 个 Cell） */
 function meshesCanMergeAsMaterialSplit(group: ModelHierarchyNode[]): boolean {
   if (group.length < 2) return false;
   if (!group.every(n => n.objectType === "mesh")) return false;
-  if (group.every(n => meshesShareSameGeometry(group[0], n))) return true;
-  return isMaterialSplitNameGroup(group);
+  if (!isMaterialSplitNameGroup(group)) return false;
+  const names = new Set(group.map(n => n.name));
+  if (names.size <= 1) return false;
+  const posKeys = new Set(group.map(n => n.localPosKey).filter(Boolean));
+  if (posKeys.size > 1) return false;
+  if (group.length > 8) return false;
+  return true;
 }
 
 function flattenMergedNodeIds(node: ModelHierarchyNode): string[] {
@@ -186,9 +221,12 @@ function absorbMaterialMeshChildrenIntoGroup(node: ModelHierarchyNode): ModelHie
 
   if (node.objectType === "group" && children.length > 0) {
     const meshChildren = children.filter(c => c.objectType === "mesh");
+    const allSameMeshName =
+      meshChildren.length > 1 && meshChildren.every(c => c.name === meshChildren[0].name);
     const shouldAbsorb =
       meshChildren.length === children.length &&
       meshChildren.length > 0 &&
+      !allSameMeshName &&
       (meshChildren.length === 1 || meshesCanMergeAsMaterialSplit(meshChildren));
     if (shouldAbsorb) {
       const geometryKey = meshChildren[0].geometryKey;
@@ -205,6 +243,34 @@ function absorbMaterialMeshChildrenIntoGroup(node: ModelHierarchyNode): ModelHie
   }
 
   return { ...node, children };
+}
+
+/** 同父级下同名 Mesh 若位置不同，视为独立实例并赋予可区分名称 */
+function disambiguateInstancedMeshNames(nodes: ModelHierarchyNode[]): ModelHierarchyNode[] {
+  const meshGroups = new Map<string, ModelHierarchyNode[]>();
+  for (const node of nodes) {
+    if (node.objectType !== "mesh") continue;
+    const list = meshGroups.get(node.name) ?? [];
+    list.push(node);
+    meshGroups.set(node.name, list);
+  }
+
+  return nodes.map(node => {
+    const children = disambiguateInstancedMeshNames(node.children);
+    if (node.objectType !== "mesh") {
+      return children === node.children ? node : { ...node, children };
+    }
+    const siblings = meshGroups.get(node.name) ?? [node];
+    if (siblings.length <= 1) {
+      return children === node.children ? node : { ...node, children };
+    }
+    const posKeys = new Set(siblings.map(s => s.localPosKey));
+    if (posKeys.size <= 1) {
+      return children === node.children ? node : { ...node, children };
+    }
+    const idx = siblings.indexOf(node) + 1;
+    return { ...node, name: `${node.name} ${idx}`, children };
+  });
 }
 
 export function applyMergedNodeMetadata(root: THREE.Object3D, nodes: ModelHierarchyNode[]) {
@@ -288,8 +354,10 @@ export function buildModelHierarchy(
   if (!tree) return [];
   let nodes = normalizeHierarchyRoots(tree);
   nodes = collapseRedundantModelRoot(nodes, modelDisplayName);
+  nodes = unwrapNamedModelGroup(nodes, modelDisplayName);
   nodes = mergeMaterialSplitMeshes(nodes);
   nodes = absorbMaterialMeshChildrenIntoGroups(nodes);
+  nodes = disambiguateInstancedMeshNames(nodes);
   applyMergedNodeMetadata(root, nodes);
   return nodes;
 }

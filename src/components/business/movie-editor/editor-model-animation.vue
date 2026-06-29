@@ -163,6 +163,15 @@ watch(
 );
 
 watch(
+  () => unref(editor.animSegmentRevision),
+  () => {
+    sigReady = false;
+    lastUserSig = buildUserSig(unref(currentSegment));
+    sigReady = true;
+  }
+);
+
+watch(
   () => buildUserSig(unref(currentSegment)),
   sig => {
     if (!sigReady) return;
@@ -205,30 +214,6 @@ const onResetAnim = async () => {
     // cancelled
   }
 };
-
-watch(
-  () => [props.formData.posOffsetX, props.formData.posOffsetY, props.formData.posOffsetZ],
-  () => {
-    if (!unref(editor.selModelId)) return;
-    props.onApply("position");
-  }
-);
-
-watch(
-  () => props.formData.scale,
-  () => {
-    if (!unref(editor.selModelId)) return;
-    props.onApply("scale");
-  }
-);
-
-watch(
-  () => [props.formData.rotX, props.formData.rotY, props.formData.rotZ],
-  () => {
-    if (!unref(editor.selModelId)) return;
-    props.onApply("rotation");
-  }
-);
 </script>
 
 <style lang="scss">
@@ -251,14 +236,14 @@ watch(
     font-size: 11px;
     font-weight: 500;
     line-height: 22px;
-    color: var(--primary-color-6);
-    border-color: var(--primary-color-6);
-    background: var(--primary-color-1);
+    color: #4ade80;
+    border-color: rgb(74 222 128 / 35%);
+    background: #143024;
 
     &:hover:not(:disabled) {
-      color: #fff;
-      background: var(--primary-color-6);
-      border-color: var(--primary-color-6);
+      color: #6ee7a0;
+      background: rgb(20 48 36 / 92%);
+      border-color: rgb(74 222 128 / 50%);
     }
 
     &:disabled {
@@ -267,7 +252,7 @@ watch(
     }
   }
 
-  .md-anim-reset-btn {
+      .md-anim-reset-btn {
     flex-shrink: 0;
     min-width: 56px;
     height: 24px;
@@ -275,14 +260,14 @@ watch(
     font-size: 11px;
     font-weight: 500;
     line-height: 22px;
-    color: var(--text-color-2);
-    border: 1px solid var(--border-color-2);
-    background: #fff;
+    color: rgb(255 255 255 / 72%);
+    border: 1px solid rgb(255 255 255 / 14%);
+    background: rgb(255 255 255 / 6%);
 
     &:hover:not(:disabled) {
-      color: var(--text-color-1);
-      border-color: var(--border-color-3);
-      background: var(--fill-color-2);
+      color: #fff;
+      border-color: rgb(255 255 255 / 22%);
+      background: rgb(255 255 255 / 10%);
     }
 
     &:disabled {

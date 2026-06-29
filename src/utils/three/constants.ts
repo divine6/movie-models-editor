@@ -15,9 +15,9 @@ export const DEFAULT_MODEL_BASE_POSITION = [0, 0, 0] as [number, number, number]
 
 /** 默认相机配置 */
 export const DEFAULT_CAMERA = {
-  position: [6, 4, 8] as [number, number, number],
-  target: [0, 0, 0] as [number, number, number],
-  fov: 50,
+  position: [4.199, 2.414, -2.519] as [number, number, number],
+  target: [0.014, 1.202, 0] as [number, number, number],
+  fov: 45,
   transitionSec: 0.5
 };
 
@@ -39,6 +39,9 @@ export const ANIMATION = {
 
 /** 节点切换镜头运镜时长（秒） */
 export const CHAPTER_CAMERA_TRANSITION_SEC = 0.5;
+
+/** 快速连点节点时合并运镜/重逻辑的防抖间隔（毫秒） */
+export const CHAPTER_NAV_DEBOUNCE_MS = 80;
 
 /** 选中模型后镜头聚焦运镜时长（秒） */
 export const MODEL_CAMERA_FOCUS_SEC = 0.6;
