@@ -283,9 +283,7 @@ export function useMovieEditor() {
   const videoSourceTab = ref<"local" | "url">("local");
   const isDragOver = ref(false);
   const showVideoPip = ref(true);
-  const modelIntroLabels = ref<Array<{ modelId: string; text: string; x: number; y: number }>>([]);
-  const introPreviewVisible = ref(false);
-  let introPreviewTimer: ReturnType<typeof setTimeout> | null = null;
+  const modelIntroLabels = ref<Array<{ modelId: string; nodeId: string | null; text: string; x: number; y: number }>>([]);
   const playbackHintVisible = ref(false);
   const playbackHintFading = ref(false);
   let playbackHintTimer: ReturnType<typeof setTimeout> | null = null;
@@ -3300,7 +3298,7 @@ export function useMovieEditor() {
   }
 
   /** 切换节点时立即刷新 3D 场景（不等待 RAF，避免短暂显示上一节点状态） */
-  function applyChapterVisualStateForNav(ch: Chapter, previewAnimation = false) {
+  function applyChapterVisualStateForNav(ch: Chapter, previewAnimation = false, visualElapsed?: number) {
     const inEditMode =
       !previewAnimation && !viewOnly.value && !isPreviewMode.value && !chapterPlayTarget.value;
     if (inEditMode) {
@@ -3311,16 +3309,27 @@ export function useMovieEditor() {
       sanitizeChapterModelConfigs(ch);
     }
     const hasEdits = chapterHasAnyModelEdits(ch);
+    const video = videoEl.value;
+    const playingVideo = !!(video && !video.paused);
+    const elapsed =
+      visualElapsed !== undefined
+        ? visualElapsed
+        : previewAnimation
+          ? 0
+          : playingVideo
+            ? resolveChapterAnimElapsed(ch, video!.currentTime)
+            : hasEdits
+              ? Number.POSITIVE_INFINITY
+              : 0;
     if (!previewAnimation && !hasEdits) {
       for (const m of models.value) {
         resetModelTreeToDefault(m);
       }
     } else {
-      const elapsed = previewAnimation ? 0 : hasEdits ? Number.POSITIVE_INFINITY : 0;
       applyChapterModelState(ch, elapsed, {
         skipOutlineRebuild: true,
         skipOverlaySync: true,
-        forceElapsed: previewAnimation ? 0 : hasEdits ? undefined : 0
+        forceElapsed: previewAnimation ? 0 : playingVideo || visualElapsed !== undefined ? elapsed : hasEdits ? undefined : 0
       });
     }
     invalidatePickMeshCache();
@@ -7661,15 +7670,15 @@ export function useMovieEditor() {
     if (!prevChapter || prevChapter.id !== chapter.id) {
       lastSyncedModelFormChapterId = null;
     }
-    applyChapterVisualStateForNav(chapter, previewAnimation);
+    applyChapterVisualStateForNav(chapter, previewAnimation, options?.visualElapsed);
     syncModelSelectionForChapter(chapter);
     scheduleChapterNavDeferredWork(chapter, gen, elapsed, previewAnimation);
+    lastIntroStateKey = "";
+    syncIntroPresentation();
 
     queueMicrotask(() => {
       if (gen !== chapterNavGeneration) return;
-      lastIntroStateKey = "";
       syncChapterMetaForm(chapter);
-      syncIntroPresentation();
       if (!camTrans && !isCameraTransitioning.value && !cameraAnimating) {
         syncCameraFormFromStored(chapter);
         chapterNavLock.value = false;
@@ -7689,10 +7698,13 @@ export function useMovieEditor() {
         const editing =
           !viewOnly.value && !isPreviewMode.value && !chapterPlayTarget.value && v.paused;
         if (!editing) {
-          syncChapterVisualState(playbackChapter, resolveChapterAnimElapsed(playbackChapter, v.currentTime), {
-            skipOutlineRebuild: true,
-            skipOverlaySync: true
-          });
+          const animElapsed = resolveChapterAnimElapsed(playbackChapter, v.currentTime);
+          if (Math.abs(animElapsed - elapsed) > CHAPTER_TIME_EPS) {
+            syncChapterVisualState(playbackChapter, animElapsed, {
+              skipOutlineRebuild: true,
+              skipOverlaySync: true
+            });
+          }
         }
         if (!v.paused) ensureVideoSyncedChapterAnimation();
       });
@@ -8044,6 +8056,32 @@ export function useMovieEditor() {
     bumpAnimSegmentRevision();
   }
 
+  function collectIntroLabelsForChapter(ch: Chapter): Array<{ modelId: string; nodeId: string | null; text: string; x: number; y: number }> {
+    const labels: Array<{ modelId: string; nodeId: string | null; text: string; x: number; y: number }> = [];
+    const def = createDefaultModelConfig();
+
+    for (const m of models.value) {
+      if (!chapterModelHasEdits(ch, m.id)) continue;
+      const raw = ch.modelConfigs?.[m.id] as ModelConfig | undefined;
+      if (!raw) continue;
+
+      const rootCfg = getModelConfig(raw);
+      const rootIntro = rootCfg.intro?.trim();
+      if (rootIntro && rootCfg.visible) {
+        labels.push({ modelId: m.id, nodeId: null, text: rootIntro, x: 0, y: 0 });
+      }
+
+      if (!raw.nodeConfigs) continue;
+      for (const [nodeId, nodeCfg] of Object.entries(raw.nodeConfigs)) {
+        const merged = getModelConfig({ ...def, ...nodeCfg } as ModelConfig);
+        const intro = merged.intro?.trim();
+        if (!intro || !merged.visible) continue;
+        labels.push({ modelId: m.id, nodeId, text: intro, x: 0, y: 0 });
+      }
+    }
+    return labels;
+  }
+
   function syncIntroPresentation() {
     const video = videoEl.value;
     const playing = !!(video && !video.paused);
@@ -8053,30 +8091,32 @@ export function useMovieEditor() {
     const chapterId = chapter?.id ?? null;
 
     const editingModel = !playing ? selModel.value : null;
-    const editingCfg =
-      chapter && editingModel && chapterModelHasEdits(chapter, editingModel.id)
-        ? getModelConfig(chapter.modelConfigs![editingModel.id])
-        : null;
-    const editingIntro = editingCfg?.intro?.trim() || "";
-    const editingShouldShow = !!(editingCfg?.visible && editingIntro);
+    const editingNodeId = !playing ? selModelNodeId.value : null;
+    let editingIntro = "";
+    let editingVisible = true;
+    if (chapter && editingModel) {
+      const liveIntro = mIntro.value?.trim();
+      if (liveIntro) {
+        editingIntro = liveIntro;
+        editingVisible = mVis.value;
+      } else {
+        const cfg = resolveEditorConfigForSelection(chapter, editingModel, editingNodeId).cfg;
+        editingIntro = cfg.intro?.trim() || "";
+        editingVisible = cfg.visible;
+      }
+    }
+    const editingShouldShow = !!(editingModel && editingVisible && editingIntro);
 
-    // 播放中：展示所有有介绍的模型；编辑中：只展示当前选中模型的介绍
-    const shouldShow = playing || introPreviewVisible.value || editingShouldShow;
+    // 播放中：展示所有有介绍的模型/子节点；编辑中：展示当前选中目标的介绍
+    const shouldShow = playing || editingShouldShow;
 
     let introSignature = "";
     if (shouldShow && chapter) {
       if (!playing && editingModel) {
-        introSignature = editingShouldShow ? `${editingModel.id}|${editingIntro}` : "";
+        introSignature = editingShouldShow ? `${editingModel.id}|${editingNodeId ?? ""}|${editingIntro}` : "";
       } else {
-        introSignature = models.value
-          .map(m => {
-            if (!chapterModelHasEdits(chapter, m.id)) return "";
-            const cfg = getModelConfig(chapter.modelConfigs![m.id]);
-            const intro = cfg.intro?.trim();
-            if (!intro || !cfg.visible) return "";
-            return `${m.id}|${intro}`;
-          })
-          .filter(Boolean)
+        introSignature = collectIntroLabelsForChapter(chapter)
+          .map(l => `${l.modelId}|${l.nodeId ?? ""}|${l.text}`)
           .join(";");
       }
     }
@@ -8091,22 +8131,14 @@ export function useMovieEditor() {
       return;
     }
 
-    const labels: Array<{ modelId: string; text: string; x: number; y: number }> = [];
-    if (!playing && editingModel) {
-      if (editingShouldShow) {
-        labels.push({ modelId: editingModel.id, text: editingIntro, x: 0, y: 0 });
-      }
+    if (!playing && editingModel && editingShouldShow) {
+      modelIntroLabels.value = [
+        { modelId: editingModel.id, nodeId: editingNodeId, text: editingIntro, x: 0, y: 0 }
+      ];
     } else {
-      for (const m of models.value) {
-        if (!chapterModelHasEdits(chapter, m.id)) continue;
-        const cfg = getModelConfig(chapter.modelConfigs![m.id]);
-        const intro = cfg.intro?.trim();
-        if (!intro || !cfg.visible) continue;
-        labels.push({ modelId: m.id, text: intro, x: 0, y: 0 });
-      }
+      modelIntroLabels.value = collectIntroLabelsForChapter(chapter);
     }
 
-    modelIntroLabels.value = labels;
     introPresentationPlaying = playing;
     introPresentationChapterId = chapterId;
   }
@@ -8121,7 +8153,9 @@ export function useMovieEditor() {
     if (width <= 0 || height <= 0) return;
 
     for (const label of modelIntroLabels.value) {
-      const obj = meshes.get(label.modelId);
+      const obj = label.nodeId
+        ? getTransformTarget(label.modelId, label.nodeId)
+        : meshes.get(label.modelId);
       if (!obj) continue;
 
       const box = new THREE.Box3().setFromObject(obj);
@@ -8915,13 +8949,6 @@ export function useMovieEditor() {
     } else if (field === "intro") {
       cfg.intro = mIntro.value;
       lastIntroStateKey = "";
-      introPreviewVisible.value = true;
-      if (introPreviewTimer) clearTimeout(introPreviewTimer);
-      introPreviewTimer = setTimeout(() => {
-        introPreviewVisible.value = false;
-        lastIntroStateKey = "";
-        syncIntroPresentation();
-      }, 2200);
       syncIntroPresentation();
     } else if (field === "position") {
       if (targets.length) {

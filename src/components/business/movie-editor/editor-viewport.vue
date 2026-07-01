@@ -23,7 +23,7 @@
       <div v-if="editor.modelIntroLabels.length" class="model-intro-layer">
         <div
           v-for="label in editor.modelIntroLabels"
-          :key="label.modelId"
+          :key="`${label.modelId}:${label.nodeId ?? ''}`"
           class="model-intro-popup"
           :style="{ left: `${label.x}px`, top: `${label.y}px` }"
         >
