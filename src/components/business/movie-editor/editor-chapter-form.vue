@@ -115,7 +115,7 @@
 </template>
 
 <script setup lang="ts" name="editor-chapter-form">
-import { computed, reactive, unref, watch } from "vue";
+import { computed, nextTick, reactive, unref, watch } from "vue";
 
 import { useMovieEditorContext } from "@/composables/useMovieEditorContext";
 import { useTranslate } from "@/hooks/useTranslate";
@@ -164,16 +164,16 @@ const syncForms = () => {
     endTime: ch.endTime
   });
   Object.assign(cameraForm, {
-    posX: ch.camera.position[0],
-    posY: ch.camera.position[1],
-    posZ: ch.camera.position[2],
-    targetX: ch.camera.target[0],
-    targetY: ch.camera.target[1],
-    targetZ: ch.camera.target[2],
+    posX: round3(ch.camera.position[0]),
+    posY: round3(ch.camera.position[1]),
+    posZ: round3(ch.camera.position[2]),
+    targetX: round3(ch.camera.target[0]),
+    targetY: round3(ch.camera.target[1]),
+    targetZ: round3(ch.camera.target[2]),
     fov: ch.camera.fov,
-    transitionSec: ch.camera.transitionSec ?? 0.5
+    transitionSec: ch.camera.transitionSec ?? cameraForm.transitionSec ?? 0.5
   });
-  queueMicrotask(() => {
+  void nextTick(() => {
     isSyncingChapterForm = false;
     isSyncingCameraForm = false;
   });
@@ -196,7 +196,13 @@ watch(
 watch(
   cameraForm,
   () => {
-    if (isSyncingCameraForm || unref(editor.chapterNavLock) || unref(editor.isCameraTransitioning)) return;
+    if (
+      isSyncingCameraForm ||
+      unref(editor.chapterNavLock) ||
+      unref(editor.isCameraTransitioning)
+    ) {
+      return;
+    }
     cameraForm.posX = round3(cameraForm.posX);
     cameraForm.posY = round3(cameraForm.posY);
     cameraForm.posZ = round3(cameraForm.posZ);
@@ -204,6 +210,7 @@ watch(
     cameraForm.targetY = round3(cameraForm.targetY);
     cameraForm.targetZ = round3(cameraForm.targetZ);
     editor.applyCameraFormSnapshot({ ...cameraForm });
+    editor.applyCameraFormToViewport();
     const ch = activeChapter.value;
     if (ch) {
       ch.camera.position = [cameraForm.posX, cameraForm.posY, cameraForm.posZ];

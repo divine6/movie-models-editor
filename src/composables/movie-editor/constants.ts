@@ -50,7 +50,20 @@ export function getSceneSettingsStorageKey(modelSetCode?: string | null) {
 export const CHAPTER_TIME_EPS = 0.05;
 export const CHAPTER_END_EPS = 0.02;
 export const SEEK_READY_TIMEOUT_MS = 4000;
-export const SEEK_EVENT_TIMEOUT_MS = 800;
+export const SEEK_EVENT_TIMEOUT_MS = 280;
+export const CHAPTER_CAMERA_SWITCH_EDIT_SEC = 0.15;
+export const CHAPTER_CAMERA_SWITCH_PLAYBACK_SEC = 0.18;
+export const CHAPTER_CAMERA_SWITCH_MIN_SEC = 0.1;
+export const CHAPTER_CAMERA_SWITCH_MAX_SEC = 0.28;
+
+export const TARGET_FPS_OPTIONS = [30, 45, 60] as const;
+export type TargetFps = (typeof TARGET_FPS_OPTIONS)[number];
+
+export function normalizeTargetFps(value: unknown): TargetFps {
+  const n = Number(value);
+  if (n === 30 || n === 45 || n === 60) return n;
+  return 30;
+}
 
 export const DEFAULT_SCENE_SETTINGS = {
   ambIntensity: 0.35,
@@ -92,7 +105,8 @@ export const DEFAULT_SCENE_SETTINGS = {
   msaaEnabled: true,
   /** none | ssaa | smaa | fxaa */
   antialiasingMode: "fxaa" as AntialiasingMode,
-  maxPixelRatio: 2
+  maxPixelRatio: 2,
+  targetFps: 30 as TargetFps
 };
 
 export const ANTIALIASING_MODE_OPTIONS: ReadonlyArray<{ value: AntialiasingMode; label: string; hint: string }> = [

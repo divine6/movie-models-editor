@@ -48,6 +48,19 @@ export const ownerRouter = [
         },
         beforeEnter: editorCodeRouteGuard,
         component: () => import("@/views/project/editor.vue")
+      },
+      {
+        path: "/project/admin",
+        name: "project-admin",
+        meta: {
+          title: "后台管理",
+          isMenu: false,
+          isHide: true,
+          isFull: true,
+          activeMenu: "/project/index",
+          localeKey: "OpWeb.Project.Admin"
+        },
+        component: () => import("@/views/project/admin.vue")
       }
     ]
   }

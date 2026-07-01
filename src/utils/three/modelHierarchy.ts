@@ -31,9 +31,13 @@ function buildNode(
   obj.userData.modelId = modelId;
   obj.userData.nodePath = path;
   obj.userData.nodeId = id;
-  obj.userData.baseLocalPos = [obj.position.x, obj.position.y, obj.position.z];
-  obj.userData.baseLocalRot = [obj.rotation.x, obj.rotation.y, obj.rotation.z];
-  obj.userData.baseLocalScale = obj.scale.x;
+  // 仅首次记录 GLB 初始局部变换；切换选中/重建层级时不可覆盖，否则相对旋转会漂移
+  if (!obj.userData.baseLocalCaptured) {
+    obj.userData.baseLocalPos = [obj.position.x, obj.position.y, obj.position.z];
+    obj.userData.baseLocalRot = [obj.rotation.x, obj.rotation.y, obj.rotation.z];
+    obj.userData.baseLocalScale = obj.scale.x;
+    obj.userData.baseLocalCaptured = true;
+  }
 
   const isMesh = (obj as THREE.Mesh).isMesh;
   const objectType: ModelHierarchyNode["objectType"] = isMesh

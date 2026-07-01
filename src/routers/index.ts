@@ -40,7 +40,7 @@ router.beforeEach(async (to, from, next) => {
 
   // 2.动态设置标题（编辑器页由路由守卫 / useMovieEditor 自行设置，避免闪烁）
   const title = import.meta.env.VITE_GLOB_APP_TITLE;
-  if (to.path !== "/project/editor") {
+  if (to.path !== "/project/editor" && to.path !== "/project/admin") {
     document.title = to.meta.title ? `${to.meta.title} - ${title}` : title;
   }
 

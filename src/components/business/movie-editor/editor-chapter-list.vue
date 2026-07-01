@@ -37,7 +37,7 @@
               :key="item.chapter.id"
               class="ch-item"
               :class="{
-                active: editor.selectedChapterId === item.chapter.id,
+                active: editor.isChapterListActive(item.chapter),
                 playing: editor.isChapterPlaying(item.chapter),
                 'is-child': !!item.chapter.parentId
               }"
@@ -49,7 +49,7 @@
                 <span class="ch-name">{{ item.chapter.name }}</span>
                 <span class="ch-time">{{ editor.fmt(item.chapter.startTime) }} → {{ editor.fmt(item.chapter.endTime) }}</span>
                 <div class="ch-segment-track">
-                  <div class="ch-segment-fill" :style="{ width: editor.chapterFillPct(item.chapter) + '%' }" />
+                  <div class="ch-segment-fill" :style="{ width: editor.chapterListFillPct(item.chapter) + '%' }" />
                 </div>
               </span>
               <span class="ch-item-actions" @click.stop>
@@ -64,7 +64,7 @@
                   </el-button>
                 </el-tooltip>
                 <el-tooltip :content="$t('OpWeb.Common.Play', '播放')" placement="top">
-                  <el-button text type="primary" @click="editor.startChapterPlayback(item.chapter, { autoplay: true })">
+                  <el-button text type="primary" @click="editor.startChapterPlayback(item.chapter, { autoplay: true, syncVideo: true })">
                     <el-icon><VideoPlay /></el-icon>
                   </el-button>
                 </el-tooltip>
@@ -133,7 +133,7 @@ const onAddChapter = () => {
 };
 
 const onPreviewChapterPlay = (chapter: Chapter) => {
-  void editor.startChapterPlayback(chapter, { autoplay: true });
+  void editor.startChapterPlayback(chapter, { autoplay: true, syncVideo: true });
   hideChapterDrawer();
 };
 

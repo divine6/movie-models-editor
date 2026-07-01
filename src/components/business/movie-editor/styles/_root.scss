@@ -306,6 +306,8 @@
       .editor-topbar__preview-end {
         align-items: center;
         gap: 10px;
+        position: relative;
+        z-index: 51;
       }
 
       .editor-topbar__exit-preview {

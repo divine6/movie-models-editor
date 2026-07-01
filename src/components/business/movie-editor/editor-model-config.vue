@@ -77,13 +77,7 @@
     <editor-model-animation :form-data="formData" :on-apply="applyLive" />
   </div>
   <div v-else-if="editor.selectedChapter" class="model-config-empty">
-    <base-empty size="small" :text="$t('OpWeb.Editor.NoChapterModel', '当前节点未配置模型')">
-      <template #desc>
-        <span class="model-config-empty-desc">
-          {{ $t("OpWeb.Editor.NoChapterModelHint", "请先在上方添加模型，或从模型列表中选择进行配置") }}
-        </span>
-      </template>
-    </base-empty>
+    <base-empty size="small" :text="$t('OpWeb.Editor.NoModelSelected', '当前未选中模型')" />
   </div>
 </template>
 

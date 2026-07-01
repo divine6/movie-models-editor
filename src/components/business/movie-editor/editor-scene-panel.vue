@@ -443,6 +443,27 @@
               </div>
             </div>
             <div class="sp-module">
+              <div class="sp-module-title">渲染帧率 Frame Rate</div>
+              <div class="sp-field">
+                <label>目标帧率</label>
+                <div class="sp-aa-presets">
+                  <button
+                    v-for="fps in editor.TARGET_FPS_OPTIONS"
+                    :key="fps"
+                    type="button"
+                    class="sp-aa-preset"
+                    :class="{ 'is-active': editor.targetFps === fps }"
+                    @click="editor.setTargetFps(fps)"
+                  >
+                    {{ fps }} FPS
+                  </button>
+                </div>
+                <div class="sp-hint sp-hint--inline">
+                  当前实际帧率 {{ editor.displayFps }} FPS
+                </div>
+              </div>
+            </div>
+            <div class="sp-module">
               <div class="sp-module-title">色彩矫正</div>
               <div class="sp-field">
                 <label>色调映射</label>

@@ -34,7 +34,7 @@
               :key="child.id"
               class="ch-item ch-item--child"
               :class="{
-                active: editor.selectedChapterId === child.id,
+                active: editor.isChapterListActive(child),
                 playing: editor.isChapterPlaying(child)
               }"
               @click.stop="onChildClick(child)"
@@ -82,18 +82,15 @@ function isRootExpanded(rootId: string) {
 }
 
 function isRootHighlighted(root: Chapter) {
-  if (editor.selectedChapterId === root.id) return true;
-  return getChildren(root.id).some(child => child.id === editor.selectedChapterId);
+  return editor.isChapterListActive(root);
 }
 
 function isRootPlaying(root: Chapter) {
-  if (!editor.isPlaying) return false;
-  if (editor.isChapterPlaying(root)) return true;
-  return getChildren(root.id).some(child => editor.isChapterPlaying(child));
+  return editor.isChapterPlaying(root);
 }
 
 function syncExpandedRoot() {
-  const selectedId = editor.selectedChapterId;
+  const selectedId = editor.getActiveChapterIdForUi();
   if (!selectedId) {
     if (expandedRootId.value) return;
     const firstWithChildren = rootChapters.value.find(root => getChildren(root.id).length > 0);
@@ -108,16 +105,10 @@ function syncExpandedRoot() {
 
 function onRootClick(root: Chapter) {
   const children = getChildren(root.id);
-  if (children.length === 0) {
-    emit("play", root);
-    return;
+  if (children.length > 0) {
+    expandedRootId.value = root.id;
   }
-  if (expandedRootId.value === root.id) {
-    expandedRootId.value = null;
-    return;
-  }
-  expandedRootId.value = root.id;
-  emit("play", children[0]);
+  emit("play", root);
 }
 
 function onChildClick(child: Chapter) {
