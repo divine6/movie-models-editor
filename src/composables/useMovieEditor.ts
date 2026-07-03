@@ -14,6 +14,7 @@ import { ElMessageBox } from "element-plus";
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { DRACOLoader } from "three/addons/loaders/DRACOLoader.js";
+import { dracoDecoderPath } from "@/utils/projectAssets";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { RGBELoader } from "three/addons/loaders/RGBELoader.js";
 import { MeshoptDecoder } from "three/examples/jsm/libs/meshopt_decoder.module.js";
@@ -231,6 +232,10 @@ export function useMovieEditor() {
     targets: Array<{ objs: THREE.Object3D[]; cfg: ModelConfig; liveSegs?: any[] }>;
   } | null = null;
   const chapterPlayTarget = ref<Chapter | null>(null);
+  /** 展示/预览：切换过程中暂存的 UI 节点 id */
+  const presentationUiChapterId = ref<string | null>(null);
+  /** 展示/预览：导航列表中的当前索引（暂停/章节边界时与视频时间解耦） */
+  const presentationNavIndex = ref(-1);
   const chapterAutoNext = ref(false);
   /** 展示/预览模式章节衔接中：避免 pause 回调误停动画 */
   let presentationChapterTransition = false;
@@ -242,6 +247,9 @@ export function useMovieEditor() {
   let videoChapterSyncPaused = false;
   let chapterNavFollowUpRaf = 0;
   let chapterPlaybackRequestSeq = 0;
+  let presentationChapterCooldownUntil = 0;
+  let lastPresentationAutoSwitchChapterId: string | null = null;
+  let lastPresentationPlaybackChapterId: string | null = null;
   let segmentPlaybackRafId: number | null = null;
   let segmentPlaybackGeneration = 0;
   let activeSegmentPlaybackSeg: any = null;
@@ -397,6 +405,16 @@ export function useMovieEditor() {
   const chapterTreeList = computed(() => flattenChapterTree(chapters.value));
   const hasChapters = computed(() => chapters.value.length > 0);
   const currentChapterIdx = computed(() => findChIdx(currentTime.value));
+  const presentationNavChapterCount = computed(() => getPresentationNavChapters().length);
+  const presentationNavChapters = computed(() => getPresentationNavChapters());
+  const presentationTimelineChapterIdx = computed(() => {
+    if (!viewOnly.value && !isPreviewMode.value) return currentChapterIdx.value;
+    const activeId = getActiveChapterIdForUi();
+    if (!activeId) return currentChapterIdx.value;
+    const ch = chapters.value.find(c => c.id === activeId);
+    if (!ch) return currentChapterIdx.value;
+    return getTimelineChapterIndex(ch);
+  });
   const playbackRateLabel = computed(() => {
     const rate = playbackRate.value;
     return Number.isInteger(rate) ? `${rate}x` : `${rate}x`;
@@ -555,6 +573,7 @@ export function useMovieEditor() {
     controls.maxPolarAngle = Math.PI / 2;
     bindControlsInteraction();
     syncOrbitControlsDom();
+    syncPresentationInteractionMode();
 
     // 光照（初始值与 DEFAULT_SCENE_SETTINGS 一致，loadAllSettings 后会再同步）
     ambientLight = new THREE.AmbientLight(0xffffff, DEFAULT_SCENE_SETTINGS.ambIntensity);
@@ -585,7 +604,7 @@ export function useMovieEditor() {
     }
     gltfLoader = new GLTFLoader();
     dracoLoader = new DRACOLoader();
-    dracoLoader.setDecoderPath("/draco/");
+    dracoLoader.setDecoderPath(dracoDecoderPath());
     // dracoLoader.setDecoderConfig({ type: "js" }); // 可选：强制使用 JS 解码器（调试用）
     gltfLoader.setDRACOLoader(dracoLoader);
     gltfLoader.setMeshoptDecoder(MeshoptDecoder);
@@ -619,6 +638,7 @@ export function useMovieEditor() {
 
     onCanvasPointerDown = (e: PointerEvent) => {
       if (e.button !== 0 || e.isPrimary === false) return;
+      if (isPresentationInteraction() && isPresentationUiTarget(e.target)) return;
       if (isPresentationInteraction()) {
         viewportPickState = { x: e.clientX, y: e.clientY, time: performance.now() };
         return;
@@ -629,6 +649,10 @@ export function useMovieEditor() {
 
     onCanvasPointerUp = (e: PointerEvent) => {
       if (e.button !== 0 || e.isPrimary === false || !viewportPickState) return;
+      if (isPresentationUiTarget(e.target)) {
+        viewportPickState = null;
+        return;
+      }
       const dx = e.clientX - viewportPickState.x;
       const dy = e.clientY - viewportPickState.y;
       const elapsed = performance.now() - viewportPickState.time;
@@ -636,7 +660,7 @@ export function useMovieEditor() {
       viewportPickState = null;
 
       if (isPresentationInteraction()) {
-        if (!wasDrag && isPreviewMode.value) {
+        if (!wasDrag && isPreviewMode.value && !viewOnly.value && !isCoarsePointerDevice()) {
           tryTogglePlayOnPreviewTap(e.clientX, e.clientY);
         }
         return;
@@ -832,18 +856,92 @@ export function useMovieEditor() {
 
   function getPresentationCameraDistance(maxDim: number) {
     const w = viewportEl.value?.clientWidth ?? 800;
+    const h = viewportEl.value?.clientHeight ?? 600;
     let mul = 2.2;
     if (viewOnly.value || isPreviewMode.value) {
-      if (w <= 480) mul = 3.0;
-      else if (w <= 768) mul = 2.6;
+      if (w <= 480) mul = 3.45;
+      else if (w <= 768) mul = 3.0;
       else mul = 2.4;
     }
-    const minDist = w <= 480 ? 3.2 : 2.5;
+    const minDist = w <= 480 ? 4.2 : w <= 768 ? 3.4 : 2.5;
     let desired = Math.max(maxDim * mul, minDist);
+    const navSafePx = w <= 768 ? 64 : 40;
+    const effectiveAspect = Math.max((w - navSafePx * 2) / Math.max(h, 1), 0.45);
+    const portraitBoost = effectiveAspect < 0.85 ? 1.28 : 1.08;
+    desired *= portraitBoost;
     if (controls?.maxDistance) {
-      desired = Math.min(desired, controls.maxDistance * 0.88);
+      desired = Math.min(desired, controls.maxDistance * 0.92);
     }
     return desired;
+  }
+
+  function computePresentationSafeFitFrame(chapter?: Chapter | null): {
+    position: [number, number, number];
+    target: [number, number, number];
+    fov: number;
+  } | null {
+    if (!camera || !controls || meshes.size === 0) return null;
+
+    const viewport = viewportEl.value;
+    const vw = viewport?.clientWidth ?? 0;
+    const vh = viewport?.clientHeight ?? 0;
+    if (vw <= 0 || vh <= 0) return null;
+
+    const box = new THREE.Box3();
+    meshes.forEach(group => box.expandByObject(group));
+    if (box.isEmpty()) return null;
+    box.getCenter(_focusCenter);
+    box.getSize(_focusSize);
+
+    const navSafePx = vw <= 768 ? 64 : 40;
+    const topSafePx = viewOnly.value ? 96 : 72;
+    const bottomSafePx = 120;
+    const effectiveW = Math.max(vw - navSafePx * 2, vw * 0.48);
+    const effectiveH = Math.max(vh - topSafePx - bottomSafePx, vh * 0.48);
+    const aspect = effectiveW / effectiveH;
+
+    const baseFov = viewCameraBaseFov ?? camera.fov;
+    let fov = baseFov;
+    if (vw <= 480) fov = Math.min(80, baseFov + 28);
+    else if (vw <= 768) fov = Math.min(72, baseFov + 18);
+
+    const vFovRad = THREE.MathUtils.degToRad(fov);
+    const hFovRad = 2 * Math.atan(Math.tan(vFovRad / 2) * aspect);
+    const halfW = Math.max(_focusSize.x, _focusSize.z) * 0.52;
+    const halfH = _focusSize.y * 0.52;
+    const fitDist = Math.max(halfW / Math.tan(hFovRad / 2), halfH / Math.tan(vFovRad / 2), 0.45) * 1.32;
+
+    const storedFrame = chapter ? getStoredChapterCameraFrame(chapter) : null;
+    if (storedFrame) {
+      const st = new THREE.Vector3(...storedFrame.target);
+      const sp = new THREE.Vector3(...storedFrame.position);
+      const dir = sp.clone().sub(st);
+      if (dir.lengthSq() > 1e-6) {
+        dir.normalize();
+        const distance = Math.max(fitDist, sp.distanceTo(st) * (vw <= 768 ? 1.15 : 1.05));
+        return {
+          position: [st.x + dir.x * distance, st.y + dir.y * distance, st.z + dir.z * distance],
+          target: [st.x, st.y, st.z],
+          fov: Math.max(fov, storedFrame ? chapter!.camera.fov : fov)
+        };
+      }
+    }
+
+    const distance = Math.max(fitDist, getPresentationCameraDistance(Math.max(_focusSize.x, _focusSize.y, _focusSize.z, 0.4)));
+    _focusOffset.copy(_defaultCamViewDir).multiplyScalar(distance);
+    return {
+      position: [
+        _focusCenter.x + _focusOffset.x,
+        Math.max(_focusCenter.y + _focusOffset.y, _focusCenter.y + _focusSize.y * 0.25),
+        _focusCenter.z + _focusOffset.z
+      ],
+      target: [_focusCenter.x, _focusCenter.y, _focusCenter.z],
+      fov
+    };
+  }
+
+  function shouldUsePresentationSafeFitCamera() {
+    return (viewOnly.value || isPreviewMode.value) && isCoarsePointerDevice();
   }
 
   function scheduleSaveSettings() {
@@ -868,7 +966,11 @@ export function useMovieEditor() {
     const minOrbit = Math.max(extent * 0.55, 1.5);
     let maxOrbit = Math.max(extent * 4.2, 14);
     if (viewOnly.value || isPreviewMode.value) {
-      maxOrbit = Math.min(maxOrbit, Math.max(extent * 3.6, 12));
+      if (shouldUsePresentationSafeFitCamera()) {
+        maxOrbit = Math.max(extent * 5.8, 22);
+      } else {
+        maxOrbit = Math.min(maxOrbit, Math.max(extent * 3.6, 12));
+      }
     }
 
     controls.minDistance = minOrbit;
@@ -895,9 +997,24 @@ export function useMovieEditor() {
   function adaptPresentationViewport() {
     if (!camera || !controls) return;
     if (!viewOnly.value && !isPreviewMode.value) return;
+    syncPresentationInteractionMode();
     const w = viewportEl.value?.clientWidth ?? 0;
     if (w <= 0) return;
     if (viewCameraBaseFov === null) viewCameraBaseFov = camera.fov;
+
+    if (shouldUsePresentationSafeFitCamera()) {
+      const frame = computePresentationSafeFitFrame(
+        chapters.value.find(ch => ch.id === selectedChapterId.value) ?? getActiveChapter()
+      );
+      if (frame) {
+        snapCam(frame.position, frame.target, frame.fov);
+        syncSceneOrbitLimits();
+        applyFog();
+        controls.update();
+        return;
+      }
+    }
+
     const base = viewCameraBaseFov;
     let fov = base;
     if (w <= 480) fov = Math.min(72, base + 18);
@@ -941,6 +1058,11 @@ export function useMovieEditor() {
     };
     controls.addEventListener("start", onControlsInteractionStart);
     controls.addEventListener("end", onControlsInteractionEnd);
+  }
+
+  function syncPresentationInteractionMode() {
+    if (!controls) return;
+    controls.enabled = true;
   }
 
   function syncOrbitControlsDom() {
@@ -2234,13 +2356,13 @@ export function useMovieEditor() {
     if (!_chAnimLock || chAnimWallclock) return;
     const video = videoEl.value;
     if (!video || video.paused) return;
-    const activeCh = getPlaybackChapterAtTime(video.currentTime);
+    const activeCh = resolvePresentationPlaybackChapter(video);
     if (!activeCh || !chapterHasAnimation(activeCh)) return;
     const targetInterval = 1000 / targetFps.value;
     if (videoAnimLastSyncAt && now - videoAnimLastSyncAt < targetInterval * 0.9) return;
     videoAnimLastSyncAt = now;
     chAnimChapterId = activeCh.id;
-    applyChapterAnimOnly(activeCh, getChapterAnimElapsed(activeCh, video.currentTime));
+    applyChapterAnimOnly(activeCh, getPresentationAnimElapsed(video, activeCh));
   }
 
   function syncWallclockChapterAnimationInMainLoop(now: number) {
@@ -2356,6 +2478,7 @@ export function useMovieEditor() {
     isCameraTransitioning.value = false;
     afterCameraChapterId = null;
     afterCameraCallback = null;
+    chapterNavLock.value = false;
   }
 
   function completeCameraTransition() {
@@ -3218,17 +3341,284 @@ export function useMovieEditor() {
     return Math.max(CHAPTER_CAMERA_SWITCH_MIN_SEC, getChapterCameraTransitionSec(ch));
   }
 
+  function getPresentationNavChapters(): Chapter[] {
+    const result: Chapter[] = [];
+    for (const root of timelineChapters.value) {
+      const children = getSortedChapterChildren(root.id);
+      if (children.length > 0) {
+        result.push(...children);
+      } else {
+        result.push(root);
+      }
+    }
+    return result;
+  }
+
+  /** 将任意节点映射到展示导航列表中的可导航项（父节点有子节点时落到对应子节点） */
+  function resolvePresentationNavChapter(chapter: Chapter): Chapter {
+    const nav = getPresentationNavChapters();
+    const direct = nav.find(item => item.id === chapter.id);
+    if (direct) return direct;
+
+    const children = getSortedChapterChildren(chapter.id);
+    if (children.length > 0) {
+      const video = videoEl.value;
+      if (video) {
+        const atTime = children.find(child => isChapterInPlaybackRange(child, video.currentTime));
+        if (atTime) return atTime;
+      }
+      return children[0];
+    }
+
+    if (chapter.parentId) {
+      const siblings = getSortedChapterChildren(chapter.parentId);
+      const self = siblings.find(child => child.id === chapter.id);
+      if (self) return self;
+    }
+
+    return chapter;
+  }
+
+  function isPresentationNavChapterAtTime(ch: Chapter, t: number): boolean {
+    return t >= ch.startTime - CHAPTER_TIME_EPS && t <= ch.endTime + CHAPTER_END_EPS;
+  }
+
+  function findPresentationNavIndexByTime(t: number): number {
+    const nav = getPresentationNavChapters();
+    if (nav.length === 0) return -1;
+    const matched = nav.filter(ch => isPresentationNavChapterAtTime(ch, t));
+    if (matched.length > 0) {
+      return nav.findIndex(ch => ch.id === matched[matched.length - 1].id);
+    }
+    for (let i = nav.length - 1; i >= 0; i--) {
+      if (nav[i].startTime <= t + CHAPTER_TIME_EPS) return i;
+    }
+    return 0;
+  }
+
+  function isPresentationSeekLocked(): boolean {
+    return presentationChapterTransition || videoChapterSyncPaused || chapterNavLock.value;
+  }
+
+  function getPresentationChapterAtVideoTime(t: number): Chapter | null {
+    if (viewOnly.value || isPreviewMode.value) {
+      const nav = getPresentationNavChapters();
+      const idx = findPresentationNavIndexByTime(t);
+      return idx >= 0 ? nav[idx] : null;
+    }
+    return getPlaybackChapterAtTime(t);
+  }
+
+  function getActivePresentationNavIndex(): number {
+    const nav = getPresentationNavChapters();
+    if (nav.length === 0) return -1;
+
+    if (isPresentationSeekLocked()) {
+      if (presentationNavIndex.value >= 0 && presentationNavIndex.value < nav.length) {
+        return presentationNavIndex.value;
+      }
+      if (presentationUiChapterId.value) {
+        const idx = nav.findIndex(ch => ch.id === presentationUiChapterId.value);
+        if (idx >= 0) return idx;
+      }
+    }
+
+    const video = videoEl.value;
+    const t = video?.currentTime ?? currentTime.value;
+    const timeIdx = findPresentationNavIndexByTime(t);
+
+    if (presentationNavIndex.value >= 0 && presentationNavIndex.value < nav.length) {
+      const uiChapter = nav[presentationNavIndex.value];
+      if (isPresentationNavChapterAtTime(uiChapter, t)) {
+        return presentationNavIndex.value;
+      }
+      // seek 失败或 ended 后 currentTime 回到 0 时，仍以 UI 当前节点为准
+      if (timeIdx >= 0 && timeIdx !== presentationNavIndex.value) {
+        const timeChapter = nav[timeIdx];
+        if (
+          t <= CHAPTER_TIME_EPS &&
+          uiChapter.startTime > CHAPTER_TIME_EPS &&
+          !isPresentationNavChapterAtTime(timeChapter, t)
+        ) {
+          return presentationNavIndex.value;
+        }
+      }
+    }
+
+    if (timeIdx >= 0) return timeIdx;
+
+    if (presentationNavIndex.value >= 0 && presentationNavIndex.value < nav.length) {
+      return presentationNavIndex.value;
+    }
+
+    if (presentationUiChapterId.value) {
+      const idx = nav.findIndex(ch => ch.id === presentationUiChapterId.value);
+      if (idx >= 0) return idx;
+    }
+
+    return 0;
+  }
+
+  function getPresentationNavIndex(ch: Chapter): number {
+    const navChapter = resolvePresentationNavChapter(ch);
+    return getPresentationNavChapters().findIndex(item => item.id === navChapter.id);
+  }
+
+  /** 展示/预览：播放中跟视频时间；仅在 seek/切换过程中锁定目标节点 */
+  function resolvePresentationPlaybackChapter(video?: HTMLVideoElement | null): Chapter | null {
+    const v = video ?? videoEl.value;
+    if (!v) return chapterPlayTarget.value;
+
+    if (isPresentationSeekLocked()) {
+      return (
+        chapterPlayTarget.value ??
+        (() => {
+          const nav = getPresentationChapterAtVideoTime(v.currentTime);
+          return nav ? resolvePlayableChapterForPresentation(nav) : null;
+        })()
+      );
+    }
+
+    if (viewOnly.value || isPreviewMode.value) {
+      const navChapter =
+        getPresentationChapterAtVideoTime(v.currentTime) ??
+        (presentationUiChapterId.value
+          ? (() => {
+              const uiChapter = chapters.value.find(ch => ch.id === presentationUiChapterId.value);
+              return uiChapter ? resolvePresentationNavChapter(uiChapter) : null;
+            })()
+          : null);
+      if (navChapter) return resolvePlayableChapterForPresentation(navChapter);
+      return chapterPlayTarget.value;
+    }
+
+    if (chapterPlayTarget.value) return chapterPlayTarget.value;
+    return getPresentationChapterAtVideoTime(v.currentTime);
+  }
+
+  function getPresentationAnimElapsed(video: HTMLVideoElement, ch?: Chapter | null): number {
+    const chapter = ch ?? resolvePresentationPlaybackChapter(video);
+    if (!chapter) return 0;
+    return getChapterAnimElapsed(chapter, video.currentTime);
+  }
+
+  function canAutoAdvancePresentationChapter(navChapter: Chapter, v: HTMLVideoElement): boolean {
+    if (presentationChapterTransition || videoChapterSyncPaused || v.seeking) return false;
+    if (performance.now() < presentationChapterCooldownUntil) return false;
+    if (!isPresentationNavChapterAtTime(navChapter, v.currentTime) && v.currentTime < navChapter.endTime - CHAPTER_END_EPS) {
+      return false;
+    }
+    const span = navChapter.endTime - navChapter.startTime;
+    if (span < MIN_CHAPTER_DURATION - CHAPTER_TIME_EPS) return false;
+    const minPlayed = Math.min(0.8, span * 0.3);
+    if (v.currentTime < navChapter.startTime + minPlayed) return false;
+    return v.currentTime >= navChapter.endTime - CHAPTER_END_EPS;
+  }
+
+  function canPresentationPrevChapter(): boolean {
+    if (!viewOnly.value && !isPreviewMode.value) return false;
+    const nav = getPresentationNavChapters();
+    if (nav.length <= 1) return false;
+    return getActivePresentationNavIndex() > 0;
+  }
+
+  function canPresentationNextChapter(): boolean {
+    if (!viewOnly.value && !isPreviewMode.value) return false;
+    const nav = getPresentationNavChapters();
+    if (nav.length <= 1) return false;
+    const idx = getActivePresentationNavIndex();
+    return idx >= 0 && idx < nav.length - 1;
+  }
+
   function getActiveChapterIdForUi(): string | null {
-    if (chapterPlayTarget.value) {
-      return chapterPlayTarget.value.id;
-    }
-    if (isPlaying.value || isPreviewMode.value || viewOnly.value) {
-      const ci = currentChapterIdx.value;
-      if (ci >= 0) return timelineChapters.value[ci]?.id ?? null;
+    if (viewOnly.value || isPreviewMode.value) {
+      if (isPresentationSeekLocked()) {
+        if (presentationUiChapterId.value) return presentationUiChapterId.value;
+        if (chapterPlayTarget.value) {
+          const nav = resolvePresentationNavChapter(chapterPlayTarget.value);
+          return nav.id;
+        }
+      }
+      const video = videoEl.value;
+      if (video) {
+        const playback = getPresentationChapterAtVideoTime(video.currentTime);
+        if (playback && isPresentationNavChapterAtTime(playback, video.currentTime)) {
+          return playback.id;
+        }
+      }
+      if (presentationUiChapterId.value) return presentationUiChapterId.value;
+      if (chapterPlayTarget.value) {
+        return resolvePresentationNavChapter(chapterPlayTarget.value).id;
+      }
+    } else {
+      if (chapterPlayTarget.value) return chapterPlayTarget.value.id;
       const playback = getPlaybackChapterAtTime(currentTime.value);
-      if (playback) return playback.id;
+      if (playback && isPlaying.value) return playback.id;
     }
-    return selectedChapterId.value;
+    if (selectedChapterId.value) return selectedChapterId.value;
+    const ci = currentChapterIdx.value;
+    if (ci >= 0) return timelineChapters.value[ci]?.id ?? null;
+    return null;
+  }
+
+  function syncPresentationPlaybackFromVideo(v: HTMLVideoElement) {
+    if (!viewOnly.value && !isPreviewMode.value) return;
+    if (isPresentationSeekLocked()) return;
+
+    const navChapter = getPresentationChapterAtVideoTime(v.currentTime);
+    if (!navChapter) return;
+
+    const playable = resolvePlayableChapterForPresentation(navChapter);
+    syncPresentationUiFromChapter(navChapter);
+    if (chapterPlayTarget.value?.id !== playable.id) {
+      chapterPlayTarget.value = playable;
+    }
+
+    if (playable.id === lastPresentationAutoSwitchChapterId) {
+      if (!v.paused && chapterHasAnimation(playable)) {
+        ensureVideoSyncedChapterAnimation();
+      }
+      return;
+    }
+    lastPresentationAutoSwitchChapterId = playable.id;
+
+    const resolved = resolveChapter(playable);
+    if (!resolved) return;
+    playingIdx.value = resolved.idx;
+    applyChapterCameraForNav(navChapter, "playback");
+    const elapsed = getChapterAnimElapsed(playable, v.currentTime);
+    syncChapterVisualState(playable, elapsed, {
+      skipOutlineRebuild: true,
+      skipOverlaySync: true
+    });
+    if (chapterNeedsOutlineRebuild(playable)) {
+      refreshChapterOutlines(playable);
+    }
+    if (!v.paused && chapterHasAnimation(playable)) {
+      ensureVideoSyncedChapterAnimation();
+    }
+  }
+
+  function isPresentationTimelineSegmentCurrent(segmentIdx: number): boolean {
+    if (!viewOnly.value && !isPreviewMode.value) {
+      return currentChapterIdx.value === segmentIdx;
+    }
+    const nav = getPresentationNavChapters();
+    const activeId = getActiveChapterIdForUi();
+    if (!activeId || segmentIdx < 0 || segmentIdx >= nav.length) return false;
+    return nav[segmentIdx].id === activeId;
+  }
+
+  function syncPresentationUiFromChapter(chapter: Chapter) {
+    if (!viewOnly.value && !isPreviewMode.value) return;
+    const navChapter = resolvePresentationNavChapter(chapter);
+    presentationUiChapterId.value = navChapter.id;
+    const nav = getPresentationNavChapters();
+    const idx = nav.findIndex(ch => ch.id === navChapter.id);
+    if (idx >= 0) presentationNavIndex.value = idx;
+    if (selectedChapterId.value !== navChapter.id) {
+      selectedChapterId.value = navChapter.id;
+    }
   }
 
   function isChapterListActive(ch: Chapter): boolean {
@@ -3326,11 +3716,15 @@ export function useMovieEditor() {
         resetModelTreeToDefault(m);
       }
     } else {
+      const isPresentation = viewOnly.value || isPreviewMode.value;
       applyChapterModelState(ch, elapsed, {
-        skipOutlineRebuild: true,
-        skipOverlaySync: true,
+        skipOutlineRebuild: !isPresentation,
+        skipOverlaySync: false,
         forceElapsed: previewAnimation ? 0 : playingVideo || visualElapsed !== undefined ? elapsed : hasEdits ? undefined : 0
       });
+      if (isPresentation && chapterNeedsOutlineRebuild(ch)) {
+        refreshChapterOutlines(ch);
+      }
     }
     invalidatePickMeshCache();
     syncTransformVisualOverlays();
@@ -3396,16 +3790,28 @@ export function useMovieEditor() {
   }
 
   function applyChapterCameraForNav(chapter: Chapter, _mode?: ChapterCameraSwitchMode) {
-    const frame = getStoredChapterCameraFrame(chapter);
-    const dur = getChapterCameraSwitchDuration(chapter);
+    const safeFrame = shouldUsePresentationSafeFitCamera()
+      ? computePresentationSafeFitFrame(chapter)
+      : null;
+    const frame = safeFrame ?? getStoredChapterCameraFrame(chapter);
+    const fov = safeFrame?.fov ?? chapter.camera.fov;
     const chapterId = chapter.id;
+
+    if (shouldUsePresentationSafeFitCamera()) {
+      snapCam(frame.position, frame.target, fov);
+      syncCameraFormFromStored(chapter);
+      chapterNavLock.value = false;
+      return;
+    }
+
     afterCameraChapterId = chapterId;
     afterCameraCallback = () => {
       if (selectedChapterId.value !== chapterId) return;
       syncCameraFormFromStored(chapter);
       chapterNavLock.value = false;
     };
-    animCam(frame.position, frame.target, chapter.camera.fov, dur, true);
+    const dur = getChapterCameraSwitchDuration(chapter);
+    animCam(frame.position, frame.target, fov, dur, true);
   }
 
   function transitionChapterCamera(ch: Chapter, after?: () => void, switchMode: ChapterCameraSwitchMode = "auto") {
@@ -3984,8 +4390,15 @@ export function useMovieEditor() {
     });
   }
 
+  function resolveModelLoadUrl(m: Model): string {
+    if (!m.url) return "";
+    if (m.url.startsWith("blob:") || m.url.startsWith("data:")) return m.url;
+    const raw = getModelSourcePath(m) || m.url;
+    return resolveAssetUrl(raw);
+  }
+
   async function loadGLB(m: Model) {
-    const url = m.url;
+    const url = resolveModelLoadUrl(m);
     if (!url) return;
     return new Promise<void>(resolve => {
       gltfLoader.load(
@@ -4310,8 +4723,16 @@ export function useMovieEditor() {
     return Math.max(rx, ry, rz) <= 0.7;
   }
 
+  function isPresentationUiTarget(target: EventTarget | null) {
+    if (!(target instanceof Element)) return false;
+    return !!target.closest(
+      ".viewport-preview-nav, .viewport-preview-nav-btn, .viewport-play-hint, .pip-group, .progress-area, .editor-topbar, .chapter-list-panel, .chapter-preview-backdrop"
+    );
+  }
+
   function tryTogglePlayOnPreviewTap(clientX: number, clientY: number) {
-    if (!isPreviewMode.value || !hasVideo.value) return;
+    if (!isPreviewMode.value || !hasVideo.value || viewOnly.value || isCoarsePointerDevice()) return;
+    if (isPresentationUiTarget(document.elementFromPoint(clientX, clientY))) return;
     if (!isPreviewModelCenterHit(clientX, clientY)) return;
     togglePlay();
   }
@@ -4496,16 +4917,38 @@ export function useMovieEditor() {
     }
   }
 
-  async function seekVideoTo(time: number) {
+  async function seekVideoTo(time: number, options?: { pause?: boolean }): Promise<boolean> {
     const video = videoEl.value;
-    if (!video) return;
+    if (!video) return false;
 
     const target = clampVideoTime(time, video);
-    if (!Number.isFinite(target)) return;
+    if (!Number.isFinite(target)) return false;
 
     const gen = ++seekGeneration;
+    const shouldPause = options?.pause ?? true;
 
-    video.pause();
+    if (
+      video.ended &&
+      Number.isFinite(video.duration) &&
+      target + CHAPTER_TIME_EPS < video.duration
+    ) {
+      try {
+        video.pause();
+        video.currentTime = Math.max(0, video.duration - 0.05);
+      } catch {
+        /* ignore */
+      }
+    }
+
+    if (shouldPause) {
+      video.pause();
+    } else if (isCoarsePointerDevice() && video.paused) {
+      try {
+        await video.play();
+      } catch {
+        /* ignore */
+      }
+    }
     try {
       video.currentTime = target;
     } catch {
@@ -4514,31 +4957,63 @@ export function useMovieEditor() {
 
     if (Math.abs(video.currentTime - target) < CHAPTER_TIME_EPS) {
       if (gen === seekGeneration) currentTime.value = video.currentTime;
-      return;
+      return true;
     }
 
     await waitUntilSeekable(video, target);
-    if (gen !== seekGeneration) return;
+    if (gen !== seekGeneration) return false;
 
-    await new Promise<void>(resolve => {
+    const seekTimeoutMs = isCoarsePointerDevice() ? 1500 : SEEK_EVENT_TIMEOUT_MS;
+    let seeked = await new Promise<boolean>(resolve => {
       let settled = false;
-      const finish = () => {
+      const finish = (ok: boolean) => {
         if (settled) return;
         settled = true;
         video.removeEventListener("seeked", onSeeked);
         if (gen === seekGeneration) currentTime.value = video.currentTime;
-        resolve();
+        resolve(ok);
       };
-      const onSeeked = () => finish();
+      const onSeeked = () => finish(Math.abs(video.currentTime - target) < CHAPTER_TIME_EPS);
       video.addEventListener("seeked", onSeeked);
       try {
         video.currentTime = target;
       } catch {
-        finish();
+        finish(false);
         return;
       }
-      window.setTimeout(finish, SEEK_EVENT_TIMEOUT_MS);
+      window.setTimeout(() => finish(Math.abs(video.currentTime - target) < CHAPTER_TIME_EPS), seekTimeoutMs);
     });
+
+    // 部分手机内核在未充分激活媒体管线前无法生效 seek（会卡在 0s）
+    if (!seeked && isCoarsePointerDevice()) {
+      try {
+        await video.play();
+        await new Promise(resolve => window.setTimeout(resolve, 180));
+      } catch {
+        /* ignore */
+      }
+      if (shouldPause) video.pause();
+      seeked = await new Promise<boolean>(resolve => {
+        let settled = false;
+        const finish = (ok: boolean) => {
+          if (settled) return;
+          settled = true;
+          video.removeEventListener("seeked", onSeeked);
+          if (gen === seekGeneration) currentTime.value = video.currentTime;
+          resolve(ok);
+        };
+        const onSeeked = () => finish(Math.abs(video.currentTime - target) < CHAPTER_TIME_EPS);
+        video.addEventListener("seeked", onSeeked);
+        try {
+          video.currentTime = target;
+        } catch {
+          finish(false);
+          return;
+        }
+        window.setTimeout(() => finish(Math.abs(video.currentTime - target) < CHAPTER_TIME_EPS), 1800);
+      });
+    }
+    return seeked;
   }
 
   function resetChapterModelsToStart(chapter: Chapter) {
@@ -4547,10 +5022,10 @@ export function useMovieEditor() {
 
   function syncPausedChapterAnimation(v: HTMLVideoElement, _ci: number) {
     if (!v.paused) return;
-    const ch = getPlaybackChapterAtTime(v.currentTime);
+    const ch = resolvePresentationPlaybackChapter(v);
     if (!ch) return;
     stopChapterAnimation();
-    applyChapterModelState(ch, getChapterAnimElapsed(ch, v.currentTime));
+    applyChapterModelState(ch, getPresentationAnimElapsed(v, ch));
   }
 
   function syncChapterSubtitle(v: HTMLVideoElement) {
@@ -4799,43 +5274,84 @@ export function useMovieEditor() {
 
   function onTick(e: Event) {
     const v = e.target as HTMLVideoElement;
-    currentTime.value = v.currentTime;
+    const seekLocked =
+      videoChapterSyncPaused || chapterNavLock.value || presentationChapterTransition;
+    if (!seekLocked) {
+      currentTime.value = v.currentTime;
+    }
 
     if (sceneBootstrapBusy.value || routeGateLoading.value) {
       syncChapterSubtitle(v);
       return;
     }
 
-    const playTarget = chapterPlayTarget.value;
-    if (!presentationChapterTransition && playTarget && v.currentTime >= playTarget.endTime - CHAPTER_END_EPS) {
-      presentationChapterTransition = true;
-      v.pause();
-      v.currentTime = playTarget.endTime;
-      currentTime.value = playTarget.endTime;
-      chapterPlayTarget.value = null;
+    if ((viewOnly.value || isPreviewMode.value) && !presentationChapterTransition && !seekLocked) {
+      syncPresentationPlaybackFromVideo(v);
+    }
 
-      if (chapterAutoNext.value) {
-        const ci = getTimelineChapterIndex(playTarget);
-        const next = ci >= 0 ? timelineChapters.value[ci + 1] : null;
-        if (next) {
-          // 继续顺序播放下一节点
-          void startChapterPlayback(next, { syncVideo: true, autoplay: true });
+    if (viewOnly.value || isPreviewMode.value) {
+      const navChapter =
+        getPresentationChapterAtVideoTime(v.currentTime) ??
+        (presentationUiChapterId.value
+          ? (() => {
+              const uiChapter = chapters.value.find(ch => ch.id === presentationUiChapterId.value);
+              return uiChapter ? resolvePresentationNavChapter(uiChapter) : null;
+            })()
+          : null);
+      const playTarget = navChapter ? resolvePlayableChapterForPresentation(navChapter) : null;
+      if (navChapter && playTarget && canAutoAdvancePresentationChapter(navChapter, v)) {
+        const nav = getPresentationNavChapters();
+        const navIdx = getPresentationNavIndex(navChapter);
+        const next = navIdx >= 0 ? nav[navIdx + 1] : null;
+
+        if (chapterAutoNext.value && next) {
+          presentationChapterTransition = true;
+          const wasPlaying = !v.paused;
+          void startChapterPlayback(next, {
+            syncVideo: true,
+            autoplay: wasPlaying,
+            keepPlaying: wasPlaying,
+            seekTime: next.startTime,
+            userGesture: false
+          });
         } else {
+          presentationChapterTransition = true;
+          v.pause();
+          const holdTime = Math.min(navChapter.endTime, v.duration || navChapter.endTime);
+          try {
+            v.currentTime = holdTime;
+          } catch {
+            /* ignore */
+          }
+          currentTime.value = holdTime;
+          chapterPlayTarget.value = playTarget;
+          syncPresentationUiFromChapter(navChapter);
           chapterAutoNext.value = false;
+          lastPresentationAutoSwitchChapterId = playTarget.id;
+          syncCurrentChapterAnimationFromVideo();
           presentationChapterTransition = false;
         }
-      } else {
-        presentationChapterTransition = false;
+        syncChapterSubtitle(v);
+        return;
       }
     }
 
     const ci = findChIdx(v.currentTime);
-    const locked = videoChapterSyncPaused || chapterNavLock.value || chapterPlayTarget.value;
 
-    if (locked) {
+    if (seekLocked) {
       if (!v.paused) {
         ensureVideoSyncedChapterAnimation();
       } else if (!videoChapterSyncPaused && !chapterNavLock.value) {
+        syncPausedChapterAnimation(v, ci);
+      }
+      syncChapterSubtitle(v);
+      return;
+    }
+
+    if (chapterPlayTarget.value && !viewOnly.value && !isPreviewMode.value) {
+      if (!v.paused) {
+        ensureVideoSyncedChapterAnimation();
+      } else {
         syncPausedChapterAnimation(v, ci);
       }
       syncChapterSubtitle(v);
@@ -4847,10 +5363,12 @@ export function useMovieEditor() {
       if (ci >= 0) {
         const ch = timelineChapters.value[ci];
         selectedChapterId.value = ch.id;
-        navigateToChapter(ch, ci, { seek: false, cameraMode: "auto" });
+        if (!viewOnly.value && !isPreviewMode.value) {
+          navigateToChapter(ch, ci, { seek: false, cameraMode: "auto" });
+        }
         if (!v.paused) ensureVideoSyncedChapterAnimation();
       }
-    } else if (!v.paused && !locked) {
+    } else if (!v.paused) {
       const ch = ci >= 0 ? timelineChapters.value[ci] : null;
       if (ch && chapterHasAnimation(ch)) {
         ensureVideoSyncedChapterAnimation();
@@ -4868,7 +5386,10 @@ export function useMovieEditor() {
 
   function onVideoEnd() {
     isPlaying.value = false;
+    chapterPlayTarget.value = null;
+    chapterAutoNext.value = false;
     stopChapterAnimation();
+    syncCurrentChapterAnimationFromVideo();
     syncIntroPresentation();
   }
 
@@ -4928,6 +5449,18 @@ export function useMovieEditor() {
     timelineChapters
   );
 
+  function presentationFillScale(i: number) {
+    const ch = presentationNavChapters.value[i];
+    if (!ch || !duration.value) return 0;
+    if (currentTime.value >= ch.endTime) return 1;
+    if (currentTime.value > ch.startTime) return (currentTime.value - ch.startTime) / (ch.endTime - ch.startTime);
+    return 0;
+  }
+
+  function presentationChapterSegmentFlex(ch: Chapter) {
+    return chapterSegmentFlex(ch);
+  }
+
   function uploadVideo(file: File) {
     if (!currProj.value) return false;
     const url = URL.createObjectURL(file);
@@ -4949,16 +5482,18 @@ export function useMovieEditor() {
   function syncVideoElementSrc(src?: string) {
     const url = src || videoSrc.value;
     if (!url) return;
-    const resolvedUrl = isCoarsePointerDevice() ? withVideoPosterFragment(url) : url;
+    const presentation = viewOnly.value || isPreviewMode.value;
+    const resolvedUrl =
+      presentation && isCoarsePointerDevice() ? url : isCoarsePointerDevice() ? withVideoPosterFragment(url) : url;
     const apply = () => {
       if (!videoEl.value) return false;
-      videoEl.value.preload = "metadata";
+      videoEl.value.preload = presentation && isCoarsePointerDevice() ? "auto" : "metadata";
       videoEl.value.src = resolvedUrl;
       if (url.startsWith("http")) videoEl.value.setAttribute("crossorigin", "anonymous");
       videoEl.value.loop = isLooping.value;
       videoEl.value.playbackRate = playbackRate.value;
       syncVideoAudioState();
-      if (!isCoarsePointerDevice()) videoEl.value.load();
+      if (!isCoarsePointerDevice() || presentation) videoEl.value.load();
       return true;
     };
     if (apply()) return;
@@ -5090,6 +5625,14 @@ export function useMovieEditor() {
     syncVideoElementSrc(url);
   }
   function showPlaybackHint() {
+    if (!viewOnly.value && !isPreviewMode.value) {
+      showTransientPlaybackHint(500);
+      return;
+    }
+    showPresentationPlaybackHint();
+  }
+
+  function showTransientPlaybackHint(hideAfterMs = 500) {
     playbackHintVisible.value = true;
     playbackHintFading.value = false;
     if (playbackHintTimer) clearTimeout(playbackHintTimer);
@@ -5100,23 +5643,118 @@ export function useMovieEditor() {
         playbackHintVisible.value = false;
         playbackHintFading.value = false;
       }, 300);
-    }, 500);
+    }, hideAfterMs);
+  }
+
+  /** 展示/预览页：移动端需用户手动播放，提示保持可见直至开始播放 */
+  function showPresentationPlaybackHint() {
+    playbackHintVisible.value = true;
+    playbackHintFading.value = false;
+    if (playbackHintTimer) clearTimeout(playbackHintTimer);
+    if (playbackHintFadeTimer) clearTimeout(playbackHintFadeTimer);
+    if (isCoarsePointerDevice()) return;
+    playbackHintTimer = setTimeout(() => {
+      playbackHintFading.value = true;
+      playbackHintFadeTimer = setTimeout(() => {
+        playbackHintVisible.value = false;
+        playbackHintFading.value = false;
+      }, 300);
+    }, 2500);
+  }
+
+  function primePresentationVideoElement(video: HTMLVideoElement) {
+    if (video.readyState >= HTMLMediaElement.HAVE_METADATA) return;
+    try {
+      video.load();
+    } catch {
+      /* ignore */
+    }
+  }
+
+  function syncPresentationVideoTimeToChapter(video: HTMLVideoElement, chapter: Chapter) {
+    const navChapter = resolvePresentationNavChapter(chapter);
+    const target = navChapter.startTime;
+    if (isPresentationNavChapterAtTime(navChapter, video.currentTime)) return;
+    try {
+      video.currentTime = target;
+      currentTime.value = video.currentTime;
+    } catch {
+      /* ignore */
+    }
   }
 
   function togglePlay() {
-    if (!videoEl.value) return;
-    if (videoEl.value.paused) {
-      chapterPlayTarget.value = null;
-      videoEl.value.play().catch(() => {});
+    const video = videoEl.value;
+    if (!video) return;
+    if (video.paused) {
+      if (viewOnly.value || isPreviewMode.value) {
+        const navChapter =
+          getPresentationChapterAtVideoTime(video.currentTime) ??
+          (presentationUiChapterId.value
+            ? (() => {
+                const uiChapter = chapters.value.find(ch => ch.id === presentationUiChapterId.value);
+                return uiChapter ? resolvePresentationNavChapter(uiChapter) : null;
+              })()
+            : null) ??
+          resolvePresentationPlaybackChapter(video) ??
+          getPlaybackChapterAtTime(video.currentTime);
+        if (navChapter) {
+          const playable = resolvePlayableChapterForPresentation(navChapter);
+          chapterPlayTarget.value = playable;
+          syncPresentationUiFromChapter(navChapter);
+          chapterAutoNext.value = true;
+          syncPresentationVideoTimeToChapter(video, navChapter);
+          syncChapterVisualState(playable, getPresentationAnimElapsed(video, playable), {
+            skipOutlineRebuild: false,
+            skipOverlaySync: false
+          });
+          if (chapterNeedsOutlineRebuild(playable)) {
+            refreshChapterOutlines(playable);
+          }
+        }
+        primePresentationVideoElement(video);
+        presentationChapterCooldownUntil = performance.now() + 500;
+        void video
+          .play()
+          .then(() => {
+            stopChapterAnimation();
+            ensureVideoSyncedChapterAnimation();
+            syncCurrentChapterAnimationFromVideo();
+          })
+          .catch(() => {
+            void waitForVideoReady().then(ok => {
+              if (!ok || !videoEl.value) {
+                showPresentationPlaybackHint();
+                return;
+              }
+              void videoEl.value
+                .play()
+                .then(() => {
+                  stopChapterAnimation();
+                  ensureVideoSyncedChapterAnimation();
+                  syncCurrentChapterAnimationFromVideo();
+                })
+                .catch(() => showPresentationPlaybackHint());
+            });
+          });
+      } else {
+        chapterPlayTarget.value = null;
+        video.play().catch(() => {});
+      }
     } else {
-      chapterPlayTarget.value = null;
-      videoEl.value.pause();
+      video.pause();
+      if (!viewOnly.value && !isPreviewMode.value) {
+        chapterPlayTarget.value = null;
+      }
+      syncCurrentChapterAnimationFromVideo();
     }
     if (!viewOnly.value && !isPreviewMode.value) showPlaybackHint();
   }
 
   function onVideoPlay() {
     isPlaying.value = true;
+    playbackHintVisible.value = false;
+    playbackHintFading.value = false;
     const video = videoEl.value;
     const ch = video ? getPlaybackChapterAtTime(video.currentTime) : null;
     if (ch && chapterHasAnimation(ch)) {
@@ -6603,7 +7241,7 @@ export function useMovieEditor() {
     rebuildOutlineForObject(m, o, cfg);
   }
 
-  function seekTrack(e: MouseEvent) {
+  function seekTrack(e: MouseEvent | PointerEvent) {
     if (!trackEl.value || !videoEl.value || !duration.value || !hasChapters.value) return;
     const target = e.target as HTMLElement;
     const segEl = target.closest(".prog-seg");
@@ -6611,8 +7249,68 @@ export function useMovieEditor() {
 
     const r = trackEl.value.getBoundingClientRect();
     const t = ((e.clientX - r.left) / r.width) * duration.value;
-    const ch = chapterAtTime(t);
-    if (ch) void startChapterPlayback(ch, { syncVideo: true });
+    void seekToTimelineTime(t, { userGesture: true });
+  }
+
+  async function seekToTimelineTime(
+    time: number,
+    options?: { autoplay?: boolean; userGesture?: boolean }
+  ) {
+    const video = videoEl.value;
+    if (!video || !duration.value) return;
+
+    const target = clampVideoTime(time, video);
+    const wasPlaying = !video.paused;
+    const shouldPlay =
+      options?.autoplay ?? (options?.userGesture ? true : wasPlaying || (viewOnly.value || isPreviewMode.value));
+
+    if (viewOnly.value || isPreviewMode.value) {
+      const navChapterAtTarget = getPresentationChapterAtVideoTime(target);
+      if (navChapterAtTarget) {
+        await executeChapterPlayback(navChapterAtTarget, {
+          syncVideo: true,
+          autoplay: shouldPlay,
+          userGesture: options?.userGesture,
+          seekTime: target,
+          keepPlaying: wasPlaying
+        });
+        return;
+      }
+    }
+
+    const chapterAtTarget =
+      chapterAtTime(target) ?? resolveActiveChapterAtTime(chapters.value, target);
+    if (chapterAtTarget) {
+      const resolved = resolveChapter(chapterAtTarget);
+      if (resolved) {
+        await executeChapterPlayback(resolved.chapter, {
+          syncVideo: true,
+          autoplay: shouldPlay,
+          userGesture: options?.userGesture,
+          seekTime: target,
+          keepPlaying: wasPlaying
+        });
+        return;
+      }
+    }
+
+    stopChapterAnimation();
+    chapterPlayTarget.value = null;
+    await seekVideoTo(target, { pause: !shouldPlay });
+    currentTime.value = video.currentTime;
+    const playback = getPlaybackChapterAtTime(video.currentTime);
+    if (playback) {
+      syncPresentationUiFromChapter(playback);
+      syncCurrentChapterAnimationFromVideo();
+    }
+    if (shouldPlay) {
+      try {
+        await video.play();
+        ensureVideoSyncedChapterAnimation();
+      } catch {
+        if (viewOnly.value || isPreviewMode.value) showPresentationPlaybackHint();
+      }
+    }
   }
 
   async function waitForVideoReady(timeoutMs = 12000): Promise<boolean> {
@@ -6730,6 +7428,9 @@ export function useMovieEditor() {
   function resetEditPlaybackBeforePresentation() {
     stopChapterAnimation();
     chapterPlayTarget.value = null;
+    presentationUiChapterId.value = null;
+    presentationNavIndex.value = -1;
+    lastPresentationAutoSwitchChapterId = null;
     chapterAutoNext.value = false;
     totalPlaying.value = false;
     if (videoEl.value) videoEl.value.pause();
@@ -6746,130 +7447,296 @@ export function useMovieEditor() {
     if (videoEl.value && videoSrc.value) {
       await waitForVideoReady();
     }
-    await startChapterPlayback(startChapter, {
-      syncVideo: true,
-      autoplay: options?.autoplay ?? true
-    });
-    // 展示页首帧兜底：确保首节点动画在首次进入时已对齐到起点
-    syncCurrentChapterAnimationFromVideo();
+
+    const resolved = resolveChapter(resolvePlayableChapterForPresentation(startChapter));
+    if (!resolved) return;
+
+    const { chapter: startResolvedChapter, idx } = resolved;
+    const autoplay = options?.autoplay ?? !isCoarsePointerDevice();
+
+    presentationChapterTransition = true;
+    videoChapterSyncPaused = true;
+    try {
+      stopChapterAnimation();
+      navigateToChapter(startResolvedChapter, idx, {
+        seek: false,
+        cameraMode: "playback",
+        visualElapsed: 0,
+        holdCurrentTime: true
+      });
+      prepareChapterForPreviewPlayback(startResolvedChapter);
+      syncPresentationUiFromChapter(startResolvedChapter);
+      currentTime.value = startResolvedChapter.startTime;
+
+      const video = videoEl.value;
+      if (video) {
+        video.pause();
+        const seekOk = await seekVideoTo(startResolvedChapter.startTime, { pause: true });
+        if (seekOk) {
+          chapterPlayTarget.value = startResolvedChapter;
+          currentTime.value = video.currentTime;
+          syncChapterVisualState(startResolvedChapter, 0, { skipOutlineRebuild: false, skipOverlaySync: false });
+          if (chapterNeedsOutlineRebuild(startResolvedChapter)) {
+            refreshChapterOutlines(startResolvedChapter);
+          }
+        } else {
+          chapterPlayTarget.value = startResolvedChapter;
+          currentTime.value = startResolvedChapter.startTime;
+          debugViewPlayback("beginPresentation:seek-failed", {
+            chapterId: startResolvedChapter.id,
+            target: startResolvedChapter.startTime,
+            currentTime: video.currentTime
+          });
+        }
+      } else {
+        chapterPlayTarget.value = startResolvedChapter;
+        currentTime.value = startResolvedChapter.startTime;
+      }
+
+      if (!autoplay) {
+        showPresentationPlaybackHint();
+        return;
+      }
+
+      if (!video) return;
+      try {
+        await video.play();
+        if (!chapterPlayTarget.value) {
+          chapterPlayTarget.value = startResolvedChapter;
+        }
+        ensureVideoSyncedChapterAnimation();
+        syncCurrentChapterAnimationFromVideo();
+      } catch {
+        showPresentationPlaybackHint();
+      }
+    } finally {
+      presentationChapterTransition = false;
+      videoChapterSyncPaused = false;
+      presentationChapterCooldownUntil = performance.now() + 500;
+    }
   }
 
   async function startChapterPlayback(
     ch: Chapter,
-    options?: { autoplay?: boolean; syncVideo?: boolean }
+    options?: {
+      autoplay?: boolean;
+      syncVideo?: boolean;
+      userGesture?: boolean;
+      seekTime?: number;
+      keepPlaying?: boolean;
+    }
+  ): Promise<void> {
+    return executeChapterPlayback(ch, options);
+  }
+
+  async function executeChapterPlayback(
+    ch: Chapter,
+    options?: {
+      autoplay?: boolean;
+      syncVideo?: boolean;
+      userGesture?: boolean;
+      seekTime?: number;
+      keepPlaying?: boolean;
+    }
   ): Promise<void> {
     const syncVideo = options?.syncVideo ?? false;
-    const chapterCandidate =
-      syncVideo && (viewOnly.value || isPreviewMode.value) ? resolvePlayableChapterForPresentation(ch) : ch;
-    const resolved = resolveChapter(chapterCandidate);
-    if (!resolved) return;
+    const navChapter =
+      syncVideo && (viewOnly.value || isPreviewMode.value) ? resolvePresentationNavChapter(ch) : ch;
+    const playableChapter =
+      syncVideo && (viewOnly.value || isPreviewMode.value)
+        ? resolvePlayableChapterForPresentation(navChapter)
+        : navChapter;
+    const navResolved = resolveChapter(navChapter);
+    const playableResolved = resolveChapter(playableChapter);
+    if (!navResolved || !playableResolved) return;
 
-    const { chapter, idx } = resolved;
+    const { chapter: navCh, idx: navIdx } = navResolved;
+    const { chapter: playableCh } = playableResolved;
+
+    if (viewOnly.value || isPreviewMode.value) {
+      syncPresentationUiFromChapter(navChapter);
+    }
 
     if (!syncVideo) {
-      if (selectedChapterId.value !== chapter.id) {
-        navigateToChapter(chapter, idx, {
+      if (selectedChapterId.value !== playableCh.id) {
+        navigateToChapter(playableCh, navIdx, {
           seek: false,
           previewAnimation: true,
           cameraMode: "playback",
           visualElapsed: 0
         });
       } else {
-        restartChapterPreviewPlayback(chapter);
+        restartChapterPreviewPlayback(playableCh);
       }
       return;
     }
 
-    const autoplay = options?.autoplay ?? !isCoarsePointerDevice();
-    debugViewPlayback("startChapterPlayback:begin", {
-      clickedChapterId: ch.id,
-      clickedChapterName: ch.name,
-      resolvedChapterId: chapter.id,
-      resolvedChapterName: chapter.name,
-      syncVideo,
-      autoplay,
-      chapterHasAnimation: chapterHasAnimation(chapter),
-      chapterAnimTargets: getChapterAnimTargetsCached(chapter).length
-    });
     if (!viewOnly.value && !isPreviewMode.value) {
-      persistActiveChapterDrafts(chapter);
+      persistActiveChapterDrafts(playableCh);
     }
 
     const video = videoEl.value;
-    const target = chapter.startTime;
+    const autoplay =
+      options?.autoplay ?? (options?.userGesture ? true : !isCoarsePointerDevice());
+    const keepPlaying = !!(options?.keepPlaying && video && !video.paused && !video.ended);
+    debugViewPlayback("startChapterPlayback:begin", {
+      clickedChapterId: ch.id,
+      clickedChapterName: ch.name,
+      navChapterId: navCh.id,
+      navChapterName: navCh.name,
+      resolvedChapterId: playableCh.id,
+      resolvedChapterName: playableCh.name,
+      syncVideo,
+      autoplay,
+      keepPlaying,
+      userGesture: !!options?.userGesture,
+      chapterHasAnimation: chapterHasAnimation(playableCh),
+      chapterAnimTargets: getChapterAnimTargetsCached(playableCh).length
+    });
+
+    let target =
+      options?.seekTime ??
+      (syncVideo && (viewOnly.value || isPreviewMode.value) ? navCh.startTime : playableCh.startTime);
+    if (syncVideo && (viewOnly.value || isPreviewMode.value)) {
+      target = Math.max(
+        navCh.startTime,
+        Math.min(target, navCh.endTime - CHAPTER_END_EPS)
+      );
+    }
+    const visualElapsed = Math.max(0, target - playableCh.startTime);
     const needsSeek = !!(video && Math.abs(video.currentTime - target) >= CHAPTER_TIME_EPS);
     const playbackReq = ++chapterPlaybackRequestSeq;
+    ++seekGeneration;
 
     presentationChapterTransition = true;
-    try {
-      if (video) {
-        video.pause();
-        chapterPlayTarget.value = null;
-        chapterAutoNext.value = true;
-        if (!needsSeek) currentTime.value = video.currentTime;
-      } else {
-        currentTime.value = target;
-        chapterAutoNext.value = true;
-      }
+    videoChapterSyncPaused = true;
+    chapterAutoNext.value = true;
 
-      navigateToChapter(chapter, idx, {
+    try {
+      stopChapterAnimation();
+      chapterPlayTarget.value = playableCh;
+      syncPresentationUiFromChapter(navCh);
+
+      navigateToChapter(navCh, navIdx, {
         seek: false,
         cameraMode: "playback",
-        visualElapsed: 0
+        visualElapsed,
+        holdCurrentTime: true
       });
+      if (viewOnly.value || isPreviewMode.value) {
+        applyChapterCameraForNav(navCh, "playback");
+      }
+      syncChapterVisualState(playableCh, visualElapsed, {
+        skipOutlineRebuild: false,
+        skipOverlaySync: false
+      });
+      if (chapterNeedsOutlineRebuild(playableCh)) {
+        refreshChapterOutlines(playableCh);
+      }
+      if (visualElapsed <= CHAPTER_TIME_EPS) {
+        prepareChapterForPreviewPlayback(playableCh);
+      } else {
+        invalidateChapterAnimTargetsCache(playableCh.id);
+      }
       if (playbackReq !== chapterPlaybackRequestSeq) return;
 
-      if (viewOnly.value || isPreviewMode.value) {
-        prepareChapterForPreviewPlayback(chapter);
-        debugViewPlayback("startChapterPlayback:prepared-preview-playback", {
-          chapterId: chapter.id,
-          chapterName: chapter.name,
-          chapterHasAnimation: chapterHasAnimation(chapter),
-          chapterAnimTargets: getChapterAnimTargetsCached(chapter).length
-        });
-      }
-
       if (!video) {
-        if (chapterHasAnimation(chapter)) {
-          runChapterAnimationWallclock(chapter);
+        chapterPlayTarget.value = playableCh;
+        syncPresentationUiFromChapter(navCh);
+        currentTime.value = target;
+        if (chapterHasAnimation(playableCh)) {
+          runChapterAnimationWallclock(playableCh);
         }
         return;
       }
 
+      if (!keepPlaying && !autoplay) {
+        video.pause();
+      }
+
+      let seekOk = true;
       if (needsSeek) {
-        await seekVideoTo(target);
+        const pauseDuringSeek = !(autoplay || keepPlaying);
+        seekOk = await seekVideoTo(target, { pause: pauseDuringSeek });
         if (playbackReq !== chapterPlaybackRequestSeq) return;
-        if (selectedChapterId.value !== chapter.id && chapterPlayTarget.value?.id !== chapter.id) return;
         debugViewPlayback("startChapterPlayback:seek-complete", {
-          chapterId: chapter.id,
+          chapterId: playableCh.id,
+          navChapterId: navCh.id,
+          target,
+          currentTime: video.currentTime,
+          seekOk
+        });
+      } else if (!autoplay && !keepPlaying) {
+        video.pause();
+      }
+
+      if (!seekOk) {
+        debugViewPlayback("startChapterPlayback:seek-abort", {
+          chapterId: playableCh.id,
+          navChapterId: navCh.id,
           target,
           currentTime: video.currentTime
         });
+        chapterPlayTarget.value = playableCh;
+        syncPresentationUiFromChapter(navCh);
+        currentTime.value =
+          Math.abs(video.currentTime - target) < CHAPTER_TIME_EPS ? video.currentTime : target;
+        syncChapterVisualState(playableCh, Math.max(0, currentTime.value - playableCh.startTime), {
+          skipOutlineRebuild: false,
+          skipOverlaySync: false
+        });
+        if (chapterNeedsOutlineRebuild(playableCh)) {
+          refreshChapterOutlines(playableCh);
+        }
+        if (!keepPlaying) {
+          video.pause();
+          showPresentationPlaybackHint();
+        }
+        return;
       }
+
+      chapterPlayTarget.value = playableCh;
+      syncPresentationUiFromChapter(navCh);
       currentTime.value = video.currentTime;
-      chapterPlayTarget.value = chapter;
+      const actualElapsed = Math.max(0, video.currentTime - playableCh.startTime);
+      syncChapterVisualState(playableCh, actualElapsed, {
+        skipOutlineRebuild: false,
+        skipOverlaySync: false
+      });
+      if (chapterNeedsOutlineRebuild(playableCh)) {
+        refreshChapterOutlines(playableCh);
+      }
 
       if (!autoplay) {
-        video.pause();
-        syncCurrentChapterAnimationFromVideo();
+        if (viewOnly.value || isPreviewMode.value) {
+          showPresentationPlaybackHint();
+        }
         return;
       }
 
       try {
-        await video.play();
+        if (video.paused) {
+          await video.play().catch(() => undefined);
+        }
         if (playbackReq !== chapterPlaybackRequestSeq) return;
+        stopChapterAnimation();
         ensureVideoSyncedChapterAnimation();
         syncCurrentChapterAnimationFromVideo();
         debugViewPlayback("startChapterPlayback:play-success", {
-          chapterId: chapter.id,
+          chapterId: playableCh.id,
+          navChapterId: navCh.id,
           currentTime: video.currentTime,
           chapterPlayTargetId: chapterPlayTarget.value?.id ?? null
         });
       } catch {
         if (playbackReq !== chapterPlaybackRequestSeq) return;
         syncCurrentChapterAnimationFromVideo();
+        if (viewOnly.value || isPreviewMode.value) {
+          showPresentationPlaybackHint();
+        }
         debugViewPlayback("startChapterPlayback:play-rejected", {
-          chapterId: chapter.id,
+          chapterId: playableCh.id,
+          navChapterId: navCh.id,
           currentTime: video.currentTime,
           chapterPlayTargetId: chapterPlayTarget.value?.id ?? null
         });
@@ -6877,16 +7744,59 @@ export function useMovieEditor() {
     } finally {
       if (playbackReq === chapterPlaybackRequestSeq) {
         presentationChapterTransition = false;
+        videoChapterSyncPaused = false;
+        presentationChapterCooldownUntil = performance.now() + 450;
+        const activeVideo = videoEl.value;
+        if (activeVideo && Math.abs(activeVideo.currentTime - target) < CHAPTER_TIME_EPS) {
+          currentTime.value = activeVideo.currentTime;
+        }
+        if (chapterPlayTarget.value) {
+          lastPresentationAutoSwitchChapterId = chapterPlayTarget.value.id;
+        }
       }
     }
   }
 
-  function jumpToChapter(ch: Chapter) {
-    void startChapterPlayback(ch, { syncVideo: true });
+  function jumpToChapter(ch: Chapter, seekTime?: number) {
+    const video = videoEl.value;
+    const wasPlaying = !!(video && !video.paused);
+    const navChapter =
+      viewOnly.value || isPreviewMode.value ? resolvePresentationNavChapter(ch) : ch;
+    let targetTime = seekTime ?? navChapter.startTime;
+    if (viewOnly.value || isPreviewMode.value) {
+      targetTime = Math.max(
+        navChapter.startTime,
+        Math.min(targetTime, navChapter.endTime - CHAPTER_END_EPS)
+      );
+    }
+    void startChapterPlayback(ch, {
+      syncVideo: true,
+      autoplay: wasPlaying || true,
+      userGesture: true,
+      keepPlaying: wasPlaying,
+      seekTime: targetTime
+    });
   }
 
   function prevCh() {
     if (!videoEl.value || !hasChapters.value) return;
+    if (viewOnly.value || isPreviewMode.value) {
+      const nav = getPresentationNavChapters();
+      if (nav.length <= 1) return;
+      const ci = getActivePresentationNavIndex();
+      if (ci <= 0) return;
+      const targetChapter = nav[ci - 1];
+      const wasPlaying = !videoEl.value.paused;
+      void startChapterPlayback(targetChapter, {
+        syncVideo: true,
+        autoplay: wasPlaying || true,
+        userGesture: true,
+        keepPlaying: wasPlaying,
+        seekTime: targetChapter.startTime
+      });
+      return;
+    }
+
     const t = videoEl.value.currentTime;
     const ci = findChIdx(t);
     let prevIdx = -1;
@@ -6901,17 +7811,33 @@ export function useMovieEditor() {
       }
     }
     if (prevIdx >= 0) {
-      void startChapterPlayback(timelineChapters.value[prevIdx], { syncVideo: true });
-    } else if (timelineChapters.value.length > 0) {
-      void startChapterPlayback(timelineChapters.value[0], { syncVideo: true });
-    } else {
-      videoEl.value.currentTime = 0;
-      currentTime.value = 0;
+      void startChapterPlayback(timelineChapters.value[prevIdx], {
+        syncVideo: true,
+        autoplay: true,
+        userGesture: true
+      });
     }
   }
 
   function nextCh() {
     if (!videoEl.value || !hasChapters.value) return;
+    if (viewOnly.value || isPreviewMode.value) {
+      const nav = getPresentationNavChapters();
+      if (nav.length <= 1) return;
+      const ci = getActivePresentationNavIndex();
+      if (ci < 0 || ci >= nav.length - 1) return;
+      const targetChapter = nav[ci + 1];
+      const wasPlaying = !videoEl.value.paused;
+      void startChapterPlayback(targetChapter, {
+        syncVideo: true,
+        autoplay: wasPlaying || true,
+        userGesture: true,
+        keepPlaying: wasPlaying,
+        seekTime: targetChapter.startTime
+      });
+      return;
+    }
+
     const t = videoEl.value.currentTime;
     const ci = findChIdx(t);
     let nextIdx = -1;
@@ -6921,7 +7847,11 @@ export function useMovieEditor() {
       nextIdx = timelineChapters.value.findIndex(c => c.startTime > t + CHAPTER_TIME_EPS);
     }
     if (nextIdx < 0) return;
-    void startChapterPlayback(timelineChapters.value[nextIdx], { syncVideo: true });
+    void startChapterPlayback(timelineChapters.value[nextIdx], {
+      syncVideo: true,
+      autoplay: true,
+      userGesture: true
+    });
   }
 
   function toggleLoop() {
@@ -7355,7 +8285,7 @@ export function useMovieEditor() {
       shareLink.value = sceneData.previewUrl
         ? rewireEditorFrontendHost(sceneData.previewUrl)
         : buildShareLink(sceneData.code || code);
-      proj.videoSrc = sceneData.videoSrc ? rewireEditorServerHost(sceneData.videoSrc) : null;
+      proj.videoSrc = sceneData.videoSrc ? resolveAssetUrl(sceneData.videoSrc) : null;
       proj.videoDuration = sceneData.videoDuration || 0;
       proj.videoWidth = sceneData.videoWidth || 0;
       proj.videoHeight = sceneData.videoHeight || 0;
@@ -7530,9 +8460,9 @@ export function useMovieEditor() {
         const b = await r.blob();
         const ext = (b.type.split("/")[1] || "mp4").replace(/[^a-z0-9]/gi, "").toLowerCase();
         const uploaded = await uploadSceneVideo(new File([b], `scene-video.${ext}`, { type: b.type || "video/mp4" }));
-        currProj.value.videoSrc = uploaded.url;
-        payload.videoSrc = uploaded.url;
-        syncVideoElementSrc(uploaded.url);
+        payload.videoSrc = uploaded.path || uploaded.url;
+        currProj.value.videoSrc = resolveAssetUrl(payload.videoSrc);
+        syncVideoElementSrc(currProj.value.videoSrc);
       }
       const result = sceneCode.value ? await updateSceneOnBackend(sceneCode.value, payload) : await saveSceneToBackend(payload);
       sceneCode.value = result.code;
@@ -7635,6 +8565,7 @@ export function useMovieEditor() {
       previewAnimation?: boolean;
       cameraMode?: ChapterCameraSwitchMode;
       visualElapsed?: number;
+      holdCurrentTime?: boolean;
     }
   ) {
     const prevChapter = getActiveChapter();
@@ -7664,7 +8595,9 @@ export function useMovieEditor() {
 
     selectedChapterId.value = chapter.id;
     playingIdx.value = idx;
-    currentTime.value = chapter.startTime;
+    if (!options?.holdCurrentTime) {
+      currentTime.value = chapter.startTime;
+    }
     applyChapterCameraForNav(chapter, cameraMode);
     resetLiveAnimEditorBuffers();
     if (!prevChapter || prevChapter.id !== chapter.id) {
@@ -7759,8 +8692,8 @@ export function useMovieEditor() {
     }
     resetLiveAnimEditorBuffers();
     applyChapterModelState(ch, 0, {
-      skipOutlineRebuild: true,
-      skipOverlaySync: true,
+      skipOutlineRebuild: false,
+      skipOverlaySync: false,
       forceElapsed: 0
     });
     invalidateChapterAnimTargetsCache(ch.id);
@@ -7776,8 +8709,8 @@ export function useMovieEditor() {
     if (videoEl.value) videoEl.value.pause();
 
     applyChapterModelState(ch, 0, {
-      skipOutlineRebuild: true,
-      skipOverlaySync: true,
+      skipOutlineRebuild: false,
+      skipOverlaySync: false,
       forceElapsed: 0
     });
     getChapterAnimTargetsCached(ch);
@@ -7801,13 +8734,9 @@ export function useMovieEditor() {
   function syncCurrentChapterAnimationFromVideo() {
     const video = videoEl.value;
     if (!video) return;
-    const playTarget = chapterPlayTarget.value;
-    const ch =
-      playTarget && isChapterInPlaybackRange(playTarget, video.currentTime)
-        ? playTarget
-        : getPlaybackChapterAtTime(video.currentTime);
+    const ch = resolvePresentationPlaybackChapter(video);
     if (!ch) return;
-    applyChapterAnimOnly(ch, getChapterAnimElapsed(ch, video.currentTime));
+    applyChapterAnimOnly(ch, getPresentationAnimElapsed(video, ch));
   }
 
   function applyChapterAnimationAtElapsed(ch: Chapter, elapsedSec: number) {
@@ -7822,15 +8751,11 @@ export function useMovieEditor() {
   function ensureVideoSyncedChapterAnimation() {
     const video = videoEl.value;
     if (!video || video.paused) return false;
-    const playTarget = chapterPlayTarget.value;
-    const activeCh =
-      playTarget && isChapterInPlaybackRange(playTarget, video.currentTime)
-        ? playTarget
-        : getPlaybackChapterAtTime(video.currentTime);
+    const activeCh = resolvePresentationPlaybackChapter(video);
     if (!activeCh || !chapterHasAnimation(activeCh)) {
       debugViewPlayback("ensureVideoSyncedChapterAnimation:skip", {
         currentTime: video.currentTime,
-        playTargetId: playTarget?.id ?? null,
+        playTargetId: chapterPlayTarget.value?.id ?? null,
         activeChapterId: activeCh?.id ?? null,
         activeHasAnimation: !!activeCh && chapterHasAnimation(activeCh)
       });
@@ -7869,8 +8794,8 @@ export function useMovieEditor() {
     chAnimWallclockMaxDur = getChapterAnimDuration(ch);
     totalPlaying.value = false;
     applyChapterModelState(ch, 0, {
-      skipOutlineRebuild: true,
-      skipOverlaySync: true,
+      skipOutlineRebuild: false,
+      skipOverlaySync: false,
       forceElapsed: 0
     });
     refreshActiveHighlightOutline();
@@ -9107,10 +10032,13 @@ export function useMovieEditor() {
     resetEditPlaybackBeforePresentation();
     isPreviewMode.value = true;
     syncEditorGizmosVisibility();
+    syncPresentationInteractionMode();
     syncVideoAudioState();
     syncPresentationRenderProfile();
 
-    void beginPresentationPlayback(getPresentationStartChapter(), { autoplay: true });
+    void beginPresentationPlayback(getPresentationStartChapter(), {
+      autoplay: !isCoarsePointerDevice()
+    });
 
     nextTick(() => {
       handleResize();
@@ -9123,6 +10051,9 @@ export function useMovieEditor() {
 
     isPreviewMode.value = false;
     chapterPlayTarget.value = null;
+    presentationUiChapterId.value = null;
+    presentationNavIndex.value = -1;
+    lastPresentationAutoSwitchChapterId = null;
     chapterAutoNext.value = false;
     stopChapterAnimation();
 
@@ -9134,6 +10065,7 @@ export function useMovieEditor() {
     currentTime.value = ch?.startTime ?? 0;
 
     syncEditorGizmosVisibility();
+    syncPresentationInteractionMode();
     syncVideoAudioState();
     syncPresentationRenderProfile();
 
@@ -9275,12 +10207,15 @@ export function useMovieEditor() {
       }
       viewCameraBaseFov = camera?.fov ?? null;
       syncPresentationRenderProfile();
+      syncPresentationInteractionMode();
       adaptPresentationViewport();
       routeGateLoading.value = false;
       handleResize();
       window.addEventListener("resize", handleResize);
       if (timelineChapters.value.length > 0) {
-        void beginPresentationPlayback(getPresentationStartChapter(), { autoplay: true });
+        void beginPresentationPlayback(getPresentationStartChapter(), {
+          autoplay: !isCoarsePointerDevice()
+        });
       }
       return;
     }
@@ -9604,6 +10539,9 @@ export function useMovieEditor() {
     hasChapters,
     canAddChapter,
     currentChapterIdx,
+    presentationNavChapterCount,
+    presentationNavChapters,
+    presentationTimelineChapterIdx,
     videoSrc,
     videoWidth,
     videoHeight,
@@ -9623,6 +10561,8 @@ export function useMovieEditor() {
     fmt,
     pct,
     fillScale,
+    presentationFillScale,
+    presentationChapterSegmentFlex,
     chapterFillPct,
     chapterListFillPct,
     chapterSegmentFlex,
@@ -9650,6 +10590,7 @@ export function useMovieEditor() {
     seekTrack,
     jumpToChapter,
     startChapterPlayback,
+    waitForVideoReady,
     prevCh,
     nextCh,
     toggleLoop,
@@ -9664,6 +10605,13 @@ export function useMovieEditor() {
     isChapterPlaying,
     isChapterListActive,
     getActiveChapterIdForUi,
+    isPresentationTimelineSegmentCurrent,
+    presentationUiChapterId,
+    presentationNavIndex,
+    canPresentationPrevChapter,
+    canPresentationNextChapter,
+    getPresentationNavChapters,
+    resolvePresentationNavChapter,
     chCmd,
     saveChF,
     saveChapterFull,

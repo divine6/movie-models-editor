@@ -14,7 +14,11 @@
         class="viewport-play-hint"
         :class="{ 'is-fading': editor.playbackHintFading }"
       >
-        <el-icon class="viewport-play-hint-icon" title="点击播放/暂停" @click.stop="editor.togglePlay">
+        <el-icon
+          class="viewport-play-hint-icon"
+          title="点击播放/暂停"
+          @click.stop="editor.togglePlay"
+        >
           <VideoPause v-if="editor.isPlaying" />
           <VideoPlay v-else />
         </el-icon>
@@ -31,7 +35,7 @@
         </div>
       </div>
 
-      <editor-viewport-preview-nav v-if="editor.isPreviewMode && editor.sortedChapters.length > 1" />
+      <editor-viewport-preview-nav v-if="(editor.isPreviewMode || editor.viewOnly) && editor.presentationNavChapterCount > 1" />
 
       <editor-video-pip v-if="editor.hasVideo" />
     </div>

@@ -1,0 +1,25 @@
+# 构建上下文为 saas3.0 根目录时使用（由 docker-build 脚本复制到上下文根）
+
+**/node_modules
+**/.git
+**/.gitignore
+**/dist
+**/dist-*
+**/*.log
+**/.DS_Store
+**/.vscode
+**/.idea
+**/test-results
+**/e2e/screenshots
+**/__MACOSX
+**/*.rar
+**/*.zip
+
+movie-models-editor/.env.development.*
+movie-models-editor/.env.test.*
+movie-models-editor/.env.production.*
+movie-models-editor/.env.local
+
+movie-models-server/storage/uploads/**
+movie-models-server/storage/data/**
+movie-models-server/.env

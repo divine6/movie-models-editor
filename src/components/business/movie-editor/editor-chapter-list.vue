@@ -64,7 +64,7 @@
                   </el-button>
                 </el-tooltip>
                 <el-tooltip :content="$t('OpWeb.Common.Play', '播放')" placement="top">
-                  <el-button text type="primary" @click="editor.startChapterPlayback(item.chapter, { autoplay: true, syncVideo: true })">
+                  <el-button text type="primary" @click="onChapterPlay(item.chapter)">
                     <el-icon><VideoPlay /></el-icon>
                   </el-button>
                 </el-tooltip>
@@ -133,8 +133,24 @@ const onAddChapter = () => {
 };
 
 const onPreviewChapterPlay = (chapter: Chapter) => {
-  void editor.startChapterPlayback(chapter, { autoplay: true, syncVideo: true });
+  const wasPlaying = !!editor.videoEl && !editor.videoEl.paused;
+  void editor.startChapterPlayback(chapter, {
+    autoplay: true,
+    syncVideo: true,
+    userGesture: true,
+    keepPlaying: wasPlaying
+  });
   hideChapterDrawer();
+};
+
+const onChapterPlay = (chapter: Chapter) => {
+  const wasPlaying = !!editor.videoEl && !editor.videoEl.paused;
+  void editor.startChapterPlayback(chapter, {
+    autoplay: true,
+    syncVideo: true,
+    userGesture: true,
+    keepPlaying: wasPlaying
+  });
 };
 
 watch(

@@ -3,18 +3,18 @@
     <div :ref="editor.bindRef('trackEl')" class="progress-track progress-track--chapters" @click="editor.seekTrack">
       <div class="prog-segs">
         <div
-          v-for="(ch, i) in editor.timelineChapters"
+          v-for="(ch, i) in progressSegments"
           :key="ch.id"
           class="prog-seg-wrap"
-          :style="{ flex: `${editor.chapterSegmentFlex(ch)} 1 0%` }"
+          :style="{ flex: `${segmentFlex(ch)} 1 0%` }"
         >
           <el-tooltip :content="ch.name" placement="top" :show-after="200">
             <div
               class="prog-seg"
-              :class="{ 'is-current': editor.currentChapterIdx === i }"
-              @click.stop="editor.jumpToChapter(ch)"
+              :class="{ 'is-current': editor.isPresentationTimelineSegmentCurrent(i) }"
+              @click.stop="onSegmentClick(ch, $event)"
             >
-              <div class="prog-seg-fill" :style="{ transform: `scaleX(${editor.fillScale(i)})` }" />
+              <div class="prog-seg-fill" :style="{ transform: `scaleX(${segmentFillScale(i)})` }" />
             </div>
           </el-tooltip>
         </div>
@@ -23,7 +23,7 @@
     </div>
     <div class="progress-meta">
       <div class="progress-meta-left">
-        <button class="progress-ctrl-btn" type="button" :title="editor.isPlaying ? '暂停' : '播放'" @click="editor.togglePlay">
+        <button class="progress-ctrl-btn" type="button" :title="editor.isPlaying ? '暂停' : '播放'" @click.stop="editor.togglePlay">
           <svg
             v-if="editor.isPlaying"
             width="12"
@@ -81,12 +81,45 @@
 import { computed } from "vue";
 
 import { useMovieEditorContext } from "@/composables/useMovieEditorContext";
+import type { Chapter } from "@/interface/project";
 
 const editor = useMovieEditorContext();
 
+const usePresentationSegments = computed(() => editor.viewOnly || editor.isPreviewMode);
+
+const progressSegments = computed(() =>
+  usePresentationSegments.value ? editor.presentationNavChapters : editor.timelineChapters
+);
+
+function segmentFlex(ch: Chapter) {
+  return usePresentationSegments.value
+    ? editor.presentationChapterSegmentFlex(ch)
+    : editor.chapterSegmentFlex(ch);
+}
+
+function segmentFillScale(i: number) {
+  return usePresentationSegments.value ? editor.presentationFillScale(i) : editor.fillScale(i);
+}
+
 const activeChapterLabel = computed(() => {
+  const activeId = editor.getActiveChapterIdForUi();
+  if (activeId) {
+    return editor.chapters.find(ch => ch.id === activeId)?.name ?? "";
+  }
   const idx = editor.currentChapterIdx;
-  if (idx >= 0) return editor.sortedChapters[idx]?.name ?? "";
-  return editor.sortedChapters[0]?.name ?? "";
+  if (idx >= 0) return editor.timelineChapters[idx]?.name ?? "";
+  return editor.timelineChapters[0]?.name ?? "";
 });
+
+function onSegmentClick(ch: Chapter, e: MouseEvent) {
+  const el = e.currentTarget as HTMLElement;
+  const rect = el.getBoundingClientRect();
+  if (!rect.width) {
+    editor.jumpToChapter(ch);
+    return;
+  }
+  const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+  const seekTime = ch.startTime + ratio * (ch.endTime - ch.startTime);
+  editor.jumpToChapter(ch, seekTime);
+}
 </script>

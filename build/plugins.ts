@@ -63,7 +63,7 @@ export const createVitePlugins = (viteEnv: ViteEnv): (PluginOption | PluginOptio
       ]
     }),
     // vitePWA - 强制启用 PWA
-    VITE_PWA && createVitePwa(viteEnv),
+    VITE_PWA ? createVitePwa(viteEnv) : createPwaRegisterStub(),
     // 是否生成包预览，分析依赖包大小做优化处理
     VITE_REPORT && (visualizer({ filename: "stats.html", gzipSize: true, brotliSize: true }) as PluginOption),
     // 自动 IDE 并将光标定位到 DOM 对应的源代码位置。see: https://inspector.fe-dev.cn/guide/start.html
@@ -102,6 +102,21 @@ const createCompression = (viteEnv: ViteEnv): PluginOption | PluginOption[] => {
   }
   return plugins;
 };
+
+/**
+ * PWA 关闭时提供 virtual:pwa-register 占位，避免构建失败
+ */
+const createPwaRegisterStub = (): PluginOption => ({
+  name: "pwa-register-stub",
+  resolveId(id) {
+    if (id === "virtual:pwa-register") return id;
+  },
+  load(id) {
+    if (id === "virtual:pwa-register") {
+      return "export function registerSW() { return async () => {}; }";
+    }
+  }
+});
 
 /**
  * @description VitePwa

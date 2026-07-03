@@ -17,7 +17,7 @@
         :ref="editor.bindRef('videoEl')"
         :src="editor.videoSrc"
         :muted="false"
-        preload="metadata"
+        preload="auto"
         playsinline
         @loadstart="onVideoLoadStart"
         @loadedmetadata="onVideoLoadedMetadata"
@@ -143,7 +143,7 @@ function onVideoLoadError() {
 }
 
 function onVideoWaiting() {
-  if (isMobile.value && !editor.isPlaying) return;
+  if (isMobile.value && !editor.isPlaying && !videoLoading.value) return;
   videoLoading.value = true;
 }
 

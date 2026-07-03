@@ -1,11 +1,11 @@
 <template>
-  <div class="viewport-preview-nav" @click.stop>
+  <div class="viewport-preview-nav" @click.stop @pointerdown.stop>
     <button
       class="viewport-preview-nav-btn viewport-preview-nav-btn--prev"
       type="button"
       title="上一章"
       :disabled="!canPrev"
-      @click="editor.prevCh()"
+      @click.stop="onPrev"
     >
       <svg
         class="viewport-preview-nav-btn__icon"
@@ -27,7 +27,7 @@
       type="button"
       title="下一章"
       :disabled="!canNext"
-      @click="editor.nextCh()"
+      @click.stop="onNext"
     >
       <svg
         class="viewport-preview-nav-btn__icon"
@@ -55,14 +55,32 @@ import { useMovieEditorContext } from "@/composables/useMovieEditorContext";
 const editor = useMovieEditorContext();
 
 const canPrev = computed(() => {
-  if (!editor.isPreviewMode || editor.sortedChapters.length <= 1) return false;
-  return editor.currentChapterIdx !== 0;
+  if (!editor.isPreviewMode && !editor.viewOnly) return false;
+  void editor.currentTime;
+  void editor.isPlaying;
+  void editor.presentationUiChapterId;
+  void editor.presentationNavIndex;
+  void editor.presentationTimelineChapterIdx;
+  return editor.canPresentationPrevChapter();
 });
 
 const canNext = computed(() => {
-  if (!editor.isPreviewMode || editor.sortedChapters.length <= 1) return false;
-  const idx = editor.currentChapterIdx;
-  if (idx < 0) return true;
-  return idx < editor.sortedChapters.length - 1;
+  if (!editor.isPreviewMode && !editor.viewOnly) return false;
+  void editor.currentTime;
+  void editor.isPlaying;
+  void editor.presentationUiChapterId;
+  void editor.presentationNavIndex;
+  void editor.presentationTimelineChapterIdx;
+  return editor.canPresentationNextChapter();
 });
+
+function onPrev() {
+  if (!canPrev.value) return;
+  editor.prevCh();
+}
+
+function onNext() {
+  if (!canNext.value) return;
+  editor.nextCh();
+}
 </script>

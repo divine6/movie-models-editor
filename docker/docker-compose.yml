@@ -1,0 +1,61 @@
+# 本地验证全栈镜像（MySQL + 应用）
+# 在 saas3.0 目录执行:
+#   docker compose -f movie-models-editor/docker/docker-compose.yml up -d --build
+#
+# Harbor 镜像配置见 docker/harbor.env
+# K8s 部署（外部 MySQL 192.168.10.220:3306）见 docker/docker-compose.k8s.yml
+
+services:
+  mysql:
+    image: mysql:8.4
+    container_name: movie-models-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD:-root}
+      MYSQL_DATABASE: ${DB_NAME:-movie_models}
+    ports:
+      - "${DB_PORT:-3306}:3306"
+    volumes:
+      - movie_models_mysql_data:/var/lib/mysql
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-p${DB_PASSWORD:-root}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  app:
+    build:
+      context: ../..
+      dockerfile: movie-models-editor/docker/Dockerfile
+      secrets:
+        - npmrc
+      args:
+        VITE_API_URL: ${VITE_API_URL:-https://ext.highlands.ltd/light-sass-api/}
+    image: ${APP_IMAGE:-core.harbor.domain:30003/movie-editor/movie-editor:latest}
+    container_name: movie-models-app
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+    ports:
+      - "${APP_PORT:-4000}:4000"
+    environment:
+      PORT: 4000
+      STORAGE_DRIVER: mysql
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_USER: root
+      DB_PASSWORD: ${DB_PASSWORD:-root}
+      DB_NAME: ${DB_NAME:-movie_models}
+    volumes:
+      - movie_models_uploads:/app/storage
+
+volumes:
+  movie_models_mysql_data:
+  movie_models_uploads:
+
+secrets:
+  npmrc:
+    file: ${NPMRC:-${USERPROFILE}/.npmrc}

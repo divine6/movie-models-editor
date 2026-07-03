@@ -6,8 +6,8 @@ export function useServiceWorker() {
   const updateSW = ref<((reloadPage?: boolean) => Promise<void>) | null>(null);
 
   onMounted(async () => {
-    // 开发环境不注册 SW，避免 virtual:pwa-register 在部分环境下触发 CORS 报错
-    if (import.meta.env.DEV) {
+    // 开发环境或未启用 PWA 时不注册 SW
+    if (import.meta.env.DEV || !import.meta.env.VITE_PWA) {
       return;
     }
 

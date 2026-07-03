@@ -536,7 +536,10 @@
         }
 
         &--root {
-          &.is-expanded,
+          &.is-expanded {
+            background: rgb(255 255 255 / 3%);
+          }
+
           &.active,
           &.playing {
             background: #143024;
@@ -973,14 +976,15 @@
 
     .viewport-preview-nav {
       inset: unset;
-      top: 50%;
+      top: 0;
       right: 0;
-      bottom: auto;
+      bottom: 0;
       left: 0;
-      height: 0;
+      height: auto;
       overflow: visible;
-      transform: translateY(-50%);
+      transform: none;
       pointer-events: none;
+      z-index: 30;
     }
 
     .view-canvas {
@@ -992,6 +996,13 @@
     .model-intro-layer,
     .pip-group--preview {
       pointer-events: none !important;
+    }
+
+    .pip-group--preview {
+      .video-pip,
+      .video-pip-play-hint {
+        pointer-events: auto !important;
+      }
     }
 
     .viewport-play-hint-icon,
@@ -1029,6 +1040,11 @@
         top: calc(env(safe-area-inset-top, 0px) + var(--preview-pip-top, 68px)) !important;
         max-width: none;
         filter: drop-shadow(0 10px 28px rgb(0 0 0 / 36%));
+
+        .video-pip,
+        .video-pip-play-hint {
+          pointer-events: auto;
+        }
 
         &.is-dragging,
         &.is-resizing {

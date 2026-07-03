@@ -10,6 +10,8 @@
   "license": "MIT",
   "scripts": {
     "dev": "npm run dev:tenant",
+    "dev:server": "npm --prefix ../movie-models-server start",
+    "dev:full": "powershell -ExecutionPolicy Bypass -File ./scripts/dev-full.ps1",
     "build": "npm run build:tenant:dev",
     "dev:tenant": "vite --mode development.tenant",
     "dev:owner": "vite --mode development.owner",
@@ -19,6 +21,7 @@
     "build:tenant:dev": "vue-tsc && vite build --mode development.tenant",
     "build:tenant:test": "vue-tsc && vite build --mode test.tenant",
     "build:tenant:prod": "vue-tsc && vite build --mode production.tenant",
+    "build:docker": "vite build --mode docker.tenant",
     "build:owner:dev": "vue-tsc && vite build --mode development.owner",
     "build:owner:test": "vue-tsc && vite build --mode test.owner",
     "build:owner:prod": "vue-tsc && vite build --mode production.owner",

@@ -6,6 +6,7 @@ import { MeshoptDecoder } from "three/examples/jsm/libs/meshopt_decoder.module.j
 import { onMounted, onUnmounted, ref, shallowRef } from "vue";
 
 import type { CameraConfig, Model, ModelConfig } from "@/interface/project";
+import { dracoDecoderPath } from "@/utils/projectAssets";
 import { DEFAULT_CAMERA } from "@/utils/three/constants";
 
 export function useThreeScene() {
@@ -19,7 +20,7 @@ export function useThreeScene() {
 
   const gltfLoader = new GLTFLoader();
   const dracoLoader = new DRACOLoader();
-  dracoLoader.setDecoderPath("/draco/");
+  dracoLoader.setDecoderPath(dracoDecoderPath());
   gltfLoader.setDRACOLoader(dracoLoader);
   gltfLoader.setMeshoptDecoder(MeshoptDecoder);
 

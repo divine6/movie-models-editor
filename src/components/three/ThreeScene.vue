@@ -14,6 +14,7 @@ import { MeshoptDecoder } from "three/examples/jsm/libs/meshopt_decoder.module.j
 import { onMounted, onUnmounted, provide, ref, watch } from "vue";
 
 import type { CameraConfig, Model, ModelConfig } from "@/interface/project";
+import { dracoDecoderPath } from "@/utils/projectAssets";
 import { DEFAULT_CAMERA } from "@/utils/three/constants";
 
 // Props
@@ -104,7 +105,7 @@ const initScene = () => {
   // GLTF Loader + Draco support for compressed GLB
   gltfLoader = new GLTFLoader();
   dracoLoader = new DRACOLoader();
-  dracoLoader.setDecoderPath("/draco/");
+  dracoLoader.setDecoderPath(dracoDecoderPath());
   gltfLoader.setDRACOLoader(dracoLoader);
   gltfLoader.setMeshoptDecoder(MeshoptDecoder);
 

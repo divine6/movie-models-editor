@@ -59,16 +59,29 @@ export interface UploadVideoResult {
 const DEFAULT_SERVER_PORT = "4000";
 const DEFAULT_EDITOR_PORT = "5173";
 
+function publicPathBase(): string {
+  const pub = (import.meta.env.VITE_PUBLIC_PATH as string | undefined)?.trim() || "/";
+  const normalized = pub.replace(/\/$/, "");
+  return normalized === "/" ? "" : normalized;
+}
+
 export function editorServerBaseUrl() {
   const envUrl = (import.meta.env.VITE_EDITOR_SERVER_URL as string | undefined)?.trim();
   if (envUrl) {
     const normalized = envUrl.replace(/\/$/, "");
-    // 相对路径走 Vite 代理（开发环境同源，避免 Failed to fetch）
-    if (normalized.startsWith("/")) {
-      if (typeof window !== "undefined") return normalized;
-      return `http://127.0.0.1:4000`;
+    if (normalized && normalized !== "/") {
+      // 相对路径走 Vite 代理（开发环境同源，避免 Failed to fetch）
+      if (normalized.startsWith("/")) {
+        if (typeof window !== "undefined") return normalized;
+        return `http://127.0.0.1:4000`;
+      }
+      return normalized;
     }
-    return normalized;
+  }
+  const fallback = publicPathBase();
+  if (fallback) {
+    if (typeof window !== "undefined") return fallback;
+    return `http://127.0.0.1:4000`;
   }
   if (typeof window === "undefined") {
     return `http://127.0.0.1:${DEFAULT_SERVER_PORT}`;
@@ -89,7 +102,11 @@ function resolveEditorServerAbsoluteBase(): URL {
 /** 编辑页前端地址（手机/局域网访问时跟随当前页面 host） */
 export function editorFrontendBaseUrl() {
   const envUrl = (import.meta.env.VITE_EDITOR_FRONTEND_URL as string | undefined)?.trim();
-  if (envUrl) return envUrl.replace(/\/$/, "");
+  if (envUrl) {
+    const normalized = envUrl.replace(/\/$/, "");
+    if (normalized.startsWith("/") && typeof window !== "undefined") return normalized;
+    return normalized;
+  }
   const { protocol, hostname, port } = window.location;
   const editorPort =
     port && port !== DEFAULT_SERVER_PORT && port !== "80" && port !== "443" ? port : DEFAULT_EDITOR_PORT;
@@ -141,8 +158,13 @@ export function rewireEditorFrontendHost(url: string) {
 
 export function resolveAssetUrl(path: string) {
   if (!path) return "";
+  const normalizeLegacyPath = (pathname: string) => {
+    let p = pathname.startsWith("/") ? pathname : `/${pathname}`;
+    p = p.replace(/^\/editor-api(?=\/|$)/, "");
+    return p;
+  };
   if (/^https?:\/\//i.test(path)) return rewireEditorServerHost(path);
-  return `${editorServerBaseUrl()}${path.startsWith("/") ? path : `/${path}`}`;
+  return `${editorServerBaseUrl()}${normalizeLegacyPath(path)}`;
 }
 
 export function rewireEditorServerHost(url: string) {
@@ -153,6 +175,8 @@ export function rewireEditorServerHost(url: string) {
     u.protocol = base.protocol;
     u.hostname = base.hostname;
     u.port = base.port;
+    u.pathname = u.pathname.replace(/^\/editor-api(?=\/|$)/, "");
+    if (!u.pathname.startsWith("/")) u.pathname = `/${u.pathname}`;
     // 开发环境走 /editor-api 代理：127.0.0.1:4000/api/... → /editor-api/api/...
     if (serverBase.startsWith("/")) {
       const prefix = serverBase.replace(/\/$/, "");
@@ -182,7 +206,17 @@ async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
   }
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
-    const err = new Error((data as any).message || res.statusText) as Error & { status?: number };
+    const bodyMessage = (data as any).message;
+    let message = bodyMessage || res.statusText || `HTTP ${res.status}`;
+    if (
+      res.status >= 500 &&
+      !bodyMessage &&
+      editorServerBaseUrl().startsWith("/")
+    ) {
+      message =
+        "无法连接模型编辑器后端，请先启动 movie-models-server（端口 4000）：在 movie-models-server 目录执行 npm start";
+    }
+    const err = new Error(message) as Error & { status?: number };
     err.status = res.status;
     throw err;
   }

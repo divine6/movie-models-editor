@@ -82,10 +82,13 @@ function isRootExpanded(rootId: string) {
 }
 
 function isRootHighlighted(root: Chapter) {
-  return editor.isChapterListActive(root);
+  const activeId = editor.getActiveChapterIdForUi();
+  return !!activeId && activeId === root.id;
 }
 
 function isRootPlaying(root: Chapter) {
+  const activeId = editor.getActiveChapterIdForUi();
+  if (!activeId || activeId !== root.id) return false;
   return editor.isChapterPlaying(root);
 }
 
@@ -107,6 +110,10 @@ function onRootClick(root: Chapter) {
   const children = getChildren(root.id);
   if (children.length > 0) {
     expandedRootId.value = root.id;
+    const activeId = editor.getActiveChapterIdForUi();
+    const activeChild = activeId ? children.find(child => child.id === activeId) : undefined;
+    emit("play", activeChild ?? children[0]);
+    return;
   }
   emit("play", root);
 }
@@ -116,7 +123,16 @@ function onChildClick(child: Chapter) {
 }
 
 watch(
-  () => [editor.selectedChapterId, editor.chapters.length] as const,
+  () =>
+    [
+      editor.presentationUiChapterId,
+      editor.presentationNavIndex,
+      editor.selectedChapterId,
+      editor.getActiveChapterIdForUi(),
+      editor.currentTime,
+      editor.isPlaying,
+      editor.chapters.length
+    ] as const,
   () => syncExpandedRoot(),
   { immediate: true }
 );
