@@ -59,6 +59,12 @@ export function useVideoPip({
 
   const pipPresentationMode = computed(() => getViewOnly() || getIsPreviewMode());
 
+  function isMobilePresentationViewport() {
+    if (typeof window === "undefined") return false;
+    const coarse = window.matchMedia?.("(pointer: coarse)")?.matches ?? false;
+    return coarse || window.innerWidth <= 768;
+  }
+
   function isDesktopLandscape() {
     if (typeof window === "undefined") return false;
     const isCoarse = window.matchMedia?.("(pointer: coarse)")?.matches ?? false;
@@ -133,12 +139,21 @@ export function useVideoPip({
     }
 
     const leftPanel = document.querySelector(".chapter-preview-panel") as HTMLElement | null;
-    if (leftPanel) {
-      const rect = leftPanel.getBoundingClientRect();
-      const overlapsViewport = rect.right > viewportRect.left && rect.left < viewportRect.right;
-      if (overlapsViewport && rect.width > 0 && rect.height > 0) {
-        const left = rect.right - viewportRect.left + margin;
-        if (Number.isFinite(left)) minLeft = Math.max(minLeft, left);
+    // 移动端展示列表是抽屉形态，隐藏时仍可能占满宽度但不可见；
+    // 若参与边界计算会把 PIP 推到屏幕外，导致“右上角视频框不显示”。
+    if (leftPanel && !isMobilePresentationViewport()) {
+      const style = window.getComputedStyle(leftPanel);
+      const visible =
+        style.display !== "none" &&
+        style.visibility !== "hidden" &&
+        Number.parseFloat(style.opacity || "1") > 0.01;
+      if (visible) {
+        const rect = leftPanel.getBoundingClientRect();
+        const overlapsViewport = rect.right > viewportRect.left && rect.left < viewportRect.right;
+        if (overlapsViewport && rect.width > 0 && rect.height > 0) {
+          const left = rect.right - viewportRect.left + margin;
+          if (Number.isFinite(left)) minLeft = Math.max(minLeft, left);
+        }
       }
     }
 
@@ -158,17 +173,29 @@ export function useVideoPip({
     const viewport = getViewportEl();
     if (!viewport) return;
     const presentation = getViewOnly() || getIsPreviewMode();
+    const fixedMobilePresentation = presentation && isMobilePresentationViewport();
     if (resetWidth) {
-      const storedWidth = getVideoDisplayWidth();
-      const storedWidthRatio = getVideoDisplayWidthRatio();
       const maxWidth = Math.max(PIP_MIN_WIDTH, viewport.clientWidth * PIP_MAX_WIDTH_RATIO);
-      if (Number.isFinite(storedWidthRatio) && (storedWidthRatio as number) > 0) {
-        pipWidth.value = clamp(viewport.clientWidth * (storedWidthRatio as number), PIP_MIN_WIDTH, maxWidth);
-      } else if (storedWidth > 0) {
-        pipWidth.value = clamp(storedWidth, PIP_MIN_WIDTH, maxWidth);
+      if (fixedMobilePresentation) {
+        pipWidth.value = clamp(resolvePipWidth(viewport.clientWidth, true), PIP_MIN_WIDTH, maxWidth);
       } else {
-        pipWidth.value = resolvePipWidth(viewport.clientWidth, presentation);
+        const storedWidth = getVideoDisplayWidth();
+        const storedWidthRatio = getVideoDisplayWidthRatio();
+        if (Number.isFinite(storedWidthRatio) && (storedWidthRatio as number) > 0) {
+          pipWidth.value = clamp(viewport.clientWidth * (storedWidthRatio as number), PIP_MIN_WIDTH, maxWidth);
+        } else if (storedWidth > 0) {
+          pipWidth.value = clamp(storedWidth, PIP_MIN_WIDTH, maxWidth);
+        } else {
+          pipWidth.value = resolvePipWidth(viewport.clientWidth, presentation);
+        }
       }
+    }
+    if (fixedMobilePresentation) {
+      const fallback = resolveDefaultPipPosition(viewport, presentation);
+      pipLeft.value = fallback.left;
+      pipTop.value = fallback.top;
+      requestAnimationFrame(clampPipBounds);
+      return;
     }
     const storedLeft = getVideoDisplayLeft();
     const storedTop = getVideoDisplayTop();

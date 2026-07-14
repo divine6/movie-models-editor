@@ -109,13 +109,18 @@ const selectedGroupName = computed(() => {
 
 const onPreviewChapterPlay = (chapter: Chapter) => {
   editor.highlightSceneNode(chapter.id);
-  const wasPlaying = !!editor.videoEl && !editor.videoEl.paused;
-  void editor.startChapterPlayback(chapter, {
-    autoplay: true,
-    syncVideo: true,
-    userGesture: true,
-    keepPlaying: wasPlaying
-  });
+  if (editor.viewOnly || editor.isPreviewMode) {
+    // 与进度条/左右切段同一套“seek + 强制续播”路径，避免停在目标点不往后播。
+    editor.jumpToChapter(chapter);
+  } else {
+    const wasPlaying = !!(editor.videoEl && (!editor.videoEl.paused || editor.isPlaying));
+    void editor.startChapterPlayback(chapter, {
+      autoplay: true,
+      syncVideo: true,
+      userGesture: true,
+      keepPlaying: wasPlaying
+    });
+  }
   if (!editor.viewOnly || (typeof window !== "undefined" && window.innerWidth <= 768)) {
     hideChapterDrawer();
   }

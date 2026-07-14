@@ -277,6 +277,9 @@ export function useMovieEditor() {
   const chapterAutoNext = ref(false);
   /** 展示/预览模式章节衔接中：避免 pause 回调误停动画 */
   let presentationChapterTransition = false;
+  /** 展示态跳转后应当继续播放：忽略 seek 引起的 pause，并强制续播 */
+  let presentationExpectPlaying = false;
+  let presentationResumeTimer: ReturnType<typeof setTimeout> | null = null;
   const chapterNavLock = ref(false);
   const isCameraTransitioning = ref(false);
   let seekGeneration = 0;
@@ -288,6 +291,7 @@ export function useMovieEditor() {
   let presentationChapterCooldownUntil = 0;
   let lastPresentationAutoSwitchChapterId: string | null = null;
   let lastPresentationPlaybackChapterId: string | null = null;
+  let presentationProgressResumeAt = 0;
   let segmentPlaybackRafId: number | null = null;
   let segmentPlaybackGeneration = 0;
   let activeSegmentPlaybackSeg: any = null;
@@ -2590,9 +2594,44 @@ export function useMovieEditor() {
     }
   }
 
+  /** 展示/预览：timeupdate 稀疏时仍跟 video 推进进度；期望播放却 paused 时补 play。 */
+  function syncPresentationProgressInMainLoop(now: number) {
+    if (!viewOnly.value && !isPreviewMode.value) return;
+    const video = videoEl.value;
+    if (!video) return;
+
+    const seekLocked =
+      videoChapterSyncPaused || chapterNavLock.value || presentationChapterTransition;
+
+    if (!video.seeking && !video.paused && !video.ended) {
+      if (!seekLocked || presentationExpectPlaying) {
+        currentTime.value = video.currentTime;
+      }
+    }
+
+    if (
+      presentationExpectPlaying &&
+      video.paused &&
+      !video.ended &&
+      !presentationChapterTransition &&
+      !videoChapterSyncPaused &&
+      now - presentationProgressResumeAt > 100
+    ) {
+      presentationProgressResumeAt = now;
+      void forceResumeVideoPlayback(video).then(ok => {
+        if (ok) {
+          stopChapterAnimation();
+          ensureVideoSyncedChapterAnimation();
+          syncCurrentChapterAnimationFromVideo();
+        }
+      });
+    }
+  }
+
   function animate(now = performance.now()) {
     afid = requestAnimationFrame(animate);
     advanceCameraTransition(now);
+    syncPresentationProgressInMainLoop(now);
 
     const targetInterval = 1000 / targetFps.value;
     const sinceLastPresent = viewportLastPresentAt ? now - viewportLastPresentAt : targetInterval;
@@ -3612,6 +3651,14 @@ export function useMovieEditor() {
     return presentationChapterTransition || videoChapterSyncPaused || chapterNavLock.value;
   }
 
+  function shouldSyncProgressFromVideo(v: HTMLVideoElement, seekLocked: boolean): boolean {
+    if (v.seeking) return false;
+    if (!seekLocked) return true;
+    // seek 锁定期：video 已在走时必须跟 currentTime，否则会一直停在点击位置。
+    if (!(viewOnly.value || isPreviewMode.value)) return false;
+    return !v.paused && !v.ended;
+  }
+
   function getPresentationChapterAtVideoTime(t: number): Chapter | null {
     if (viewOnly.value || isPreviewMode.value) {
       const nav = getPresentationNavChapters();
@@ -3831,10 +3878,15 @@ export function useMovieEditor() {
     return nav[segmentIdx].id === activeId;
   }
 
-  function syncPresentationUiFromChapter(chapter: Chapter) {
+  function syncPresentationUiFromChapter(chapter: Chapter, atTime?: number) {
     if (!viewOnly.value && !isPreviewMode.value) return;
     const navChapter = resolvePresentationNavChapter(chapter);
-    const syncTime = videoEl.value?.currentTime ?? chapter.startTime;
+    // seek 锁定期视频尚未落到目标点：用显式时间 / 乐观 currentTime，避免仍按旧时间解析动画节点。
+    const syncTime =
+      atTime ??
+      (isPresentationSeekLocked() ? currentTime.value : undefined) ??
+      videoEl.value?.currentTime ??
+      chapter.startTime;
     const playableChapter = resolvePlayableChapterForPresentationAtTime(navChapter, syncTime);
     presentationUiChapterId.value = navChapter.id;
     const nav = getPresentationNavChapters();
@@ -5275,6 +5327,196 @@ export function useMovieEditor() {
     }
   }
 
+  function isSeekNearTarget(video: HTMLVideoElement, target: number) {
+    // 移动端解码/缓冲常有更大误差，过严会把已成功的 seek 判失败，随后又从 0 继续播。
+    const eps = isCoarsePointerDevice() ? Math.max(CHAPTER_TIME_EPS, 0.35) : CHAPTER_TIME_EPS;
+    return Math.abs(video.currentTime - target) < eps;
+  }
+
+  async function forceResumeVideoPlayback(
+    video: HTMLVideoElement,
+    options?: { requestSeq?: number }
+  ): Promise<boolean> {
+    if (!video.ended && !video.paused) {
+      isPlaying.value = true;
+      return true;
+    }
+    const req = options?.requestSeq;
+    // 移动端 seek 后常需多次重试才能拿回播放权。
+    const delays = [0, 30, 80, 160, 280, 450, 700, 1100, 1600];
+    for (const delay of delays) {
+      if (req !== undefined && req !== chapterPlaybackRequestSeq) return false;
+      if (delay > 0) await new Promise(resolve => window.setTimeout(resolve, delay));
+      if (req !== undefined && req !== chapterPlaybackRequestSeq) return false;
+      if ((viewOnly.value || isPreviewMode.value) && !presentationExpectPlaying) {
+        return false;
+      }
+      try {
+        if (video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
+          await waitForVideoReady(2500);
+          if (req !== undefined && req !== chapterPlaybackRequestSeq) return false;
+        }
+        await video.play();
+      } catch {
+        /* retry */
+      }
+      if (!video.paused && !video.ended) {
+        isPlaying.value = true;
+        return true;
+      }
+    }
+    return !video.paused && !video.ended;
+  }
+
+  function clearPresentationResumeTimer() {
+    if (presentationResumeTimer != null) {
+      clearTimeout(presentationResumeTimer);
+      presentationResumeTimer = null;
+    }
+  }
+
+  /** 解锁 seek 后再补几次 play，避免 pause 事件在 finally 之后把播放掐死。 */
+  function schedulePresentationPlaybackResume(requestSeq: number) {
+    if (!presentationExpectPlaying) return;
+    if (!videoEl.value) return;
+    clearPresentationResumeTimer();
+    const delays = [0, 60, 150, 320, 600, 1000, 1800, 2800];
+    let idx = 0;
+    const runNext = () => {
+      if (idx >= delays.length) {
+        if (presentationExpectPlaying && videoEl.value?.paused) {
+          showPresentationPlaybackHint();
+        }
+        return;
+      }
+      const delay = delays[idx++];
+      presentationResumeTimer = setTimeout(() => {
+        presentationResumeTimer = null;
+        if (requestSeq !== chapterPlaybackRequestSeq) return;
+        if (!presentationExpectPlaying) return;
+        const v = videoEl.value;
+        if (!v || v.ended) return;
+        if (!v.paused) {
+          isPlaying.value = true;
+          stopChapterAnimation();
+          ensureVideoSyncedChapterAnimation();
+          return;
+        }
+        void forceResumeVideoPlayback(v, { requestSeq }).then(ok => {
+          if (ok) {
+            stopChapterAnimation();
+            ensureVideoSyncedChapterAnimation();
+            syncCurrentChapterAnimationFromVideo();
+            return;
+          }
+          runNext();
+        });
+      }, delay);
+    };
+    runNext();
+  }
+
+  /** 在点击同步栈内先触发 play，给后续 await seek 后的续播保留媒体授权。 */
+  function claimPresentationPlaybackGesture(video: HTMLVideoElement) {
+    presentationExpectPlaying = true;
+    chapterAutoNext.value = true;
+    isPlaying.value = true;
+    try {
+      const p = video.play();
+      if (p && typeof p.catch === "function") void p.catch(() => undefined);
+    } catch {
+      /* ignore */
+    }
+  }
+
+  function isPresentationSeekAcceptable(video: HTMLVideoElement, target: number) {
+    if (isSeekNearTarget(video, target)) return true;
+    // 移动端缓冲落点误差更大：宁可接受“基本到点”也不要判定 seek 失败并放弃续播。
+    const looseEps = isCoarsePointerDevice() ? 1.25 : 0.55;
+    return Math.abs(video.currentTime - target) < looseEps;
+  }
+
+  /**
+   * 展示/预览跳转：始终不断播 seek（禁止 pause→seek 路径，避免丢掉移动端播放权）；
+   * play 失败也返回成功，由 schedulePresentationPlaybackResume / onVideoPause 继续补播。
+   */
+  async function seekPresentationMedia(
+    target: number,
+    shouldPlay: boolean,
+    options?: { requestSeq?: number; preferContinuous?: boolean }
+  ): Promise<boolean> {
+    const video = videoEl.value;
+    if (!video) return false;
+    const req = options?.requestSeq;
+    if (shouldPlay) {
+      presentationExpectPlaying = true;
+      chapterAutoNext.value = true;
+      isPlaying.value = true;
+    }
+
+    // 展示续播路径：永远不断播 seek，最大限度保留手势授权。禁止 pause:true。
+    let seekOk = await seekVideoTo(target, { pause: false });
+    if (req !== undefined && req !== chapterPlaybackRequestSeq) return false;
+
+    if (!seekOk && !isPresentationSeekAcceptable(video, target)) {
+      try {
+        video.currentTime = clampVideoTime(target, video);
+      } catch {
+        /* ignore */
+      }
+      await waitUntilSeekable(video, target);
+      if (req !== undefined && req !== chapterPlaybackRequestSeq) return false;
+      await new Promise<void>(resolve => {
+        let settled = false;
+        const finish = () => {
+          if (settled) return;
+          settled = true;
+          video.removeEventListener("seeked", onSeeked);
+          resolve();
+        };
+        const onSeeked = () => finish();
+        video.addEventListener("seeked", onSeeked);
+        window.setTimeout(finish, isCoarsePointerDevice() ? 2200 : 1200);
+      });
+      if (req !== undefined && req !== chapterPlaybackRequestSeq) return false;
+      seekOk = isPresentationSeekAcceptable(video, target);
+    }
+    seekOk = seekOk || isPresentationSeekAcceptable(video, target);
+
+    if (seekOk) {
+      currentTime.value = video.currentTime;
+    } else if (shouldPlay) {
+      // 校验未过也不中止续播：进度条保持目标点，后续 resume 仍可从附近继续。
+      currentTime.value = target;
+      seekOk = true;
+    } else {
+      return false;
+    }
+
+    if (shouldPlay) {
+      try {
+        const p = video.play();
+        if (p && typeof p.catch === "function") void p.catch(() => undefined);
+      } catch {
+        /* ignore */
+      }
+      await forceResumeVideoPlayback(video, { requestSeq: req });
+      if (req !== undefined && req !== chapterPlaybackRequestSeq) return false;
+      // 若播着被机型弹回远处：不断播修正，禁止 pause。
+      if (!isPresentationSeekAcceptable(video, target)) {
+        const repaired = await seekVideoTo(target, { pause: false });
+        if (req !== undefined && req !== chapterPlaybackRequestSeq) return false;
+        if (repaired || isPresentationSeekAcceptable(video, target)) {
+          currentTime.value = video.currentTime;
+          await forceResumeVideoPlayback(video, { requestSeq: req });
+        }
+      }
+      // play 成败都视为跳转流程成功，避免调用方清掉 presentationExpectPlaying。
+      return true;
+    }
+    return seekOk;
+  }
+
   async function seekVideoTo(time: number, options?: { pause?: boolean }): Promise<boolean> {
     const video = videoEl.value;
     if (!video) return false;
@@ -5283,6 +5525,8 @@ export function useMovieEditor() {
     if (!Number.isFinite(target)) return false;
 
     const gen = ++seekGeneration;
+    const coarse = isCoarsePointerDevice();
+    // 尊重调用方 pause 意图：续播跳转可不断播 seek；仅默认场景 pause→seek。
     const shouldPause = options?.pause ?? true;
 
     if (
@@ -5298,78 +5542,76 @@ export function useMovieEditor() {
       }
     }
 
-    if (shouldPause) {
+    if (shouldPause && !video.paused) {
       video.pause();
-    } else if (isCoarsePointerDevice() && video.paused) {
-      try {
-        await video.play();
-      } catch {
-        /* ignore */
-      }
-    }
-    try {
-      video.currentTime = target;
-    } catch {
-      /* ignore */
     }
 
-    if (Math.abs(video.currentTime - target) < CHAPTER_TIME_EPS) {
-      if (gen === seekGeneration) currentTime.value = video.currentTime;
+    const commitSeekUi = (ok: boolean) => {
+      if (gen !== seekGeneration) return;
+      // 失败时不要用错误的 currentTime（常为 0）覆盖乐观进度。
+      if (ok) currentTime.value = video.currentTime;
+    };
+
+    const tryAssignCurrentTime = () => {
+      try {
+        video.currentTime = target;
+        return true;
+      } catch {
+        return false;
+      }
+    };
+
+    if (!tryAssignCurrentTime()) return false;
+
+    if (isSeekNearTarget(video, target)) {
+      commitSeekUi(true);
       return true;
     }
 
     await waitUntilSeekable(video, target);
     if (gen !== seekGeneration) return false;
 
-    const seekTimeoutMs = isCoarsePointerDevice() ? 1500 : SEEK_EVENT_TIMEOUT_MS;
-    let seeked = await new Promise<boolean>(resolve => {
-      let settled = false;
-      const finish = (ok: boolean) => {
-        if (settled) return;
-        settled = true;
-        video.removeEventListener("seeked", onSeeked);
-        if (gen === seekGeneration) currentTime.value = video.currentTime;
-        resolve(ok);
-      };
-      const onSeeked = () => finish(Math.abs(video.currentTime - target) < CHAPTER_TIME_EPS);
-      video.addEventListener("seeked", onSeeked);
-      try {
-        video.currentTime = target;
-      } catch {
-        finish(false);
-        return;
-      }
-      window.setTimeout(() => finish(Math.abs(video.currentTime - target) < CHAPTER_TIME_EPS), seekTimeoutMs);
-    });
-
-    // 部分手机内核在未充分激活媒体管线前无法生效 seek（会卡在 0s）
-    if (!seeked && isCoarsePointerDevice()) {
-      try {
-        await video.play();
-        await new Promise(resolve => window.setTimeout(resolve, 180));
-      } catch {
-        /* ignore */
-      }
-      if (shouldPause) video.pause();
-      seeked = await new Promise<boolean>(resolve => {
+    const waitForSeeked = (timeoutMs: number) =>
+      new Promise<boolean>(resolve => {
         let settled = false;
         const finish = (ok: boolean) => {
           if (settled) return;
           settled = true;
           video.removeEventListener("seeked", onSeeked);
-          if (gen === seekGeneration) currentTime.value = video.currentTime;
+          commitSeekUi(ok);
           resolve(ok);
         };
-        const onSeeked = () => finish(Math.abs(video.currentTime - target) < CHAPTER_TIME_EPS);
+        const onSeeked = () => finish(isSeekNearTarget(video, target));
         video.addEventListener("seeked", onSeeked);
-        try {
-          video.currentTime = target;
-        } catch {
+        if (!tryAssignCurrentTime()) {
           finish(false);
           return;
         }
-        window.setTimeout(() => finish(Math.abs(video.currentTime - target) < CHAPTER_TIME_EPS), 1800);
+        window.setTimeout(() => finish(isSeekNearTarget(video, target)), timeoutMs);
       });
+
+    let seeked = await waitForSeeked(coarse ? 2800 : SEEK_EVENT_TIMEOUT_MS);
+    if (gen !== seekGeneration) return false;
+
+    // 部分手机需先短暂激活管线；仅在明确要求 pause 时再停，避免展示续播丢播放权。
+    if (!seeked && coarse) {
+      try {
+        await video.play();
+      } catch {
+        /* ignore */
+      }
+      if (shouldPause) video.pause();
+      await new Promise(resolve => window.setTimeout(resolve, 40));
+      if (gen !== seekGeneration) return false;
+      seeked = await waitForSeeked(2500);
+      if (!seeked && isPresentationSeekAcceptable(video, target)) {
+        commitSeekUi(true);
+        return true;
+      }
+    }
+    if (!seeked && isPresentationSeekAcceptable(video, target)) {
+      commitSeekUi(true);
+      return true;
     }
     return seeked;
   }
@@ -5643,11 +5885,19 @@ export function useMovieEditor() {
     const v = e.target as HTMLVideoElement;
     const actualPlaying = !v.paused && !v.ended;
     if (isPlaying.value !== actualPlaying) {
-      isPlaying.value = actualPlaying;
+      // seek/跳转期间 video 会短暂 paused；若期望续播，不要把 UI 打成“播放按钮”。
+      if (!(presentationExpectPlaying && !actualPlaying && (viewOnly.value || isPreviewMode.value))) {
+        isPlaying.value = actualPlaying;
+      } else {
+        isPlaying.value = true;
+      }
     }
     const seekLocked =
       videoChapterSyncPaused || chapterNavLock.value || presentationChapterTransition;
-    if (!seekLocked) {
+    // seek/章节切换锁定期内不要用 video.currentTime 覆盖进度条。
+    // 移动端 seek 失败时常停在 0，否则绿色条会被立刻拉回起点。
+    // 但若 video 已在播放，必须跟 video 时间，否则会一直停在点击位置。
+    if (shouldSyncProgressFromVideo(v, seekLocked)) {
       currentTime.value = v.currentTime;
     }
 
@@ -5731,6 +5981,8 @@ export function useMovieEditor() {
 
   function onVideoEnd() {
     isPlaying.value = false;
+    presentationExpectPlaying = false;
+    clearPresentationResumeTimer();
     chapterPlayTarget.value = null;
     chapterAutoNext.value = false;
     stopChapterAnimation();
@@ -6146,7 +6398,11 @@ export function useMovieEditor() {
           chapterPlayTarget.value = playable;
           syncPresentationUiFromChapter(navChapter);
           chapterAutoNext.value = true;
-          syncPresentationVideoTimeToChapter(video, navChapter);
+          presentationExpectPlaying = true;
+          // 不要把 currentTime 打回章节起点，否则进度条 seek 后再点播放会跳走。
+          if (!isPresentationNavChapterAtTime(navChapter, video.currentTime)) {
+            syncPresentationVideoTimeToChapter(video, navChapter);
+          }
           syncChapterVisualState(playable, getPresentationAnimElapsed(video, playable), {
             skipOutlineRebuild: false,
             skipOverlaySync: false
@@ -6157,29 +6413,18 @@ export function useMovieEditor() {
         }
         primePresentationVideoElement(video);
         presentationChapterCooldownUntil = performance.now() + 500;
-        void video
-          .play()
-          .then(() => {
+        claimPresentationPlaybackGesture(video);
+        void forceResumeVideoPlayback(video)
+          .then(ok => {
+            if (!ok) {
+              showPresentationPlaybackHint();
+              return;
+            }
             stopChapterAnimation();
             ensureVideoSyncedChapterAnimation();
             syncCurrentChapterAnimationFromVideo();
           })
-          .catch(() => {
-            void waitForVideoReady().then(ok => {
-              if (!ok || !videoEl.value) {
-                showPresentationPlaybackHint();
-                return;
-              }
-              void videoEl.value
-                .play()
-                .then(() => {
-                  stopChapterAnimation();
-                  ensureVideoSyncedChapterAnimation();
-                  syncCurrentChapterAnimationFromVideo();
-                })
-                .catch(() => showPresentationPlaybackHint());
-            });
-          });
+          .catch(() => showPresentationPlaybackHint());
       } else {
         chapterPlayTarget.value = null;
         if (video.ended || video.currentTime >= Math.max((duration.value || video.duration || 0) - CHAPTER_END_EPS, 0)) {
@@ -6201,6 +6446,9 @@ export function useMovieEditor() {
         });
       }
     } else {
+      presentationExpectPlaying = false;
+      clearPresentationResumeTimer();
+      chapterAutoNext.value = false;
       video.pause();
       if (!viewOnly.value && !isPreviewMode.value) {
         chapterPlayTarget.value = null;
@@ -6214,6 +6462,9 @@ export function useMovieEditor() {
     isPlaying.value = true;
     playbackHintVisible.value = false;
     playbackHintFading.value = false;
+    if (viewOnly.value || isPreviewMode.value) {
+      presentationExpectPlaying = true;
+    }
     const video = videoEl.value;
     const ch = video ? getPlaybackChapterAtTime(video.currentTime) : null;
     if (ch && chapterHasAnimation(ch)) {
@@ -6224,10 +6475,31 @@ export function useMovieEditor() {
   }
 
   function onVideoPause() {
-    isPlaying.value = false;
-    if (!presentationChapterTransition) {
-      stopChapterAnimation();
+    // seek / 章节跳转会主动 pause；若期望续播则立刻补 play（含锁定期），避免 UI 变回 ▶。
+    if (presentationExpectPlaying) {
+      isPlaying.value = true;
+      const video = videoEl.value;
+      if (video && video.paused && !video.ended) {
+        try {
+          const p = video.play();
+          if (p && typeof p.catch === "function") void p.catch(() => undefined);
+        } catch {
+          /* ignore */
+        }
+        void forceResumeVideoPlayback(video).then(ok => {
+          if (ok) {
+            stopChapterAnimation();
+            ensureVideoSyncedChapterAnimation();
+          }
+        });
+      }
+      return;
     }
+    if (presentationChapterTransition || videoChapterSyncPaused) {
+      return;
+    }
+    isPlaying.value = false;
+    stopChapterAnimation();
     syncCurrentChapterAnimationFromVideo();
     syncIntroPresentation();
     syncComposerMsaaSamples();
@@ -7723,17 +7995,8 @@ export function useMovieEditor() {
     const shouldPlay = options?.autoplay ?? (viewOnly.value || isPreviewMode.value ? true : wasPlaying);
 
     if (viewOnly.value || isPreviewMode.value) {
-      const navChapterAtTarget = getPresentationChapterAtVideoTime(target);
-      if (navChapterAtTarget) {
-        await executeChapterPlayback(navChapterAtTarget, {
-          syncVideo: true,
-          autoplay: shouldPlay,
-          userGesture: options?.userGesture,
-          seekTime: target,
-          keepPlaying: wasPlaying
-        });
-        return;
-      }
+      await seekPresentationTimelineTime(target, shouldPlay);
+      return;
     }
 
     const chapterAtTarget =
@@ -7775,6 +8038,105 @@ export function useMovieEditor() {
         ensureVideoSyncedChapterAnimation();
       } catch {
         if (viewOnly.value || isPreviewMode.value) showPresentationPlaybackHint();
+      }
+    }
+  }
+
+  async function seekPresentationTimelineTime(target: number, shouldPlay: boolean) {
+    const video = videoEl.value;
+    if (!video) return;
+    const req = ++chapterPlaybackRequestSeq;
+    presentationChapterTransition = true;
+    videoChapterSyncPaused = true;
+    chapterAutoNext.value = true;
+    if (shouldPlay) {
+      presentationExpectPlaying = true;
+      isPlaying.value = true;
+    }
+    // 手动点击进度条后，短时间内禁止自动切段，避免刚 seek 完就被切回其它节点。
+    presentationChapterCooldownUntil = performance.now() + 1200;
+    currentTime.value = target;
+
+    // 先按目标时间切模型/运镜，不依赖 seek 是否立刻成功——避免“进度到位但模型没反应”。
+    const navForTarget = getPresentationChapterAtVideoTime(target);
+    if (navForTarget) {
+      const playableForTarget = resolvePlayableChapterForPresentationAtTime(navForTarget, target);
+      chapterPlayTarget.value = playableForTarget;
+      lastPresentationAutoSwitchChapterId = playableForTarget.id;
+      syncPresentationUiFromChapter(navForTarget, target);
+      applyChapterCameraForNav(navForTarget, "playback");
+      syncChapterVisualState(playableForTarget, Math.max(0, target - playableForTarget.startTime), {
+        skipOutlineRebuild: false,
+        skipOverlaySync: false
+      });
+      if (chapterNeedsOutlineRebuild(playableForTarget)) {
+        refreshChapterOutlines(playableForTarget);
+      }
+      if (Math.max(0, target - playableForTarget.startTime) <= CHAPTER_TIME_EPS) {
+        prepareChapterForPreviewPlayback(playableForTarget);
+      } else {
+        invalidateChapterAnimTargetsCache(playableForTarget.id);
+      }
+    }
+
+    if (shouldPlay) claimPresentationPlaybackGesture(video);
+    try {
+      if (video.readyState < HTMLMediaElement.HAVE_METADATA) {
+        await waitForVideoReady();
+        if (req !== chapterPlaybackRequestSeq) return;
+      }
+      const seekOk = await seekPresentationMedia(target, shouldPlay, {
+        requestSeq: req,
+        preferContinuous: true
+      });
+      if (req !== chapterPlaybackRequestSeq) return;
+      // seekOk 在 shouldPlay 时基本恒为 true；即使媒体未完全到点也继续续播，禁止清掉 expectPlaying。
+      const actualTime = isPresentationSeekAcceptable(video, target)
+        ? video.currentTime
+        : isSeekNearTarget(video, target)
+          ? video.currentTime
+          : target;
+      currentTime.value = actualTime;
+      const navChapter = getPresentationChapterAtVideoTime(actualTime) ?? navForTarget;
+      if (navChapter) {
+        const playable = resolvePlayableChapterForPresentationAtTime(navChapter, actualTime);
+        chapterPlayTarget.value = playable;
+        lastPresentationAutoSwitchChapterId = playable.id;
+        syncPresentationUiFromChapter(navChapter, actualTime);
+        applyChapterCameraForNav(navChapter, "playback");
+        syncChapterVisualState(playable, Math.max(0, actualTime - playable.startTime), {
+          skipOutlineRebuild: false,
+          skipOverlaySync: false
+        });
+        if (chapterNeedsOutlineRebuild(playable)) {
+          refreshChapterOutlines(playable);
+        }
+      }
+      if (shouldPlay) {
+        presentationExpectPlaying = true;
+        isPlaying.value = true;
+        // 不能只看 !video.paused：seek 期间常“未暂停但也不在走”，会误判跳过续播。
+        await forceResumeVideoPlayback(video, { requestSeq: req });
+        if (req !== chapterPlaybackRequestSeq) return;
+        if (!video.paused && !video.ended) {
+          stopChapterAnimation();
+          ensureVideoSyncedChapterAnimation();
+          syncCurrentChapterAnimationFromVideo();
+        } else if (!seekOk) {
+          showPresentationPlaybackHint();
+        }
+      } else {
+        presentationExpectPlaying = false;
+        video.pause();
+      }
+    } finally {
+      if (req === chapterPlaybackRequestSeq) {
+        presentationChapterTransition = false;
+        videoChapterSyncPaused = false;
+        presentationChapterCooldownUntil = performance.now() + 800;
+        if (shouldPlay && presentationExpectPlaying) {
+          schedulePresentationPlaybackResume(req);
+        }
       }
     }
   }
@@ -7917,6 +8279,8 @@ export function useMovieEditor() {
     presentationNavIndex.value = -1;
     lastPresentationAutoSwitchChapterId = null;
     chapterAutoNext.value = false;
+    presentationExpectPlaying = false;
+    clearPresentationResumeTimer();
     totalPlaying.value = false;
     if (videoEl.value) videoEl.value.pause();
   }
@@ -7927,6 +8291,8 @@ export function useMovieEditor() {
   ) {
     const startChapter = chapter ?? getPresentationStartChapter();
     if (!startChapter) return;
+    // 展示/预览模式固定显示右上角视频窗（含移动端）
+    showVideoPip.value = true;
 
     chapterAutoNext.value = true;
     if (videoEl.value && videoSrc.value) {
@@ -8121,12 +8487,16 @@ export function useMovieEditor() {
     if (viewOnly.value || isPreviewMode.value) {
       // 先更新进度条反馈，再等待媒体 seek 完成，避免点击后绿色进度停留在旧位置。
       currentTime.value = target;
+      if (autoplay || keepPlaying) {
+        if (video) claimPresentationPlaybackGesture(video);
+      }
     }
 
     try {
       stopChapterAnimation();
       chapterPlayTarget.value = playableCh;
-      syncPresentationUiFromChapter(navCh);
+      lastPresentationAutoSwitchChapterId = playableCh.id;
+      syncPresentationUiFromChapter(navCh, target);
 
       navigateToChapter(navCh, navIdx, {
         seek: false,
@@ -8153,7 +8523,7 @@ export function useMovieEditor() {
 
       if (!video) {
         chapterPlayTarget.value = playableCh;
-        syncPresentationUiFromChapter(navCh);
+        syncPresentationUiFromChapter(navCh, target);
         currentTime.value = target;
         if (chapterHasAnimation(playableCh)) {
           runChapterAnimationWallclock(playableCh);
@@ -8167,9 +8537,24 @@ export function useMovieEditor() {
 
       let seekOk = true;
       if (needsSeek) {
-        const pauseDuringSeek = !(autoplay || keepPlaying);
-        seekOk = await seekVideoTo(target, { pause: pauseDuringSeek });
-        if (playbackReq !== chapterPlaybackRequestSeq) return;
+        const shouldResume = !!(autoplay || keepPlaying);
+        if (viewOnly.value || isPreviewMode.value) {
+          // 展示/预览：统一走不断播 seek + 强制续播（禁止 pause→seek）
+          seekOk = await seekPresentationMedia(target, shouldResume, {
+            requestSeq: playbackReq,
+            preferContinuous: isPlaying.value || !video.paused
+          });
+          if (playbackReq !== chapterPlaybackRequestSeq) return;
+        } else {
+          const pauseDuringSeek = isCoarsePointerDevice() ? true : !shouldResume;
+          seekOk = await seekVideoTo(target, { pause: pauseDuringSeek });
+          if (playbackReq !== chapterPlaybackRequestSeq) return;
+          if (!seekOk && !isSeekNearTarget(video, target)) {
+            seekOk = await seekVideoTo(target, { pause: true });
+            if (playbackReq !== chapterPlaybackRequestSeq) return;
+          }
+          seekOk = seekOk || isSeekNearTarget(video, target);
+        }
         debugViewPlayback("startChapterPlayback:seek-complete", {
           chapterId: playableCh.id,
           navChapterId: navCh.id,
@@ -8189,25 +8574,38 @@ export function useMovieEditor() {
           currentTime: video.currentTime
         });
         chapterPlayTarget.value = playableCh;
-        syncPresentationUiFromChapter(navCh);
-        currentTime.value =
-          Math.abs(video.currentTime - target) < CHAPTER_TIME_EPS ? video.currentTime : target;
-        syncChapterVisualState(playableCh, Math.max(0, currentTime.value - playableCh.startTime), {
+        syncPresentationUiFromChapter(navCh, target);
+        // 失败时用真实时间；展示态若仍要续播则不要强制 pause/清 expectPlaying。
+        const shouldResume = !!(autoplay || keepPlaying);
+        if (!(viewOnly.value || isPreviewMode.value) || !shouldResume) {
+          video.pause();
+          currentTime.value = video.currentTime;
+        } else {
+          currentTime.value = isPresentationSeekAcceptable(video, target) ? video.currentTime : target;
+          presentationExpectPlaying = true;
+          isPlaying.value = true;
+          await forceResumeVideoPlayback(video, { requestSeq: playbackReq });
+          if (playbackReq !== chapterPlaybackRequestSeq) return;
+        }
+        syncChapterVisualState(playableCh, Math.max(0, (video.currentTime || target) - playableCh.startTime), {
           skipOutlineRebuild: false,
           skipOverlaySync: false
         });
         if (chapterNeedsOutlineRebuild(playableCh)) {
           refreshChapterOutlines(playableCh);
         }
-        if (!keepPlaying) {
-          video.pause();
+        if ((viewOnly.value || isPreviewMode.value) && shouldResume) {
+          showPresentationPlaybackHint();
+        } else if (viewOnly.value || isPreviewMode.value) {
+          presentationExpectPlaying = false;
+          clearPresentationResumeTimer();
           showPresentationPlaybackHint();
         }
         return;
       }
 
       chapterPlayTarget.value = playableCh;
-      syncPresentationUiFromChapter(navCh);
+      syncPresentationUiFromChapter(navCh, video.currentTime);
       currentTime.value = video.currentTime;
       const actualElapsed = Math.max(0, video.currentTime - playableCh.startTime);
       syncChapterVisualState(playableCh, actualElapsed, {
@@ -8220,16 +8618,30 @@ export function useMovieEditor() {
 
       if (!autoplay) {
         if (viewOnly.value || isPreviewMode.value) {
+          presentationExpectPlaying = false;
+          clearPresentationResumeTimer();
           showPresentationPlaybackHint();
         }
         return;
       }
 
-      try {
-        if (video.paused) {
-          await video.play().catch(() => undefined);
+      // 展示路径里 seekPresentationMedia 已续播；编辑路径或其他仍 paused 时再强制续播。
+      const played = await forceResumeVideoPlayback(video, { requestSeq: playbackReq });
+      if (playbackReq !== chapterPlaybackRequestSeq) return;
+      if (played) {
+        // 禁止“播完后再 pause 修正”——移动端会丢掉播放权导致停在点击位置。
+        if (
+          (viewOnly.value || isPreviewMode.value) &&
+          !isSeekNearTarget(video, target)
+        ) {
+          const repaired = await seekVideoTo(target, { pause: false });
+          if (playbackReq !== chapterPlaybackRequestSeq) return;
+          if (repaired || isSeekNearTarget(video, target)) {
+            currentTime.value = video.currentTime;
+            await forceResumeVideoPlayback(video, { requestSeq: playbackReq });
+            if (playbackReq !== chapterPlaybackRequestSeq) return;
+          }
         }
-        if (playbackReq !== chapterPlaybackRequestSeq) return;
         stopChapterAnimation();
         ensureVideoSyncedChapterAnimation();
         syncCurrentChapterAnimationFromVideo();
@@ -8239,26 +8651,25 @@ export function useMovieEditor() {
           currentTime: video.currentTime,
           chapterPlayTargetId: chapterPlayTarget.value?.id ?? null
         });
-      } catch {
-        if (playbackReq !== chapterPlaybackRequestSeq) return;
+      } else {
         syncCurrentChapterAnimationFromVideo();
         if (viewOnly.value || isPreviewMode.value) {
-          showPresentationPlaybackHint();
+          // 不立刻放弃：finally 里还会 schedule 续播。
+          debugViewPlayback("startChapterPlayback:play-pending", {
+            chapterId: playableCh.id,
+            navChapterId: navCh.id,
+            currentTime: video.currentTime,
+            chapterPlayTargetId: chapterPlayTarget.value?.id ?? null
+          });
         }
-        debugViewPlayback("startChapterPlayback:play-rejected", {
-          chapterId: playableCh.id,
-          navChapterId: navCh.id,
-          currentTime: video.currentTime,
-          chapterPlayTargetId: chapterPlayTarget.value?.id ?? null
-        });
       }
     } finally {
       if (playbackReq === chapterPlaybackRequestSeq) {
         presentationChapterTransition = false;
         videoChapterSyncPaused = false;
-        presentationChapterCooldownUntil = performance.now() + 450;
+        presentationChapterCooldownUntil = performance.now() + 800;
         const activeVideo = videoEl.value;
-        if (activeVideo && Math.abs(activeVideo.currentTime - target) < CHAPTER_TIME_EPS) {
+        if (activeVideo && isSeekNearTarget(activeVideo, target)) {
           currentTime.value = activeVideo.currentTime;
         }
         // 编辑态播放后清掉 playTarget，让 onTick 按视频时间持续同步节点选中
@@ -8269,13 +8680,16 @@ export function useMovieEditor() {
         } else if (chapterPlayTarget.value) {
           lastPresentationAutoSwitchChapterId = chapterPlayTarget.value.id;
         }
+        if ((viewOnly.value || isPreviewMode.value) && (autoplay || keepPlaying) && presentationExpectPlaying) {
+          schedulePresentationPlaybackResume(playbackReq);
+        }
       }
     }
   }
 
   function jumpToChapter(ch: Chapter, seekTime?: number) {
     const video = videoEl.value;
-    const wasPlaying = !!(video && !video.paused);
+    const wasPlaying = !!(video && (!video.paused || isPlaying.value));
     const presentation = viewOnly.value || isPreviewMode.value;
     const navChapter =
       presentation ? resolvePresentationNavChapter(ch) : ch;
@@ -8285,12 +8699,14 @@ export function useMovieEditor() {
         navChapter.startTime,
         Math.min(targetTime, navChapter.endTime - CHAPTER_END_EPS)
       );
+      void seekPresentationTimelineTime(targetTime, true);
+      return;
     }
     void startChapterPlayback(ch, {
       syncVideo: true,
-      autoplay: presentation ? true : wasPlaying,
+      autoplay: wasPlaying,
       userGesture: true,
-      keepPlaying: presentation ? true : wasPlaying,
+      keepPlaying: wasPlaying,
       seekTime: targetTime
     });
   }
@@ -8303,14 +8719,7 @@ export function useMovieEditor() {
       const ci = getActivePresentationNavIndex();
       if (ci <= 0) return;
       const targetChapter = nav[ci - 1];
-      const wasPlaying = !videoEl.value.paused;
-      void startChapterPlayback(targetChapter, {
-        syncVideo: true,
-        autoplay: true,
-        userGesture: true,
-        keepPlaying: true,
-        seekTime: targetChapter.startTime
-      });
+      void seekPresentationTimelineTime(targetChapter.startTime, true);
       return;
     }
 
@@ -8330,8 +8739,9 @@ export function useMovieEditor() {
     if (prevIdx >= 0) {
       void startChapterPlayback(timelineChapters.value[prevIdx], {
         syncVideo: true,
-        autoplay: !videoEl.value.paused,
-        userGesture: true
+        autoplay: !videoEl.value.paused || isPlaying.value,
+        userGesture: true,
+        keepPlaying: !videoEl.value.paused || isPlaying.value
       });
     }
   }
@@ -8344,14 +8754,7 @@ export function useMovieEditor() {
       const ci = getActivePresentationNavIndex();
       if (ci < 0 || ci >= nav.length - 1) return;
       const targetChapter = nav[ci + 1];
-      const wasPlaying = !videoEl.value.paused;
-      void startChapterPlayback(targetChapter, {
-        syncVideo: true,
-        autoplay: true,
-        userGesture: true,
-        keepPlaying: true,
-        seekTime: targetChapter.startTime
-      });
+      void seekPresentationTimelineTime(targetChapter.startTime, true);
       return;
     }
 
@@ -8394,6 +8797,8 @@ export function useMovieEditor() {
     presentationUiChapterId.value = null;
     presentationNavIndex.value = -1;
     lastPresentationAutoSwitchChapterId = null;
+    presentationExpectPlaying = false;
+    clearPresentationResumeTimer();
     videoChapterSyncPaused = false;
     presentationChapterTransition = false;
     chapterNavLock.value = false;
@@ -9379,6 +9784,8 @@ export function useMovieEditor() {
     selectedNodeId.value = ch.id;
     const video = videoEl.value;
     if (video && !video.paused) {
+      presentationExpectPlaying = false;
+      clearPresentationResumeTimer();
       video.pause();
       chapterPlayTarget.value = null;
       chapterAutoNext.value = false;
@@ -9388,6 +9795,8 @@ export function useMovieEditor() {
 
     chapterPlayTarget.value = null;
     chapterAutoNext.value = false;
+    presentationExpectPlaying = false;
+    clearPresentationResumeTimer();
 
     if (video) {
       try {
@@ -9438,6 +9847,8 @@ export function useMovieEditor() {
     stopChapterAnimation();
     chapterPlayTarget.value = null;
     chapterAutoNext.value = false;
+    presentationExpectPlaying = false;
+    clearPresentationResumeTimer();
     if (videoEl.value) videoEl.value.pause();
 
     applyChapterModelState(ch, 0, {
@@ -9563,12 +9974,13 @@ export function useMovieEditor() {
     if (!resolved) return;
     const { chapter } = resolved;
     const video = videoEl.value;
-    const wasPlaying = !!(video && !video.paused);
+    const wasPlaying = !!(video && (!video.paused || isPlaying.value));
+    const presentation = viewOnly.value || isPreviewMode.value;
 
     void startChapterPlayback(chapter, {
       syncVideo: true,
       autoplay: true,
-      keepPlaying: wasPlaying,
+      keepPlaying: presentation ? true : wasPlaying,
       userGesture: true,
       seekTime: chapter.startTime
     });
@@ -10858,6 +11270,8 @@ export function useMovieEditor() {
     presentationNavIndex.value = -1;
     lastPresentationAutoSwitchChapterId = null;
     chapterAutoNext.value = false;
+    presentationExpectPlaying = false;
+    clearPresentationResumeTimer();
     stopChapterAnimation();
 
     const ch = getActiveChapter();
@@ -11027,6 +11441,7 @@ export function useMovieEditor() {
       viewCameraBaseFov = camera?.fov ?? null;
       syncPresentationRenderProfile();
       syncPresentationInteractionMode();
+      showVideoPip.value = true;
       adaptPresentationViewport();
       handleResize();
       window.addEventListener("resize", handleResize);
