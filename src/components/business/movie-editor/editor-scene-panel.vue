@@ -260,6 +260,22 @@
               <div class="sp-module-title">材质设置（当前模型）</div>
               <p v-if="!editor.selModel" class="sp-hint">请先在模型列表中选择一个模型</p>
               <template v-else>
+                <p class="sp-hint">
+                  {{
+                    editor.selModelNodeId
+                      ? "作用于当前选中的模型部件"
+                      : "作用于当前选中的整个模型"
+                  }}
+                </p>
+                <div class="sp-field sp-field--inline">
+                  <label>颜色</label>
+                  <el-color-picker
+                    v-model="editor.matColor"
+                    size="small"
+                    @change="editor.applyMatToCurModel"
+                    @active-change="editor.applyMatToCurModel"
+                  />
+                </div>
                 <div class="sp-field">
                   <label>粗糙度</label>
                   <div class="sp-slider-row">
@@ -574,6 +590,7 @@
               </div>
               <div class="sp-field">
                 <label>模型反射强度</label>
+                <p class="sp-hint">1 = 保持模型原始材质；大于 1 仅增强环境反射，不改贴图</p>
                 <div class="sp-slider-row">
                   <el-slider
                     v-model="editor.envReflectionIntensity"

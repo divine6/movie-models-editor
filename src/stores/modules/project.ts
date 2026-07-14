@@ -69,7 +69,8 @@ export const useProjectStore = defineStore("project", {
         videoDisplayWidth: 0,
         createdAt: now,
         updatedAt: now,
-        chapters: [],
+        schemaVersion: 2,
+        nodes: [],
         models: [],
         subtitles: []
       };
@@ -92,7 +93,8 @@ export const useProjectStore = defineStore("project", {
         videoDisplayWidth: 0,
         createdAt: now,
         updatedAt: now,
-        chapters: [],
+        schemaVersion: 2,
+        nodes: [],
         models: [],
         subtitles: []
       };
@@ -152,8 +154,7 @@ export const useProjectStore = defineStore("project", {
           this.currentProject.videoWidth = 0;
           this.currentProject.videoHeight = 0;
           this.currentProject.videoDisplayWidth = 0;
-          // 同时清除相关数据
-          this.currentProject.chapters = [];
+          this.currentProject.nodes = [];
           this.currentProject.models = [];
           this.currentProject.subtitles = [];
         }

@@ -6,54 +6,94 @@
 export interface Project {
   id: string;
   title: string;
-  videoSrc: string | null; // Blob URL 或远程 URL
+  /** @deprecated v2 起视频挂在 video 节点上 */
+  videoSrc: string | null;
+  /** @deprecated */
   videoDuration: number;
+  /** @deprecated */
   videoWidth: number;
+  /** @deprecated */
   videoHeight: number;
-  /** 画中画展示宽度（用于桌面横屏的预览/浏览尺寸同步） */
+  /** @deprecated */
   videoDisplayWidth: number;
   createdAt: string;
   updatedAt: string;
 }
 
-/** 项目详情（含节点、模型、字幕） */
-export interface ProjectDetail extends Project {
-  chapters: Chapter[];
-  models: Model[];
-  subtitles: Subtitle[];
-}
+/** 场景节点类型 */
+export type SceneNodeType = "group" | "video" | "animation";
 
-/** 节点 */
-export interface Chapter {
+export interface SceneNodeBase {
   id: string;
   projectId: string;
   name: string;
+  type: SceneNodeType;
+  parentId?: string;
+  sortOrder: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** 分组节点 */
+export interface SceneGroupNode extends SceneNodeBase {
+  type: "group";
+}
+
+/** 视频节点 */
+export interface SceneVideoNode extends SceneNodeBase {
+  type: "video";
+  videoSrc: string | null;
+  videoPath?: string;
+  videoDuration: number;
+  videoWidth: number;
+  videoHeight: number;
+  videoDisplayWidth: number;
+  videoDisplayWidthRatio?: number;
+  videoDisplayLeft?: number;
+  videoDisplayTop?: number;
+  videoDisplayXRatio?: number;
+  videoDisplayYRatio?: number;
+}
+
+/** 视频节点动画（原 Chapter） */
+export interface SceneAnimationNode extends SceneNodeBase {
+  type: "animation";
   subtitle: string;
   startTime: number;
   endTime: number;
   color: string;
   camera: CameraConfig;
   modelConfigs: Record<string, ModelConfig>;
-  /** 父节点ID，用于构建树状结构 */
-  parentId?: string;
-  createdAt: string;
-  updatedAt: string;
+}
+
+export type SceneNode = SceneGroupNode | SceneVideoNode | SceneAnimationNode;
+
+/** @deprecated 使用 SceneAnimationNode */
+export type Chapter = SceneAnimationNode;
+
+/** 项目详情（含节点、模型、字幕） */
+export interface ProjectDetail extends Project {
+  schemaVersion?: number;
+  nodes: SceneNode[];
+  /** @deprecated v1 兼容，加载后自动迁移为 nodes */
+  chapters?: Chapter[];
+  models: Model[];
+  subtitles: Subtitle[];
 }
 
 /** 相机配置 */
 export interface CameraConfig {
-  position: [number, number, number]; // XYZ
-  target: [number, number, number]; // Look-at XYZ
-  fov: number; // Field of view (20-120)
-  /** 切换到该节点镜头时的运镜时长（秒） */
+  position: [number, number, number];
+  target: [number, number, number];
+  fov: number;
   transitionSec?: number;
 }
 
 /** 动画时间段 */
 export interface AnimSegment {
   id: string;
-  startTime: number; // 开始时间（秒）
-  endTime: number; // 结束时间（秒）
+  startTime: number;
+  endTime: number;
   startPos: [number, number, number];
   endPos: [number, number, number];
   startScale: number;
@@ -64,7 +104,7 @@ export interface AnimSegment {
 
 /** 动画配置 */
 export interface AnimationConfig {
-  duration: number; // 总时长（秒）
+  duration: number;
   segments: AnimSegment[];
 }
 
@@ -73,18 +113,17 @@ export interface ModelConfig {
   visible: boolean;
   posOffset: [number, number, number];
   scale: number;
-  wireframe?: boolean; // 仅显示线框（隐藏模型面）
-  highlight: boolean; // 模型本体高亮
+  wireframe?: boolean;
+  highlight: boolean;
   /** @deprecated 请使用 outlineColor / modelHighlightColor */
   highlightColor?: string;
-  outlineColor?: string; // 轮廓高亮颜色
-  wireframeColor?: string; // 线框颜色
-  modelHighlightColor?: string; // 模型高亮颜色
-  outline: boolean; // 模型外轮廓高亮
+  outlineColor?: string;
+  wireframeColor?: string;
+  modelHighlightColor?: string;
+  outline: boolean;
   animation: boolean;
-  intro?: string; // 节点内模型介绍文案
+  intro?: string;
   animConfig?: AnimationConfig;
-  /** GLB 子层级独立配置，key 为 hierarchy nodeId */
   nodeConfigs?: Record<string, ModelConfig>;
 }
 
@@ -95,20 +134,18 @@ export interface Model {
   name: string;
   type: ModelType;
   color: string;
-  url?: string; // GLB Blob URL
-  sourcePath?: string; // 后端模型相对路径，用于保存场景后复原
-  file?: File; // 原始文件引用（本地上传时）
-  glbData?: ArrayBuffer; // 原始 GLB 数据（用于导出）
-  groundY: number; // 自动计算的地面位置
+  url?: string;
+  sourcePath?: string;
+  file?: File;
+  glbData?: ArrayBuffer;
+  groundY: number;
   basePosition: [number, number, number];
   createdAt: string;
   updatedAt: string;
 }
 
-/** 模型类型 */
 export type ModelType = "cube" | "sphere" | "cylinder" | "torus" | "cone" | "dodecahedron" | "custom";
 
-/** GLB 模型内部层级节点（导入后从场景图解析） */
 export interface ModelHierarchyNode {
   id: string;
   modelId: string;
@@ -116,20 +153,18 @@ export interface ModelHierarchyNode {
   path: string;
   objectType: "group" | "mesh" | "bone" | "other";
   children: ModelHierarchyNode[];
-  /** 同几何体、多材质拆分的 Mesh 合并展示时，包含的全部 nodeId */
   mergedNodeIds?: string[];
-  /** 原为 Group，子级均为同几何体 Mesh；展示为 Mesh，变换作用在 Group 上 */
   materialGroupHost?: boolean;
-  /** 仅 mesh：用于识别同源几何体 */
   geometryKey?: string;
-  /** 本地位置指纹，用于区分同几何体实例与多材质拆分 */
   localPosKey?: string;
 }
 
-/** 字幕 */
+/** 字幕 — 绑定在视频或动画节点下 */
 export interface Subtitle {
   id: string;
   projectId: string;
+  /** 所属视频节点或动画节点 ID */
+  parentNodeId: string;
   startTime: number;
   endTime: number;
   text: string;
@@ -140,30 +175,23 @@ export interface Subtitle {
   updatedAt: string;
 }
 
-/** 字幕显示模式 */
 export type SubtitleDisplayMode = "fadeIn" | "typewriter";
 
-/** 字幕文本最大长度 */
 export const SUBTITLE_TEXT_MAX_LENGTH = 100;
-
-/** 字幕默认背景色 */
 export const SUBTITLE_DEFAULT_BACKGROUND = "transparent";
 
-/** Primitive 模型类型配置 */
 export interface PrimitiveTypeConfig {
   type: ModelType;
   name: string;
   defaultColor: string;
 }
 
-/** 项目创建参数 */
 export interface CreateProjectParams {
   title: string;
   videoSrc?: string;
   videoFile?: File;
 }
 
-/** 节点创建参数 */
 export interface CreateChapterParams {
   projectId: string;
   name: string;
@@ -172,7 +200,6 @@ export interface CreateChapterParams {
   color?: string;
 }
 
-/** 模型创建参数 */
 export interface CreateModelParams {
   projectId: string;
   name: string;

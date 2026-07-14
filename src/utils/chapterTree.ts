@@ -50,17 +50,9 @@ export function getChapterDepth(chapters: Chapter[], chapter: Chapter): number {
 
 const CHAPTER_TIME_EPS = 0.05;
 
-/** 取当前时间命中的最具体节点（优先子节点） */
+/** 取当前时间命中的最具体节点（优先子节点）；间隙时段返回 null */
 export function resolveActiveChapterAtTime(chapters: Chapter[], t: number): Chapter | null {
   const matches = chapters.filter(ch => t >= ch.startTime - CHAPTER_TIME_EPS && t < ch.endTime);
-  if (matches.length === 0) {
-    const roots = getRootChapters(chapters);
-    let last: Chapter | null = null;
-    for (const ch of roots) {
-      if (ch.startTime <= t + CHAPTER_TIME_EPS) last = ch;
-      else break;
-    }
-    return last ?? roots[0] ?? null;
-  }
+  if (matches.length === 0) return null;
   return matches.sort((a, b) => getChapterDepth(chapters, b) - getChapterDepth(chapters, a))[0];
 }

@@ -37,10 +37,10 @@
 
       <editor-viewport-preview-nav v-if="(editor.isPreviewMode || editor.viewOnly) && editor.presentationNavChapterCount > 1" />
 
-      <editor-video-pip v-if="editor.hasVideo" />
+      <editor-video-pip v-if="editor.hasVideo && editor.showVideoPip" />
     </div>
 
-    <editor-progress-bar v-if="editor.hasVideo" />
+    <editor-progress-bar v-if="editor.hasVideo && (editor.showVideoPip || editor.isPreviewMode || editor.viewOnly)" />
   </div>
 </template>
 

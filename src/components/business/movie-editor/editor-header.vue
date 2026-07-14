@@ -24,6 +24,7 @@
           v-if="editor.hasVideo"
           type="button"
           class="editor-topbar__chapter-trigger"
+          data-testid="open-chapter-drawer"
           title="节点"
           @click="chapterDrawer?.show()"
         >
@@ -87,15 +88,17 @@
           <el-icon><View /></el-icon>
           预览
         </el-button>
-        <el-button size="default" :disabled="!editor.modelSetCode" @click="sceneListVisible = true"> 场景列表 </el-button>
+        <el-button size="default" @click="onCreateNewScene"> 新建 </el-button>
+        <el-button size="default" :disabled="!editor.modelSetCode" @click="sceneListVisible = true"> 编辑列表 </el-button>
         <el-button
           class="editor-topbar__save-btn"
           type="primary"
           size="default"
           :loading="editor.savingScene"
-          :disabled="!editor.hasVideo || editor.chapters.length === 0"
+          :disabled="!editor.canSaveScene"
           @click="editor.saveSceneToServer"
         >
+          <span v-if="editor.sceneHasUnsavedChanges" class="editor-topbar__save-dot" aria-hidden="true" />
           {{ editor.sceneCode ? "更新" : "保存" }}
         </el-button>
       </div>
@@ -107,7 +110,8 @@
         v-if="editor.hasVideo"
         type="button"
         class="editor-topbar__chapter-trigger"
-        title="节点"
+        data-testid="open-chapter-drawer"
+        title="展示列表"
         @click="chapterDrawer?.show()"
       >
         <svg
@@ -131,6 +135,7 @@
 </template>
 
 <script setup lang="ts" name="editor-header">
+import { ElMessageBox } from "element-plus";
 import { Close, Edit, Setting, View } from "@element-plus/icons-vue";
 import { computed, nextTick, ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
@@ -182,4 +187,18 @@ const finishEdit = () => {
   editor.saveTitle();
   isEditing.value = false;
 };
+
+async function onCreateNewScene() {
+  if (editor.savingScene) return;
+  if (editor.sceneHasUnsavedChanges) {
+    try {
+      await ElMessageBox.confirm("当前场景有未保存修改，确认新建并丢弃当前修改吗？", "提示", {
+        type: "warning"
+      });
+    } catch {
+      return;
+    }
+  }
+  editor.createNewSceneDraft();
+}
 </script>

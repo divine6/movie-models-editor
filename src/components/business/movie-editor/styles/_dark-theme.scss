@@ -136,6 +136,13 @@
             border-color: var(--el-button-hover-border-color) !important;
             color: var(--el-button-hover-text-color) !important;
           }
+
+          &.is-disabled {
+            background-color: rgb(255 255 255 / 4%) !important;
+            border-color: var(--editor-border) !important;
+            color: var(--editor-text-muted) !important;
+            opacity: 1 !important;
+          }
         }
       }
     }
@@ -279,6 +286,57 @@
       .chapter-list {
         background: transparent !important;
         padding: 4px 0 12px;
+      }
+
+      .scene-node-row {
+        border-radius: 0;
+
+        &:hover {
+          background: rgb(255 255 255 / 4%);
+        }
+
+        &.active {
+          background: var(--editor-accent-soft);
+          border-color: transparent;
+
+          .scene-node-name {
+            color: var(--editor-accent);
+            font-weight: 500;
+          }
+        }
+
+        &.is-drop-target {
+          background: rgb(74 222 128 / 8%);
+          border-color: rgb(74 222 128 / 35%);
+        }
+      }
+
+      .scene-node-name {
+        color: var(--editor-text-secondary);
+      }
+
+      .scene-node-meta {
+        color: var(--editor-text-muted);
+      }
+
+      .scene-node-toggle {
+        color: var(--editor-text-muted);
+      }
+
+      .scene-node-action-btn.el-button.is-text {
+        --el-button-text-color: var(--editor-text-muted);
+        --el-button-hover-text-color: var(--editor-accent);
+        --el-button-hover-bg-color: rgb(255 255 255 / 6%);
+      }
+
+      .scene-node-action-btn.el-button--danger.is-text {
+        --el-button-text-color: #f87171;
+        --el-button-hover-text-color: #fca5a5;
+        --el-button-hover-bg-color: rgb(127 29 29 / 28%);
+      }
+
+      .video-node-detail-hint {
+        color: var(--editor-text-muted);
       }
     }
 

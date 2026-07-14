@@ -2,16 +2,27 @@
   <el-drawer
     v-model="visible"
     class="editor-scene-list-drawer"
-    title="场景列表"
+    title="编辑列表"
     direction="rtl"
     size="min(860px, 96vw)"
     :z-index="3100"
     @open="loadScenes"
   >
     <div v-loading="loading" class="editor-scene-list-drawer__body">
-      <el-empty v-if="!loading && scenes.length === 0" description="暂无已保存场景" />
+      <div class="editor-scene-list-drawer__search">
+        <el-input
+          v-model="searchKeyword"
+          clearable
+          size="small"
+          placeholder="搜索场景名称或场景 ID"
+        />
+      </div>
+      <el-empty
+        v-if="!loading && filteredScenes.length === 0"
+        :description="searchKeyword.trim() ? '未找到匹配场景' : '暂无已保存场景'"
+      />
       <div v-else class="editor-scene-list-drawer__table-wrap">
-        <el-table :data="scenes" stripe size="small" class="editor-scene-list-drawer__table">
+        <el-table :data="filteredScenes" stripe size="small" class="editor-scene-list-drawer__table">
           <el-table-column label="场景名称" min-width="140" show-overflow-tooltip>
             <template #default="{ row }">{{ displaySceneTitle(row) }}</template>
           </el-table-column>
@@ -28,7 +39,7 @@
             </template>
           </el-table-column>
           <el-table-column label="保存时间" width="168">
-            <template #default="{ row }">{{ formatTime(row.updatedAt || row.createdAt) }}</template>
+            <template #default="{ row }">{{ formatTime(resolveSceneSavedTime(row)) }}</template>
           </el-table-column>
           <el-table-column label="操作" width="248" fixed="right">
             <template #default="{ row }">
@@ -57,7 +68,7 @@
 
 <script setup lang="ts" name="editor-scene-list-drawer">
 import { ElMessage, ElMessageBox } from "element-plus";
-import { ref, watch } from "vue";
+import { computed, ref, watch } from "vue";
 
 import {
   buildScenePreviewLink,
@@ -72,8 +83,18 @@ const editor = useMovieEditorContext();
 const visible = defineModel<boolean>({ default: false });
 const loading = ref(false);
 const scenes = ref<EditorServerSceneItem[]>([]);
+const searchKeyword = ref("");
 const editingCode = ref<string | null>(null);
 const deletingCode = ref<string | null>(null);
+const filteredScenes = computed(() => {
+  const q = searchKeyword.value.trim().toLowerCase();
+  if (!q) return scenes.value;
+  return scenes.value.filter(scene => {
+    const title = displaySceneTitle(scene).toLowerCase();
+    const code = (scene.code || "").toLowerCase();
+    return title.includes(q) || code.includes(q);
+  });
+});
 
 watch(
   () => editor.sceneListVersion,
@@ -97,7 +118,18 @@ function displaySceneTitle(row: EditorServerSceneItem) {
 async function loadScenes() {
   loading.value = true;
   try {
-    scenes.value = await fetchSceneList(editor.modelSetCode || undefined);
+    searchKeyword.value = "";
+    const list = await fetchSceneList(editor.modelSetCode || undefined);
+    const currentCode = editor.sceneCode || "";
+    const localSavedAtMs = parseTimeMs(editor.sceneSavedAt);
+    scenes.value = list.map(scene => {
+      if (!currentCode || scene.code !== currentCode || !Number.isFinite(localSavedAtMs)) return scene;
+      const remoteMs = parseTimeMs(scene.updatedAt || scene.createdAt);
+      if (!Number.isFinite(remoteMs) || localSavedAtMs >= remoteMs) {
+        return { ...scene, updatedAt: editor.sceneSavedAt };
+      }
+      return scene;
+    });
   } catch (e: any) {
     ElMessage.error(e?.message || "加载场景列表失败");
     scenes.value = [];
@@ -106,9 +138,46 @@ async function loadScenes() {
   }
 }
 
+function parseTimeMs(input?: string) {
+  if (!input) return Number.NaN;
+  const raw = String(input).trim();
+  if (!raw) return Number.NaN;
+  const normalized = raw.includes(" ") ? raw.replace(" ", "T") : raw;
+  const localParsed = new Date(normalized);
+  if (Number.isFinite(localParsed.getTime())) return localParsed.getTime();
+  const utcParsed = new Date(`${normalized}Z`);
+  if (Number.isFinite(utcParsed.getTime())) return utcParsed.getTime();
+  return Number.NaN;
+}
+
+function resolveSceneSavedTime(row: EditorServerSceneItem) {
+  if (editor.sceneCode && row.code === editor.sceneCode && editor.sceneSavedAt) {
+    const localMs = parseTimeMs(editor.sceneSavedAt);
+    const rowMs = parseTimeMs(row.updatedAt || row.createdAt);
+    if (!Number.isFinite(rowMs) || (Number.isFinite(localMs) && localMs >= rowMs)) {
+      return editor.sceneSavedAt;
+    }
+  }
+  return row.updatedAt || row.createdAt;
+}
+
 function formatTime(iso?: string) {
   if (!iso) return "-";
-  return new Date(iso).toLocaleString("zh-CN");
+  const raw = String(iso).trim();
+  if (!raw) return "-";
+  const normalized = raw.includes(" ") ? raw.replace(" ", "T") : raw;
+  const parsedLocal = new Date(normalized);
+  const parsed = Number.isFinite(parsedLocal.getTime()) ? parsedLocal : new Date(`${normalized}Z`);
+  if (!Number.isFinite(parsed.getTime())) return raw;
+  return new Intl.DateTimeFormat("zh-CN", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false
+  }).format(parsed);
 }
 
 async function copy(url: string) {
@@ -131,8 +200,7 @@ async function onEdit(row: EditorServerSceneItem) {
 async function onDelete(row: EditorServerSceneItem) {
   try {
     await ElMessageBox.confirm(`确定删除场景「${displaySceneTitle(row)}」？`, "提示", {
-      type: "warning",
-      zIndex: 3200
+      type: "warning"
     });
   } catch {
     return;
@@ -187,6 +255,10 @@ async function onDelete(row: EditorServerSceneItem) {
 
   .editor-scene-list-drawer__body {
     min-height: 200px;
+  }
+
+  .editor-scene-list-drawer__search {
+    margin-bottom: 10px;
   }
 
   .editor-scene-list-drawer__table-wrap {

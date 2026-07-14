@@ -1,12 +1,13 @@
 <template>
   <div class="progress-area" :class="{ 'preview-progress': editor.isPreviewMode }" @click.stop>
     <div :ref="editor.bindRef('trackEl')" class="progress-track progress-track--chapters" @click="editor.seekTrack">
-      <div class="prog-segs">
+      <div class="prog-playback" :style="{ width: `${trailPct}%` }" />
+      <div class="prog-segs prog-segs--absolute">
         <div
           v-for="(ch, i) in progressSegments"
           :key="ch.id"
           class="prog-seg-wrap"
-          :style="{ flex: `${segmentFlex(ch)} 1 0%` }"
+          :style="segmentStyle(ch)"
         >
           <el-tooltip :content="ch.name" placement="top" :show-after="200">
             <div
@@ -90,11 +91,13 @@ const usePresentationSegments = computed(() => editor.viewOnly || editor.isPrevi
 const progressSegments = computed(() =>
   usePresentationSegments.value ? editor.presentationNavChapters : editor.timelineChapters
 );
+const trailPct = computed(() => {
+  if (!editor.duration || editor.duration <= 0) return 0;
+  return Math.max(0, Math.min(100, (editor.currentTime / editor.duration) * 100));
+});
 
-function segmentFlex(ch: Chapter) {
-  return usePresentationSegments.value
-    ? editor.presentationChapterSegmentFlex(ch)
-    : editor.chapterSegmentFlex(ch);
+function segmentStyle(ch: Chapter) {
+  return editor.chapterSegmentStyle(ch);
 }
 
 function segmentFillScale(i: number) {
@@ -108,7 +111,7 @@ const activeChapterLabel = computed(() => {
   }
   const idx = editor.currentChapterIdx;
   if (idx >= 0) return editor.timelineChapters[idx]?.name ?? "";
-  return editor.timelineChapters[0]?.name ?? "";
+  return "";
 });
 
 function onSegmentClick(ch: Chapter, e: MouseEvent) {

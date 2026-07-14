@@ -113,6 +113,23 @@
       padding-left: 16px;
     }
 
+    &__save-btn {
+      position: relative;
+      overflow: visible;
+    }
+
+    &__save-dot {
+      position: absolute;
+      top: 4px;
+      right: 4px;
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: #ef4444;
+      box-shadow: 0 0 0 1px rgb(0 0 0 / 18%);
+      pointer-events: none;
+    }
+
     &--preview &__actions {
       padding-left: 0;
     }
@@ -378,6 +395,17 @@
       pointer-events: none;
       overflow: visible;
 
+      &.is-view .chapter-preview-backdrop {
+        display: none !important;
+      }
+
+      &.is-view.is-drawer-open .chapter-preview-panel,
+      &.is-view .chapter-preview-panel {
+        @media (min-width: 769px) {
+          pointer-events: auto;
+        }
+      }
+
       .chapter-preview-panel,
       .chapter-preview-backdrop,
       .ch-item,
@@ -471,6 +499,21 @@
         border-bottom: none;
         overflow: hidden;
         pointer-events: auto;
+      }
+
+      .scene-node-tree-search {
+        .el-input__wrapper {
+          background: rgb(255 255 255 / 6%);
+          box-shadow: inset 0 0 0 1px rgb(255 255 255 / 14%);
+        }
+
+        .el-input__inner {
+          color: rgb(255 255 255 / 88%);
+
+          &::placeholder {
+            color: rgb(255 255 255 / 48%);
+          }
+        }
       }
 
       .chapter-list--preview-drawer {
@@ -717,9 +760,6 @@
       pointer-events: none;
       touch-action: none;
       cursor: default;
-      left: auto !important;
-      right: max(var(--preview-pip-right), calc(env(safe-area-inset-right, 0px) + var(--preview-pip-right))) !important;
-      top: calc(env(safe-area-inset-top, 0px) + var(--preview-pip-top)) !important;
       max-width: none;
       filter: drop-shadow(0 10px 28px rgb(0 0 0 / 36%));
 
@@ -1032,12 +1072,6 @@
         touch-action: none;
         user-select: none;
         pointer-events: none;
-        left: auto !important;
-        right: max(
-          var(--preview-pip-right, 16px),
-          calc(env(safe-area-inset-right, 0px) + var(--preview-pip-right, 16px))
-        ) !important;
-        top: calc(env(safe-area-inset-top, 0px) + var(--preview-pip-top, 68px)) !important;
         max-width: none;
         filter: drop-shadow(0 10px 28px rgb(0 0 0 / 36%));
 
@@ -1085,10 +1119,6 @@
 
         .pip-group--view-fixed {
           max-width: none;
-          right: max(
-            var(--preview-pip-right, 16px),
-            calc(env(safe-area-inset-right, 0px) + var(--preview-pip-right, 16px))
-          ) !important;
         }
       }
 

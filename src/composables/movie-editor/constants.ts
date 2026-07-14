@@ -83,6 +83,7 @@ export const DEFAULT_SCENE_SETTINGS = {
   ppSaturation: 0,
   toneMapping: "ACESFilmicToneMapping",
   envIntensityVal: 1,
+  /** 1 = 保持 GLTF 原始 envMapIntensity；仅乘算反射，不改粗糙度/金属度 */
   envReflectionIntensity: 1,
   envRotation: 0,
   envMapUrl: null as string | null,

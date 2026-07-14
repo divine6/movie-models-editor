@@ -4,6 +4,7 @@ import type { Chapter } from "@/interface/project";
 
 export function createTimelineHelpers(duration: Ref<number>, currentTime: Ref<number>, timelineChapters: ComputedRef<Chapter[]>) {
   const fmt = (s: number) => {
+    if (!Number.isFinite(s) || s < 0) return "0:00";
     const m = Math.floor(s / 60);
     const se = Math.floor(s % 60);
     return `${m}:${se.toString().padStart(2, "0")}`;

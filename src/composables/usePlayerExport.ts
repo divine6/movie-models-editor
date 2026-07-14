@@ -12,6 +12,8 @@ import {
   type Subtitle
 } from "@/interface/project";
 import { ElMessage } from "element-plus";
+import { ensureProjectNodes } from "@/utils/sceneMigration";
+import { getAnimationNodes } from "@/utils/sceneNodeTree";
 import { ANIMATION } from "@/utils/three/constants";
 
 async function getModelGlbData(model: Model): Promise<ArrayBuffer | null> {
@@ -148,7 +150,8 @@ function generatePlayerHtml(
   modelsPayload: Awaited<ReturnType<typeof buildModelsExportPayload>>,
   videoDataUrl?: string
 ): string {
-  const chaptersJson = JSON.stringify(project.chapters);
+  ensureProjectNodes(project);
+  const chaptersJson = JSON.stringify(getAnimationNodes(project.nodes));
   const modelsJson = JSON.stringify(modelsPayload);
   const subtitlesJson = JSON.stringify(project.subtitles);
 

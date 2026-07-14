@@ -65,11 +65,11 @@
     <div class="subtitle-list-section">
       <div class="subtitle-list-head">
         <span class="subtitle-list-title">{{ $t("OpWeb.Editor.SubtitleList", "已添加的字幕") }}</span>
-        <span class="subtitle-list-count">{{ editor.subtitles.length }}</span>
+        <span class="subtitle-list-count">{{ scopedSubtitles.length }}</span>
       </div>
 
-      <div class="subtitle-list" :class="{ 'is-empty': editor.subtitles.length === 0 }">
-        <div v-if="editor.subtitles.length === 0" class="subtitle-list-empty">
+      <div class="subtitle-list" :class="{ 'is-empty': scopedSubtitles.length === 0 }">
+        <div v-if="scopedSubtitles.length === 0" class="subtitle-list-empty">
           <base-empty size="small" :text="$t('OpWeb.Editor.NoSubtitles', '暂无字幕')">
             <template #desc>
               <span class="subtitle-empty-desc">
@@ -79,7 +79,7 @@
           </base-empty>
         </div>
         <div
-          v-for="s in editor.sortedSubtitles"
+          v-for="s in scopedSubtitles"
           :key="s.id"
           class="subtitle-item"
           :class="{ 'is-editing': editingId === s.id }"
@@ -110,13 +110,14 @@
 
 <script setup lang="ts" name="editor-subtitle-panel">
 import { Delete } from "@element-plus/icons-vue";
-import { reactive, ref, watch } from "vue";
+import { computed, reactive, ref, watch } from "vue";
 
 import { useMovieEditorContext } from "@/composables/useMovieEditorContext";
 import { useTranslate } from "@/hooks/useTranslate";
 import { type Subtitle, SUBTITLE_DEFAULT_BACKGROUND, SUBTITLE_TEXT_MAX_LENGTH } from "@/interface/project";
 
 const editor = useMovieEditorContext();
+const scopedSubtitles = computed(() => editor.chapterSubtitles);
 const $t = useTranslate();
 const editingId = ref<string | null>(null);
 

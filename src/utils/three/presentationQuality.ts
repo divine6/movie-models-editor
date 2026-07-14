@@ -4,7 +4,31 @@ import { getDevicePixelRatio, normalizeAntialiasRatio } from "@/composables/movi
 
 import type { GpuTierProfile } from "./gpuTier";
 
-const TEXTURE_MAP_KEYS = ["map", "normalMap", "roughnessMap", "metalnessMap", "aoMap", "emissiveMap"] as const;
+/** 提升 GLB 贴图在斜视角下的清晰度（覆盖 Standard / Physical 常用贴图槽） */
+const TEXTURE_MAP_KEYS = [
+  "map",
+  "normalMap",
+  "roughnessMap",
+  "metalnessMap",
+  "aoMap",
+  "emissiveMap",
+  "alphaMap",
+  "bumpMap",
+  "displacementMap",
+  "lightMap",
+  "clearcoatMap",
+  "clearcoatNormalMap",
+  "clearcoatRoughnessMap",
+  "sheenColorMap",
+  "sheenRoughnessMap",
+  "transmissionMap",
+  "thicknessMap",
+  "specularMap",
+  "specularIntensityMap",
+  "specularColorMap",
+  "iridescenceMap",
+  "iridescenceThicknessMap"
+] as const;
 
 /** Oxide 风格：根据 GPU 最大纹理边长计算 DPR 上限 */
 export function probePresentationBufferCap(viewportEdgePx: number, maxTextureSize: number): number {
@@ -44,12 +68,15 @@ export function applyMeshTextureQuality(root: THREE.Object3D, renderer: THREE.We
     for (const mat of mats) {
       if (!mat) continue;
       for (const key of TEXTURE_MAP_KEYS) {
-        const tex = (mat as THREE.MeshStandardMaterial)[key];
-        if (!tex) continue;
+        const tex = (mat as THREE.MeshStandardMaterial & Record<string, THREE.Texture | null>)[key];
+        if (!tex || !(tex as THREE.Texture).isTexture) continue;
         tex.anisotropy = aniso;
-        tex.minFilter = THREE.LinearMipmapLinearFilter;
-        tex.magFilter = THREE.LinearFilter;
-        tex.generateMipmaps = true;
+        const compressed = (tex as THREE.CompressedTexture).isCompressedTexture;
+        if (!compressed) {
+          tex.minFilter = THREE.LinearMipmapLinearFilter;
+          tex.magFilter = THREE.LinearFilter;
+          tex.generateMipmaps = true;
+        }
         tex.needsUpdate = true;
       }
     }

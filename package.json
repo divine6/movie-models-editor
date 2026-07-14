@@ -30,6 +30,8 @@
     "deploy:owner": "node script/deploy.js owner",
     "extract:i18n": "node script/extract.js",
     "type:check": "vue-tsc --noEmit --skipLibCheck",
+    "test:e2e": "playwright test",
+    "test:e2e:scene-nodes": "playwright test e2e/unit/scene-node-utils.spec.ts e2e/api/scene-nodes.api.spec.ts e2e/scene-nodes-editor.spec.ts",
     "preview": "pnpm build:dev && vite preview",
     "lint:eslint": "eslint --fix --ext .js,.ts,.vue ./src",
     "lint:prettier": "prettier --write \"src/**/*.{js,ts,json,tsx,css,less,scss,vue,html,md}\"",

@@ -23,6 +23,8 @@ export const useChapterStore = defineStore("chapter", {
         id,
         projectId,
         name,
+        type: "animation",
+        sortOrder: 0,
         subtitle: "",
         startTime,
         endTime,

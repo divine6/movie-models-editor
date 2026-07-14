@@ -158,6 +158,9 @@ export function rewireEditorFrontendHost(url: string) {
 
 export function resolveAssetUrl(path: string) {
   if (!path) return "";
+  // 本地临时地址不可走服务端代理
+  if (isTransientMediaUrl(path)) return unwrapTransientMediaUrl(path);
+
   const normalizeLegacyPath = (pathname: string) => {
     let p = pathname.startsWith("/") ? pathname : `/${pathname}`;
     p = p.replace(/^\/editor-api(?=\/|$)/, "");
@@ -165,6 +168,35 @@ export function resolveAssetUrl(path: string) {
   };
   if (/^https?:\/\//i.test(path)) return rewireEditorServerHost(path);
   return `${editorServerBaseUrl()}${normalizeLegacyPath(path)}`;
+}
+
+/** blob:/data: 或被错误加上前导 / 的临时媒体地址 */
+export function isTransientMediaUrl(path: string) {
+  if (!path || typeof path !== "string") return false;
+  const p = path.trim();
+  return (
+    p.startsWith("blob:") ||
+    p.startsWith("data:") ||
+    /^\/+blob:/i.test(p) ||
+    /^\/+data:/i.test(p)
+  );
+}
+
+/** 还原被误存成 `/blob:...` 的地址；无法还原的返回空串 */
+export function unwrapTransientMediaUrl(path: string) {
+  if (!path) return "";
+  const trimmed = path.trim();
+  if (trimmed.startsWith("blob:") || trimmed.startsWith("data:")) return trimmed;
+  const unslashed = trimmed.replace(/^\/+/, "");
+  if (unslashed.startsWith("blob:") || unslashed.startsWith("data:")) return unslashed;
+  return "";
+}
+
+/** 持久化用的资源路径：拒绝把 blob/data 写进场景 */
+export function toPersistableAssetPath(path: string | null | undefined): string | null {
+  if (!path) return null;
+  if (isTransientMediaUrl(path)) return null;
+  return path;
 }
 
 export function rewireEditorServerHost(url: string) {

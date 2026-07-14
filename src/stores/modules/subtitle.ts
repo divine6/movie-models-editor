@@ -17,6 +17,7 @@ export const useSubtitleStore = defineStore("subtitle", {
     /** 创建字幕 */
     createSubtitle(
       projectId: string,
+      parentNodeId: string,
       text: string,
       startTime: number,
       endTime: number,
@@ -27,6 +28,7 @@ export const useSubtitleStore = defineStore("subtitle", {
       return {
         id,
         projectId,
+        parentNodeId,
         startTime,
         endTime,
         text,

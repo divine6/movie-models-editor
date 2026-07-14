@@ -34,10 +34,13 @@ import {
   fetchModelSet,
   fetchSceneList,
   fetchScene,
+  isTransientMediaUrl,
   rewireEditorFrontendHost,
   rewireEditorServerHost,
   resolveAssetUrl,
   saveScene as saveSceneToBackend,
+  toPersistableAssetPath,
+  unwrapTransientMediaUrl,
   updateScene as updateSceneOnBackend,
   uploadSceneVideo
 } from "@/api/modules/editor-server";
@@ -85,11 +88,29 @@ import {
 import { createTimelineHelpers } from "@/composables/movie-editor/utils/timeline";
 import { exportPlayer } from "@/composables/usePlayerExport";
 import { resumeProjectPersist, suspendProjectPersist } from "@/utils/projectPersist";
-import { flattenChapterTree, getDescendantChapterIds, getRootChapters, resolveActiveChapterAtTime } from "@/utils/chapterTree";
+import { createSceneNodeEditorApi } from "@/composables/movie-editor/sceneNodeEditorApi";
+import { getDescendantChapterIds, resolveActiveChapterAtTime } from "@/utils/chapterTree";
+import { ensureProjectNodes, SCHEMA_VERSION } from "@/utils/sceneMigration";
+import {
+  flattenSceneNodeTree,
+  getAnimationNodes,
+  getNodeById,
+  getParentVideoNodeById,
+  getTimelineAnimations,
+  getVideoAnimations,
+  isAnimationNode,
+  isVideoNode,
+  getDescendantNodeIds,
+  getChildNodes,
+  getRootNodes,
+  resolveActiveAnimationAtTime
+} from "@/utils/sceneNodeTree";
 import { isCoarsePointerDevice, withVideoPosterFragment } from "@/utils/device";
 import {
   type Chapter,
   type Model,
+  type SceneNode,
+  type SceneVideoNode,
   type ModelConfig,
   type ModelHierarchyNode,
   type Subtitle,
@@ -127,6 +148,11 @@ import { createViewportGrid, disposeViewportGrid } from "@/utils/three/viewportG
 import { createViewportEnvironment, disposeViewportEnvironment } from "@/utils/three/viewportEnvironment";
 import { createEnvReflectionProbe, type EnvReflectionProbe } from "@/utils/three/envReflectionProbe";
 import { applyMeshTextureQuality, resolvePresentationPixelRatio } from "@/utils/three/presentationQuality";
+import {
+  applyGltfEnvMapIntensity,
+  prepareGltfMaterials,
+  updateGltfMaterialBaseOverrides
+} from "@/utils/three/gltfMaterials";
 import { detectGpuTierProfile, type GpuTierProfile } from "@/utils/three/gpuTier";
 import { toastShow } from "@/utils/toast";
 
@@ -149,6 +175,13 @@ export function useMovieEditor() {
   const playbackRate = ref<number>(1);
   const playingIdx = ref(-1);
   const selectedChapterId = ref<string | null>(null);
+  const selectedNodeId = ref<string | null>(null);
+  const activeVideoId = ref<string | null>(null);
+  const expandedNodeIds = ref<Set<string>>(new Set());
+  const sceneNodeDraggingId = ref<string | null>(null);
+  const sceneNodeDropTargetId = ref<string | null>(null);
+  const videoNodeUploadTargetId = ref<string | null>(null);
+  const videoOnlyMode = ref(false);
   const selModelId = ref<string | null>(null);
   const selModelNodeId = ref<string | null>(null);
   const hoverModelId = ref<string | null>(null);
@@ -169,7 +202,8 @@ export function useMovieEditor() {
   const viewOnly = ref((route.query.mode as string) === "view" && !!(route.query.code as string));
   /** 编辑页内预览：仅内存切换，不跟随 URL mode=preview（避免 fullPath 变化整页重挂载） */
   const isPreviewMode = ref(viewOnly.value);
-  const routeGateLoading = ref(!!(route.query.code as string));
+  const editorBootLoading = ref(true);
+  const editorInitializing = computed(() => editorBootLoading.value || sceneBootstrapBusy.value);
   const rightTab = ref("model");
   const videoFps = ref(0);
   const modelSetCode = ref<string | null>(null);
@@ -181,8 +215,10 @@ export function useMovieEditor() {
   );
   const sceneCode = ref<string | null>(null);
   const shareLink = ref("");
+  const sceneSavedAt = ref("");
   const savingScene = ref(false);
   const sceneListVersion = ref(0);
+  const sceneSavedSignature = ref("");
   const editSceneCompanyName = ref("");
   const editSceneToolName = ref("");
 
@@ -223,6 +259,8 @@ export function useMovieEditor() {
   const editingSegMode = ref<"start" | "end">("start");
   let _chAnimLock = false; // prevent re-entrant chapter animation from onTick
   let chAnimChapterId: string | null = null;
+  let editPlaybackSyncChapterId: string | null = null;
+  let editPlaybackSyncElapsed = -1;
   let chAnimWallclock = false;
   let chAnimWallclockStart = 0;
   let chAnimWallclockMaxDur = 0;
@@ -290,7 +328,7 @@ export function useMovieEditor() {
   const remoteUrl = ref("");
   const videoSourceTab = ref<"local" | "url">("local");
   const isDragOver = ref(false);
-  const showVideoPip = ref(true);
+  const showVideoPip = ref(false);
   const modelIntroLabels = ref<Array<{ modelId: string; nodeId: string | null; text: string; x: number; y: number }>>([]);
   const playbackHintVisible = ref(false);
   const playbackHintFading = ref(false);
@@ -388,22 +426,50 @@ export function useMovieEditor() {
 
   // Computed
   const currProj = computed(() => pStore.currentProject);
-  const hasVideo = computed(() => !!currProj.value?.videoSrc);
+  const nodes = computed(() => {
+    if (currProj.value) ensureProjectNodes(currProj.value);
+    return currProj.value?.nodes || [];
+  });
+  const activeVideoNode = computed(() => {
+    if (!activeVideoId.value) return null;
+    const n = getNodeById(nodes.value, activeVideoId.value);
+    return n && isVideoNode(n) ? n : null;
+  });
+  const hasVideo = computed(() => !!activeVideoNode.value?.videoSrc);
+  const showNodePanel = computed(() => !!currProj.value && (!viewOnly.value || nodes.value.length > 0));
   watch(hasVideo, function (v, prev) {
-    if (v) syncVideoElementSrc();
-    if (!v || !pendingModelSetCode.value || modelSetModelsLoaded.value) return;
-    // 编辑场景链接：仅在本次新导入视频后加载模型，不在初始化时展示
+    // 编辑态未打开视频窗时，不自动挂载 video src
+    if (v && (viewOnly.value || isPreviewMode.value || showVideoPip.value)) {
+      syncVideoElementSrc();
+    }
+    if (!v) {
+      if (videoEl.value) delete videoEl.value.dataset.editorSrc;
+      return;
+    }
+    if (!pendingModelSetCode.value || modelSetModelsLoaded.value) return;
     if (editSceneLinkEntry.value && prev !== false) return;
     void tryLoadPendingModelSet();
   });
-  const videoSrc = computed(() => currProj.value?.videoSrc || "");
-  const videoWidth = computed(() => currProj.value?.videoWidth || 0);
-  const videoHeight = computed(() => currProj.value?.videoHeight || 0);
-  const chapters = computed(() => currProj.value?.chapters || []);
+  const videoSrc = computed(() => activeVideoNode.value?.videoSrc || "");
+  watch(videoSrc, (src, prev) => {
+    if (!src || src === prev) return;
+    if (viewOnly.value || isPreviewMode.value || showVideoPip.value) {
+      syncVideoElementSrc(src);
+    }
+  });
+  const videoWidth = computed(() => activeVideoNode.value?.videoWidth || 0);
+  const videoHeight = computed(() => activeVideoNode.value?.videoHeight || 0);
+  const chapters = computed(() => getAnimationNodes(nodes.value));
   const sortedChapters = computed(() => [...chapters.value].sort((a, b) => a.startTime - b.startTime));
-  const timelineChapters = computed(() => getRootChapters(chapters.value));
-  const chapterTreeList = computed(() => flattenChapterTree(chapters.value));
+  const timelineChapters = computed(() => getTimelineAnimations(nodes.value, activeVideoId.value));
+  const chapterTreeList = computed(() =>
+    flattenSceneNodeTree(nodes.value).map(item => ({
+      chapter: item.node as Chapter,
+      depth: item.depth
+    }))
+  );
   const hasChapters = computed(() => chapters.value.length > 0);
+  const rootSceneNodes = computed(() => getRootNodes(nodes.value));
   const currentChapterIdx = computed(() => findChIdx(currentTime.value));
   const presentationNavChapterCount = computed(() => getPresentationNavChapters().length);
   const presentationNavChapters = computed(() => getPresentationNavChapters());
@@ -426,6 +492,13 @@ export function useMovieEditor() {
     if (chapters.value.length === 0) return true;
     return !!getNextChapterRange(undefined);
   });
+  const sceneDraftSignature = computed(() => buildSceneDraftSignature());
+  const sceneHasUnsavedChanges = computed(
+    () => !!sceneDraftSignature.value && sceneDraftSignature.value !== sceneSavedSignature.value
+  );
+  const canSaveScene = computed(
+    () => hasVideo.value && chapters.value.length > 0 && sceneHasUnsavedChanges.value && !savingScene.value
+  );
   const models = computed(() => currProj.value?.models || []);
   const subtitles = computed(() => currProj.value?.subtitles || []);
   const selectedChapter = computed(() => chapters.value.find(c => c.id === selectedChapterId.value));
@@ -452,9 +525,9 @@ export function useMovieEditor() {
   });
   const sortedSubtitles = computed(() => [...subtitles.value].sort((a, b) => a.startTime - b.startTime));
   const chapterSubtitles = computed(() => {
-    const ch = selectedChapter.value;
-    if (!ch) return [];
-    return sortedSubtitles.value.filter(s => s.startTime >= ch.startTime - 0.1 && s.endTime <= ch.endTime + 0.1);
+    const parentId = selectedNodeId.value || selectedChapterId.value || activeVideoId.value;
+    if (!parentId) return [];
+    return sortedSubtitles.value.filter(s => s.parentNodeId === parentId);
   });
 
   // ── Three.js ──
@@ -481,6 +554,11 @@ export function useMovieEditor() {
   let envMap: THREE.Texture | null = null;
   let envMapEquirect: THREE.Texture | null = null;
   let envMapSourceUrl: string | null = null;
+  /** 已成功套用的环境贴图键（resolvedUrl|hdr），用于跳过重复 PMREM */
+  let appliedEnvMapKey: string | null = null;
+  let envMapLoadGen = 0;
+  /** PMREM / RoomEnvironment 烘焙期间暂停视口绘制，避免与渲染循环抢 GPU */
+  let envBakeBusy = false;
   let envReflectionProbe: EnvReflectionProbe | null = null;
   const textureLoader = new THREE.TextureLoader();
   const rgbeLoader = new RGBELoader();
@@ -609,21 +687,35 @@ export function useMovieEditor() {
     gltfLoader.setDRACOLoader(dracoLoader);
     gltfLoader.setMeshoptDecoder(MeshoptDecoder);
     try {
-      envMap = createViewportEnvironment(renderer);
-      scene.environment = envMap;
-      applyEnv();
-      ensureEnvReflectionSphere();
-      if (envMapUrl.value) {
-        loadEnvironmentMapFromUrl(envMapUrl.value, envMapIsHdr.value);
+      // 服务端场景会随后恢复设置；此处只建默认环境，避免与后续 HDR PMREM 竞态
+      ensureDefaultViewportEnvironment();
+      if (!skipStoredSceneSettings && envMapUrl.value) {
+        void loadEnvironmentMapFromUrlAsync(envMapUrl.value, envMapIsHdr.value);
       } else {
         applyBackgroundFromSettings();
       }
     } catch (e) {
       console.warn("Viewport environment init failed", e);
     }
+    bindWebGlContextGuards();
     bindViewportPicking();
     syncEditorGizmosVisibility();
     animate();
+  }
+
+  function bindWebGlContextGuards() {
+    const canvas = canvasEl.value;
+    if (!canvas || (canvas as any).__editorWebglGuards) return;
+    (canvas as any).__editorWebglGuards = true;
+    canvas.addEventListener(
+      "webglcontextlost",
+      (e: Event) => {
+        e.preventDefault();
+        console.error("[movie-editor] WebGL context lost");
+        toastShow("3D 渲染上下文丢失，请刷新页面", "error");
+      },
+      false
+    );
   }
 
   function bindViewportPicking() {
@@ -1189,7 +1281,11 @@ export function useMovieEditor() {
     syncEditorGizmosVisibility();
   }
 
+  let sceneLightsPinnedFromSettings = false;
+
   function snapSceneLightsToModelDefaults() {
+    // 已从场景设置恢复过灯光时，不再用模型中心覆盖用户保存的灯光位姿
+    if (sceneLightsPinnedFromSettings) return;
     const center = getSceneModelCenter();
     if (!center) return;
     const typeCounters: Record<SceneLightType, number> = { directional: 0, point: 0, spot: 0 };
@@ -1244,6 +1340,7 @@ export function useMovieEditor() {
     }
     disposeViewportEnvironment(envMap);
     envMap = null;
+    appliedEnvMapKey = null;
   }
 
   function ensureEnvReflectionSphere() {
@@ -1256,32 +1353,81 @@ export function useMovieEditor() {
     syncEditorGizmosVisibility();
   }
 
+  function normalizeViewportBgColor(raw: string): string {
+    const normalized = String(raw).toLowerCase().trim();
+    if (
+      !normalized ||
+      normalized === "#f2f3f5" ||
+      normalized === "#0a0c10" ||
+      normalized === "#ffffff" ||
+      normalized === "#fff" ||
+      normalized === "white" ||
+      normalized === "#fafafa" ||
+      normalized === "#f5f5f5"
+    ) {
+      return SCENE_VIEWPORT_BG;
+    }
+    return raw;
+  }
+
   function applyBackgroundFromSettings() {
     if (!scene || !renderer) return;
     // 背景始终保持编辑器默认背景色；环境贴图仅用于模型反射
-    const bg = new THREE.Color(bgColorVal.value);
+    const bg = new THREE.Color(normalizeViewportBgColor(bgColorVal.value));
     scene.background = bg;
     renderer.setClearColor(bg, 1);
   }
 
+  function ensureDefaultViewportEnvironment() {
+    if (!renderer || !scene) return;
+    if (envMap && !envMapEquirect) return;
+    envBakeBusy = true;
+    try {
+      disposeEnvTextures();
+      envMap = createViewportEnvironment(renderer);
+      scene.environment = envMap;
+      applyBackgroundFromSettings();
+      ensureEnvReflectionSphere();
+      applyEnv();
+    } catch (e) {
+      console.warn("Viewport environment init failed", e);
+    } finally {
+      envBakeBusy = false;
+    }
+  }
+
   function applyEnvironmentTexture(equirect: THREE.Texture, isHdr: boolean) {
     if (!renderer || !scene) return;
-    disposeEnvTextures();
-    equirect.mapping = THREE.EquirectangularReflectionMapping;
-    if (!isHdr) {
-      equirect.colorSpace = THREE.SRGBColorSpace;
+    envBakeBusy = true;
+    try {
+      disposeEnvTextures();
+      equirect.mapping = THREE.EquirectangularReflectionMapping;
+      if (!isHdr) {
+        equirect.colorSpace = THREE.SRGBColorSpace;
+      }
+      envMapEquirect = equirect;
+
+      const pmrem = new THREE.PMREMGenerator(renderer);
+      pmrem.compileEquirectangularShader();
+      envMap = pmrem.fromEquirectangular(equirect).texture;
+      pmrem.dispose();
+
+      scene.environment = envMap;
+      applyBackgroundFromSettings();
+      ensureEnvReflectionSphere();
+      applyEnv();
+    } catch (e) {
+      console.warn("PMREM environment failed, falling back to RoomEnvironment", e);
+      try {
+        equirect.dispose();
+      } catch {
+        /* ignore */
+      }
+      envMapEquirect = null;
+      ensureDefaultViewportEnvironment();
+    } finally {
+      envBakeBusy = false;
     }
-    envMapEquirect = equirect;
-
-    const pmrem = new THREE.PMREMGenerator(renderer);
-    pmrem.compileEquirectangularShader();
-    envMap = pmrem.fromEquirectangular(equirect).texture;
-    pmrem.dispose();
-
-    scene.environment = envMap;
-    applyBackgroundFromSettings();
-    ensureEnvReflectionSphere();
-    applyEnv();
   }
 
   let SETTINGS_KEY = SCENE_SETTINGS_STORAGE_KEY;
@@ -1359,8 +1505,7 @@ export function useMovieEditor() {
     if (d.fogNear !== undefined) fogNear.value = d.fogNear;
     if (d.fogFar !== undefined) fogFar.value = d.fogFar;
     if (d.bgColorVal) {
-      const normalized = String(d.bgColorVal).toLowerCase();
-      bgColorVal.value = normalized === "#f2f3f5" || normalized === "#0a0c10" ? SCENE_VIEWPORT_BG : d.bgColorVal;
+      bgColorVal.value = normalizeViewportBgColor(d.bgColorVal);
     }
     if (d.shadowEnabled !== undefined) shadowEnabled.value = d.shadowEnabled;
     if (d.shadowIntensity !== undefined) shadowIntensity.value = d.shadowIntensity;
@@ -1414,6 +1559,7 @@ export function useMovieEditor() {
   async function applySceneSettingsFromServer(sceneSettings: unknown) {
     if (!sceneSettings || typeof sceneSettings !== "object") return;
     applySceneSettingsData(sceneSettings as Record<string, any>);
+    sceneLightsPinnedFromSettings = true;
     applySettings();
     applyGrid();
     applyFog();
@@ -1425,9 +1571,10 @@ export function useMovieEditor() {
     saveAllSettings();
     const settings = sceneSettings as { envMapUrl?: string; envMapIsHdr?: boolean };
     if (settings.envMapUrl) {
-      loadEnvironmentMapFromUrl(settings.envMapUrl, !!settings.envMapIsHdr);
+      await loadEnvironmentMapFromUrlAsync(settings.envMapUrl, !!settings.envMapIsHdr);
     }
     applyAntialiasing();
+    applyModelEnvReflectionIntensity();
   }
 
   function resetSceneSettings() {
@@ -1487,23 +1634,115 @@ export function useMovieEditor() {
   }
 
   function loadEnvironmentMapFromUrl(url: string, isHdr: boolean) {
-    if (!renderer || !scene) return;
-    envMapPreview.value = isHdr ? "" : url;
-    envMapSourceUrl = url;
-    const onLoaded = (texture: THREE.Texture) => {
-      applyEnvironmentTexture(texture, isHdr);
-    };
-    const onError = () => {
-      console.warn("Environment map load failed", url);
-      if (url === "/hdr/default.hdr") {
-        envMapPreview.value = "";
-      }
-    };
-    if (isHdr) {
-      rgbeLoader.load(url, onLoaded, undefined, onError);
-    } else {
-      textureLoader.load(url, onLoaded, undefined, onError);
+    void loadEnvironmentMapFromUrlAsync(url, isHdr);
+  }
+
+  function resolveEnvMapLoadUrl(url: string) {
+    if (!url) return "";
+    if (url.startsWith("blob:") || url.startsWith("data:")) return url;
+    return resolveAssetUrl(url);
+  }
+
+  function makeEnvMapKey(resolvedUrl: string, isHdr: boolean) {
+    return `${resolvedUrl}|${isHdr ? 1 : 0}`;
+  }
+
+  function loadEnvironmentMapFromUrlAsync(url: string, isHdr: boolean): Promise<boolean> {
+    if (!renderer || !scene || !url) return Promise.resolve(false);
+    const resolved = resolveEnvMapLoadUrl(url);
+    if (!resolved) return Promise.resolve(false);
+    const key = makeEnvMapKey(resolved, isHdr);
+    if (appliedEnvMapKey === key && envMap) {
+      envMapUrl.value = url;
+      envMapIsHdr.value = isHdr;
+      envMapSourceUrl = resolved;
+      return Promise.resolve(true);
     }
+
+    const gen = ++envMapLoadGen;
+    envMapPreview.value = isHdr ? "" : resolved;
+    envMapSourceUrl = resolved;
+    envMapUrl.value = url;
+    envMapIsHdr.value = isHdr;
+
+    return new Promise(resolve => {
+      const onLoaded = (texture: THREE.Texture) => {
+        if (gen !== envMapLoadGen) {
+          texture.dispose();
+          resolve(false);
+          return;
+        }
+        try {
+          applyEnvironmentTexture(texture, isHdr);
+          if (gen === envMapLoadGen && envMap) {
+            appliedEnvMapKey = key;
+            applyModelEnvReflectionIntensity();
+            resolve(true);
+            return;
+          }
+          resolve(false);
+        } catch (e) {
+          console.warn("Environment map apply failed", resolved, e);
+          resolve(false);
+        }
+      };
+      const onError = () => {
+        if (gen !== envMapLoadGen) {
+          resolve(false);
+          return;
+        }
+        console.warn("Environment map load failed", resolved);
+        if (url === "/hdr/default.hdr") {
+          envMapPreview.value = "";
+        }
+        if (!envMap) ensureDefaultViewportEnvironment();
+        resolve(false);
+      };
+      if (isHdr) {
+        rgbeLoader.load(resolved, onLoaded, undefined, onError);
+      } else {
+        textureLoader.load(resolved, onLoaded, undefined, onError);
+      }
+    });
+  }
+
+  /** 模型加载完成后重新套用场景设置，避免灯光自动吸附覆盖已保存参数 */
+  async function finalizeSceneVisualBootstrap() {
+    if (!renderer || !scene) return;
+    applySettings();
+    applyGrid();
+    applyFog();
+    if (shadowEnabled.value) applyShadow();
+    if (bloomIntensity.value > 0 || ppContrast.value !== 0 || ppSaturation.value !== 0) {
+      toggleBloom();
+      toggleColor();
+    }
+    applyAntialiasing();
+    if (envMapUrl.value) {
+      const ok = await loadEnvironmentMapFromUrlAsync(envMapUrl.value, envMapIsHdr.value);
+      if (!ok && !envMap) ensureDefaultViewportEnvironment();
+    } else if (!envMap) {
+      ensureDefaultViewportEnvironment();
+    }
+    meshes.forEach(root => {
+      prepareGltfMaterials(root, renderer);
+      applyMeshTextureQuality(root, renderer!);
+      root.traverse(child => {
+        const mesh = child as THREE.Mesh;
+        if (!mesh.isMesh || !mesh.material) return;
+        const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+        for (const mat of mats) {
+          if (!mat) continue;
+          mat.needsUpdate = true;
+        }
+      });
+    });
+    // 先整理贴图/快照原始 PBR，再套用反射强度（只乘 envMapIntensity）
+    applyModelEnvReflectionIntensity();
+    syncSceneOrbitLimits();
+    layoutEditorGizmosNearScene();
+    applyBackgroundFromSettings();
+    handleResize();
   }
 
   function applyToneMapping() {
@@ -1515,7 +1754,7 @@ export function useMovieEditor() {
 
   function applyFog() {
     if (!scene) return;
-    const bg = new THREE.Color(bgColorVal.value);
+    const bg = new THREE.Color(normalizeViewportBgColor(bgColorVal.value));
 
     if (!fogEnabled.value) {
       scene.fog = null;
@@ -1571,11 +1810,7 @@ export function useMovieEditor() {
     if (envMapUrl.value) {
       loadEnvironmentMapFromUrl(envMapUrl.value, envMapIsHdr.value);
     } else {
-      disposeEnvTextures();
-      envMap = createViewportEnvironment(renderer);
-      scene.environment = envMap;
-      applyBackgroundFromSettings();
-      applyEnv();
+      ensureDefaultViewportEnvironment();
     }
     saveAllSettings();
   }
@@ -1635,23 +1870,31 @@ export function useMovieEditor() {
   function syncMaterialUiFromModel() {
     const model = selModel.value;
     if (!model) return;
-    const root = meshes.get(model.id);
-    if (!root) return;
+    const targets =
+      selModelNodeId.value != null
+        ? getNodeObjects(model.id, selModelNodeId.value, true)
+        : ([meshes.get(model.id)].filter(Boolean) as THREE.Object3D[]);
+    if (!targets.length) return;
 
     let found = false;
-    root.traverse(child => {
-      if (found) return;
-      const mesh = child as THREE.Mesh;
-      if (!mesh.isMesh || !mesh.material) return;
-      const mat = (Array.isArray(mesh.material) ? mesh.material[0] : mesh.material) as THREE.MeshStandardMaterial;
-      if (!mat?.isMeshStandardMaterial) return;
-      if (mat.roughness !== undefined) matRoughness.value = mat.roughness;
-      if (mat.metalness !== undefined) matMetalness.value = mat.metalness;
-      if (mat.normalScale) matNormalStr.value = mat.normalScale.x;
-      if (mat.emissiveIntensity !== undefined) matEmissiveInt.value = mat.emissiveIntensity;
-      else matEmissiveInt.value = 0;
-      found = true;
-    });
+    const visit = (root: THREE.Object3D) => {
+      root.traverse(child => {
+        if (found) return;
+        const mesh = child as THREE.Mesh;
+        if (!mesh.isMesh || !mesh.material) return;
+        const mat = (Array.isArray(mesh.material) ? mesh.material[0] : mesh.material) as THREE.MeshStandardMaterial;
+        if (!mat?.isMeshStandardMaterial && !(mat as THREE.MeshPhysicalMaterial)?.isMeshPhysicalMaterial) return;
+        if (mat.color) matColor.value = `#${mat.color.getHexString()}`;
+        if (mat.roughness !== undefined) matRoughness.value = mat.roughness;
+        if (mat.metalness !== undefined) matMetalness.value = mat.metalness;
+        // 法线强度用绝对值展示；glTF 可能为 -1（翻转），滑杆下限为 0 时不能直接读负值
+        if (mat.normalScale) matNormalStr.value = Math.abs(mat.normalScale.x);
+        if (mat.emissiveIntensity !== undefined) matEmissiveInt.value = mat.emissiveIntensity;
+        else matEmissiveInt.value = 0;
+        found = true;
+      });
+    };
+    targets.forEach(visit);
   }
 
   function syncViewportFog() {
@@ -1673,21 +1916,33 @@ export function useMovieEditor() {
   function applyMatToModel(modelId: string) {
     const root = meshes.get(modelId);
     if (!root) return;
-    root.traverse(child => {
-      const mesh = child as THREE.Mesh;
-      if (!mesh.isMesh || !mesh.material) return;
-      const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
-      mats.forEach(mat => {
-        const m = mat as THREE.MeshStandardMaterial;
-        if (!m.isMeshStandardMaterial) return;
-        if (m.roughness !== undefined) m.roughness = matRoughness.value;
-        if (m.metalness !== undefined) m.metalness = matMetalness.value;
-        if (m.normalScale) m.normalScale.setScalar(matNormalStr.value);
-        if (m.emissiveIntensity !== undefined) m.emissiveIntensity = matEmissiveInt.value;
-        m.needsUpdate = true;
+    // 有子节点选中时只改当前选中部件，便于修局部材质；否则改整个模型
+    const targets =
+      selModelId.value === modelId && selModelNodeId.value
+        ? getNodeObjects(modelId, selModelNodeId.value, true)
+        : [root];
+
+    const applyToMat = (mat: THREE.Material) => {
+      const m = mat as THREE.MeshStandardMaterial;
+      if (!m.isMeshStandardMaterial && !(m as THREE.MeshPhysicalMaterial).isMeshPhysicalMaterial) return;
+      // 标量与贴图相乘（Three/glTF 惯例），滑杆始终生效
+      updateGltfMaterialBaseOverrides(m, {
+        color: matColor.value,
+        roughness: matRoughness.value,
+        metalness: matMetalness.value,
+        normalScale: matNormalStr.value,
+        emissiveIntensity: matEmissiveInt.value
       });
-    });
-    // 保持材质参数变更后，反射强度附加效果仍然生效
+    };
+
+    for (const target of targets) {
+      target.traverse(child => {
+        const mesh = child as THREE.Mesh;
+        if (!mesh.isMesh || !mesh.material) return;
+        const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+        mats.forEach(applyToMat);
+      });
+    }
     applyModelEnvReflectionIntensity(root);
     scheduleSaveSettings();
   }
@@ -1873,7 +2128,8 @@ export function useMovieEditor() {
 
   /** 展示模式：SMAA + MSAA 轻量后处理（对齐 Oxide PostProcessing 思路） */
   function renderViewportFrame() {
-    if (!renderer || !scene || !camera) return;
+    if (!renderer || !scene || !camera || envBakeBusy) return;
+    if (renderer.getContext()?.isContextLost?.()) return;
     syncRendererPresentationState();
     syncEditorComposerPasses();
     if (composer) {
@@ -1996,7 +2252,7 @@ export function useMovieEditor() {
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     renderer.toneMapping = TONE_MAPPING_MAP[toneMapping.value] ?? THREE.ACESFilmicToneMapping;
     renderer.toneMappingExposure = ppExposure.value;
-    renderer.setClearColor(new THREE.Color(bgColorVal.value), 1);
+    renderer.setClearColor(new THREE.Color(normalizeViewportBgColor(bgColorVal.value)), 1);
   }
 
   let pendingAntialiasingApply = 0;
@@ -2162,55 +2418,10 @@ export function useMovieEditor() {
   });
 
   function applyModelEnvReflectionIntensity(targetRoot?: THREE.Object3D) {
-    const reflectK = THREE.MathUtils.clamp(envReflectionIntensity.value / 5, 0, 1);
-    const reflectBoost = Math.pow(reflectK, 0.5);
+    // 1 = 保持 GLTF/3ds Max 原始反射；仅缩放 envMapIntensity，绝不改写粗糙度/金属度
+    const intensity = Math.max(0, envReflectionIntensity.value);
     const applyToRoot = (root: THREE.Object3D) => {
-      root.traverse(child => {
-        const mesh = child as THREE.Mesh;
-        if (!mesh.isMesh || !mesh.material) return;
-        const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
-        mats.forEach(mat => {
-          const m = mat as THREE.Material & {
-            envMapIntensity?: number;
-            roughness?: number;
-            metalness?: number;
-            needsUpdate?: boolean;
-            userData?: Record<string, unknown>;
-          };
-          if (typeof m.envMapIntensity !== "number") return;
-
-          const envKey = "__baseEnvMapIntensity";
-          const roughKey = "__baseRoughness";
-          const metalKey = "__baseMetalness";
-
-          const baseEnv =
-            typeof m.userData?.[envKey] === "number" ? (m.userData[envKey] as number) : m.envMapIntensity;
-          const baseRough =
-            typeof m.roughness === "number"
-              ? (typeof m.userData?.[roughKey] === "number" ? (m.userData[roughKey] as number) : m.roughness)
-              : undefined;
-          const baseMetal =
-            typeof m.metalness === "number"
-              ? (typeof m.userData?.[metalKey] === "number" ? (m.userData[metalKey] as number) : m.metalness)
-              : undefined;
-
-          if (!m.userData) m.userData = {};
-          m.userData[envKey] = baseEnv;
-          if (typeof baseRough === "number") m.userData[roughKey] = baseRough;
-          if (typeof baseMetal === "number") m.userData[metalKey] = baseMetal;
-
-          // 反射滑杆：在独立通道内增强“反光感”
-          // 强化反射映射：2 左右即明显，5 为极强反光
-          m.envMapIntensity = baseEnv * (0.2 + reflectBoost * 20);
-          if (typeof baseRough === "number") {
-            m.roughness = THREE.MathUtils.clamp(baseRough * (1 - 0.985 * reflectBoost), 0.002, 1);
-          }
-          if (typeof baseMetal === "number") {
-            m.metalness = THREE.MathUtils.clamp(baseMetal + 1.0 * reflectBoost, 0, 1);
-          }
-          m.needsUpdate = true;
-        });
-      });
+      applyGltfEnvMapIntensity(root, intensity);
     };
     if (targetRoot) {
       applyToRoot(targetRoot);
@@ -2483,11 +2694,9 @@ export function useMovieEditor() {
 
   function completeCameraTransition() {
     if (!afterCameraCallback) return;
-    const chapterId = afterCameraChapterId;
     const fn = afterCameraCallback;
     afterCameraChapterId = null;
     afterCameraCallback = null;
-    if (chapterId && selectedChapterId.value !== chapterId) return;
     fn();
   }
 
@@ -3338,6 +3547,9 @@ export function useMovieEditor() {
   type ChapterCameraSwitchMode = "edit" | "playback" | "auto";
 
   function getChapterCameraSwitchDuration(ch: Chapter, _mode?: ChapterCameraSwitchMode) {
+    if (_mode === "playback" && !viewOnly.value && !isPreviewMode.value) {
+      return 0.5;
+    }
     return Math.max(CHAPTER_CAMERA_SWITCH_MIN_SEC, getChapterCameraTransitionSec(ch));
   }
 
@@ -3505,6 +3717,7 @@ export function useMovieEditor() {
   function canAutoAdvancePresentationChapter(navChapter: Chapter, v: HTMLVideoElement): boolean {
     if (presentationChapterTransition || videoChapterSyncPaused || v.seeking) return false;
     if (performance.now() < presentationChapterCooldownUntil) return false;
+    if (v.currentTime > navChapter.endTime + CHAPTER_END_EPS) return false;
     if (!isPresentationNavChapterAtTime(navChapter, v.currentTime) && v.currentTime < navChapter.endTime - CHAPTER_END_EPS) {
       return false;
     }
@@ -3551,9 +3764,17 @@ export function useMovieEditor() {
         return resolvePresentationNavChapter(chapterPlayTarget.value).id;
       }
     } else {
-      if (chapterPlayTarget.value) return chapterPlayTarget.value.id;
-      const playback = getPlaybackChapterAtTime(currentTime.value);
-      if (playback && isPlaying.value) return playback.id;
+      // 编辑态播放中：以视频时间对应的动画节点为准
+      const video = videoEl.value;
+      if ((video && !video.paused) || isPlaying.value) {
+        const ci = findChIdx(currentTime.value);
+        if (ci >= 0) return timelineChapters.value[ci]?.id ?? null;
+      }
+      if (selectedChapterId.value) return selectedChapterId.value;
+      if (selectedNodeId.value) {
+        const node = getNodeById(nodes.value, selectedNodeId.value);
+        if (node && isAnimationNode(node)) return node.id;
+      }
     }
     if (selectedChapterId.value) return selectedChapterId.value;
     const ci = currentChapterIdx.value;
@@ -3601,7 +3822,8 @@ export function useMovieEditor() {
 
   function isPresentationTimelineSegmentCurrent(segmentIdx: number): boolean {
     if (!viewOnly.value && !isPreviewMode.value) {
-      return currentChapterIdx.value === segmentIdx;
+      const ci = findChIdx(currentTime.value);
+      return ci === segmentIdx;
     }
     const nav = getPresentationNavChapters();
     const activeId = getActiveChapterIdForUi();
@@ -3612,12 +3834,20 @@ export function useMovieEditor() {
   function syncPresentationUiFromChapter(chapter: Chapter) {
     if (!viewOnly.value && !isPreviewMode.value) return;
     const navChapter = resolvePresentationNavChapter(chapter);
+    const syncTime = videoEl.value?.currentTime ?? chapter.startTime;
+    const playableChapter = resolvePlayableChapterForPresentationAtTime(navChapter, syncTime);
     presentationUiChapterId.value = navChapter.id;
     const nav = getPresentationNavChapters();
     const idx = nav.findIndex(ch => ch.id === navChapter.id);
     if (idx >= 0) presentationNavIndex.value = idx;
-    if (selectedChapterId.value !== navChapter.id) {
-      selectedChapterId.value = navChapter.id;
+    if (selectedChapterId.value !== playableChapter.id) {
+      selectedChapterId.value = playableChapter.id;
+    }
+    if (selectedNodeId.value !== playableChapter.id) {
+      selectedNodeId.value = playableChapter.id;
+    }
+    if (playableChapter.parentId && activeVideoId.value !== playableChapter.parentId) {
+      activeVideoId.value = playableChapter.parentId;
     }
   }
 
@@ -3789,7 +4019,100 @@ export function useMovieEditor() {
     };
   }
 
-  function applyChapterCameraForNav(chapter: Chapter, _mode?: ChapterCameraSwitchMode) {
+  function resetAllModelsToDefault() {
+    for (const m of models.value) resetModelTreeToDefault(m);
+    invalidatePickMeshCache();
+    syncTransformVisualOverlays();
+  }
+
+  function isTreeNodeHighlighted(node: SceneNode): boolean {
+    if (viewOnly.value || isPreviewMode.value) {
+      return selectedNodeId.value === node.id;
+    }
+    if (videoOnlyMode.value) {
+      return node.type === "video" && node.id === selectedNodeId.value;
+    }
+    // 依赖响应式 currentTime / isPlaying，保证 timeupdate 时树高亮会刷新
+    if (isPlaying.value) {
+      const ci = findChIdx(currentTime.value);
+      if (ci >= 0) return timelineChapters.value[ci]?.id === node.id;
+    }
+    return selectedNodeId.value === node.id || selectedChapterId.value === node.id;
+  }
+
+  /** 编辑态：跟视频时间同步 3D 动画与树高亮，避免 navigateToChapter 全量切换 */
+  function syncEditModePlaybackFromVideo(v: HTMLVideoElement) {
+    const t = v.currentTime;
+    const ci = findChIdx(t);
+    playingIdx.value = ci;
+
+    if (!v.paused) {
+      if (ci >= 0) {
+        const ch = timelineChapters.value[ci];
+        if (selectedNodeId.value !== ch.id || selectedChapterId.value !== ch.id) {
+          selectedNodeId.value = ch.id;
+          selectedChapterId.value = ch.id;
+          videoOnlyMode.value = false;
+          syncChapterMetaForm(ch);
+        }
+      }
+    }
+
+    if (ci < 0) {
+      if (editPlaybackSyncChapterId !== null) {
+        editPlaybackSyncChapterId = null;
+        editPlaybackSyncElapsed = -1;
+        if (_chAnimLock || chAnimChapterId) stopChapterAnimation();
+        resetAllModelsToDefault();
+      }
+      return;
+    }
+
+    const ch = timelineChapters.value[ci];
+    const elapsed = getChapterAnimElapsed(ch, t);
+    const chapterChanged = editPlaybackSyncChapterId !== ch.id;
+    const hasModelEdits = chapterHasAnyModelEdits(ch);
+    if (!hasModelEdits) {
+      if (chapterChanged) {
+        editPlaybackSyncChapterId = ch.id;
+        editPlaybackSyncElapsed = elapsed;
+        applyChapterCameraForNav(ch, "playback");
+        if (_chAnimLock || chAnimChapterId) stopChapterAnimation();
+        resetAllModelsToDefault();
+      }
+      return;
+    }
+
+    const elapsedChanged = Math.abs(elapsed - editPlaybackSyncElapsed) >= 1 / 30;
+    if (!chapterChanged && !elapsedChanged) return;
+
+    editPlaybackSyncChapterId = ch.id;
+    editPlaybackSyncElapsed = elapsed;
+
+    if (chapterChanged) {
+      applyChapterCameraForNav(ch, "playback");
+      syncChapterVisualState(ch, elapsed, {
+        skipOutlineRebuild: false,
+        skipOverlaySync: false
+      });
+      if (chapterNeedsOutlineRebuild(ch)) {
+        refreshChapterOutlines(ch);
+      }
+    }
+
+    if (!v.paused) {
+      if (!_chAnimLock || chAnimChapterId !== ch.id) {
+        startVideoSyncedChapterAnimation(ch);
+      }
+      applyChapterAnimOnly(ch, elapsed);
+      return;
+    }
+
+    stopChapterAnimation();
+    applyChapterAnimOnly(ch, elapsed);
+  }
+
+  function applyChapterCameraForNav(chapter: Chapter, mode?: ChapterCameraSwitchMode) {
     const safeFrame = shouldUsePresentationSafeFitCamera()
       ? computePresentationSafeFitFrame(chapter)
       : null;
@@ -3797,7 +4120,7 @@ export function useMovieEditor() {
     const fov = safeFrame?.fov ?? chapter.camera.fov;
     const chapterId = chapter.id;
 
-    if (shouldUsePresentationSafeFitCamera()) {
+    if (mode === "edit") {
       snapCam(frame.position, frame.target, fov);
       syncCameraFormFromStored(chapter);
       chapterNavLock.value = false;
@@ -3806,7 +4129,6 @@ export function useMovieEditor() {
 
     afterCameraChapterId = chapterId;
     afterCameraCallback = () => {
-      if (selectedChapterId.value !== chapterId) return;
       syncCameraFormFromStored(chapter);
       chapterNavLock.value = false;
     };
@@ -3847,9 +4169,40 @@ export function useMovieEditor() {
   }
 
   function applyChapter(ch: Chapter) {
+    videoOnlyMode.value = false;
     const resolved = resolveChapter(ch);
     if (!resolved) return;
-    navigateToChapter(resolved.chapter, resolved.idx, { seek: false });
+    if (ch.parentId) {
+      activeVideoId.value = ch.parentId;
+      const parentVideo = getNodeById(nodes.value, ch.parentId);
+      if (parentVideo && isVideoNode(parentVideo) && parentVideo.videoSrc) {
+        showVideoPip.value = true;
+        syncVideoElementSrc(parentVideo.videoSrc);
+      }
+    }
+    selectedNodeId.value = ch.id;
+    selectedChapterId.value = ch.id;
+
+    const video = videoEl.value;
+    // 编辑态未打开视频窗时，只切换模型/相机，不强制 seek 视频
+    if (video && showVideoPip.value) {
+      const shouldKeepPlaying = isPlaying.value || !video.paused;
+      void startChapterPlayback(ch, {
+        syncVideo: true,
+        autoplay: shouldKeepPlaying,
+        keepPlaying: shouldKeepPlaying,
+        userGesture: true,
+        seekTime: ch.startTime
+      });
+      return;
+    }
+
+    navigateToChapter(resolved.chapter, resolved.idx, {
+      seek: false,
+      cameraMode: "playback",
+      visualElapsed: 0,
+      holdCurrentTime: true
+    });
   }
 
   // ── Model helpers ──
@@ -3889,6 +4242,7 @@ export function useMovieEditor() {
     };
     scene.add(root);
     meshes.set(m.id, root);
+    prepareGltfMaterials(root, renderer);
     if (renderer) applyMeshTextureQuality(root, renderer);
     invalidateSceneModelCenterCache();
     applyModelEnvReflectionIntensity(root);
@@ -4104,7 +4458,8 @@ export function useMovieEditor() {
   }
 
   function modelHasEdits(modelId: string): boolean {
-    const ch = getActiveChapter();
+    // 仅在明确选中某个动画节点时展示「已改」，避免刷新后未选中却回退到第一章节误标
+    const ch = selectedChapter.value;
     if (!ch) return false;
     if (modelHasSelectionEditDrafts(ch.id, modelId)) return true;
     return chapterModelHasEdits(ch, modelId);
@@ -4150,7 +4505,8 @@ export function useMovieEditor() {
   }
 
   function modelNodeHasEdits(modelId: string, nodeId: string): boolean {
-    const ch = getActiveChapter();
+    // 与 modelHasEdits 一致：未选中动画时不显示「已改」
+    const ch = selectedChapter.value;
     if (!ch) return false;
     const displayId = resolveDisplayNodeId(getModelHierarchy(modelId), nodeId);
     if (hasSelectionEditDraft(ch.id, modelId, displayId) || hasSelectionEditDraft(ch.id, modelId, nodeId)) {
@@ -4193,7 +4549,9 @@ export function useMovieEditor() {
         return selected;
       }
     }
-    return resolveActiveChapterAtTime(chapters.value, t);
+    return activeVideoId.value
+      ? resolveActiveAnimationAtTime(nodes.value, activeVideoId.value, t)
+      : resolveActiveChapterAtTime(chapters.value, t);
   }
 
   function collectChapterAnimTargets(ch: Chapter): Array<{ objs: THREE.Object3D[]; cfg: ModelConfig; liveSegs?: any[] }> {
@@ -5021,15 +5379,32 @@ export function useMovieEditor() {
   }
 
   function syncPausedChapterAnimation(v: HTMLVideoElement, _ci: number) {
+    if (!viewOnly.value && !isPreviewMode.value) {
+      syncEditModePlaybackFromVideo(v);
+      return;
+    }
     if (!v.paused) return;
     const ch = resolvePresentationPlaybackChapter(v);
-    if (!ch) return;
+    if (!ch) {
+      resetAllModelsToDefault();
+      return;
+    }
     stopChapterAnimation();
+    if (!chapterHasAnyModelEdits(ch)) {
+      resetAllModelsToDefault();
+      return;
+    }
     applyChapterModelState(ch, getPresentationAnimElapsed(v, ch));
   }
 
   function syncChapterSubtitle(v: HTMLVideoElement) {
-    const subtitle = subtitles.value.find(sb => v.currentTime >= sb.startTime && v.currentTime < sb.endTime);
+    const scopeId = selectedChapterId.value || activeVideoId.value;
+    const subtitle = subtitles.value.find(
+      sb =>
+        v.currentTime >= sb.startTime &&
+        v.currentTime < sb.endTime &&
+        (!scopeId || sb.parentNodeId === scopeId || sb.parentNodeId === activeVideoId.value)
+    );
     if (subtitle) {
       showSubtitle(subtitle);
       return;
@@ -5043,7 +5418,9 @@ export function useMovieEditor() {
   }
 
   function chapterAtTime(t: number): Chapter | null {
-    return resolveActiveChapterAtTime(chapters.value, t);
+    return activeVideoId.value
+      ? resolveActiveAnimationAtTime(nodes.value, activeVideoId.value, t)
+      : resolveActiveChapterAtTime(chapters.value, t);
   }
 
   function getPlaybackChapterAtTime(t: number): Chapter | null {
@@ -5051,8 +5428,7 @@ export function useMovieEditor() {
   }
 
   function getTimelineChapterIndex(ch: Chapter): number {
-    if (!ch.parentId) return timelineChapters.value.findIndex(c => c.id === ch.id);
-    return timelineChapters.value.findIndex(c => c.id === ch.parentId);
+    return timelineChapters.value.findIndex(c => c.id === ch.id);
   }
 
   function isChapterInPlaybackRange(ch: Chapter, t: number): boolean {
@@ -5064,12 +5440,17 @@ export function useMovieEditor() {
     return Math.min(Math.max(value, min), max);
   }
 
-  function getChapterScope(parentId?: string) {
-    const parent = parentId ? chapters.value.find(ch => ch.id === parentId) : null;
+  function getChapterScope(parentVideoId?: string) {
+    const video =
+      parentVideoId ? getNodeById(nodes.value, parentVideoId) : activeVideoNode.value;
+    const videoDur =
+      video && isVideoNode(video)
+        ? video.videoDuration
+        : currProj.value?.videoDuration || duration.value;
     return {
-      parent,
-      startTime: parent?.startTime ?? 0,
-      endTime: parent?.endTime ?? (currProj.value?.videoDuration || duration.value)
+      parent: video && isVideoNode(video) ? video : null,
+      startTime: 0,
+      endTime: videoDur
     };
   }
 
@@ -5079,10 +5460,8 @@ export function useMovieEditor() {
       .sort((a, b) => a.startTime - b.startTime || a.endTime - b.endTime);
   }
 
-  function getSortedChapterChildren(chapterId: string) {
-    return chapters.value
-      .filter(ch => ch.parentId === chapterId)
-      .sort((a, b) => a.startTime - b.startTime || a.endTime - b.endTime);
+  function getSortedChapterChildren(videoId: string) {
+    return getVideoAnimations(nodes.value, videoId);
   }
 
   function getDefaultChapterSegmentDuration(rangeDuration: number) {
@@ -5092,9 +5471,7 @@ export function useMovieEditor() {
   }
 
   function getProtectedChildEnd(ch: Chapter) {
-    const children = getSortedChapterChildren(ch.id);
-    if (children.length === 0) return ch.startTime;
-    return Math.max(...children.map(child => child.endTime));
+    return ch.startTime;
   }
 
   function getNextChapterRange(parentId?: string): { startTime: number; endTime: number; splitChapter?: Chapter } | null {
@@ -5238,49 +5615,43 @@ export function useMovieEditor() {
 
   function onMeta(e: Event) {
     const v = e.target as HTMLVideoElement;
+    const metaDuration = Number.isFinite(v.duration) && v.duration > 0 ? v.duration : 0;
+    const videoNode = activeVideoNode.value;
+    if (videoNode) {
+      sceneNodeApi.setVideoNodeInfo(
+        videoNode,
+        videoNode.videoSrc || v.currentSrc || v.src,
+        metaDuration,
+        v.videoWidth,
+        v.videoHeight
+      );
+    }
     if (currProj.value) {
-      currProj.value.videoDuration = v.duration;
+      currProj.value.videoDuration = metaDuration;
       currProj.value.videoWidth = v.videoWidth;
       currProj.value.videoHeight = v.videoHeight;
     }
-    duration.value = v.duration;
-    v.loop = isLooping.value;
+    if (metaDuration > 0) duration.value = metaDuration;
+    v.loop = resolveEffectiveVideoLoop();
     v.playbackRate = playbackRate.value;
-    ensureDefaultChapter(v.duration);
-    // 检测 FPS
-    try {
-      const track = (v as any).captureStream ? (v as any).captureStream().getVideoTracks()[0] : null;
-      if (track) {
-        const settings = track.getSettings();
-        videoFps.value = Math.round(settings.frameRate || 0);
-      }
-    } catch {
-      /* ignore */
-    }
-    if (!videoFps.value) {
-      let fc = 0;
-      let last = performance.now();
-      const cb = () => {
-        fc++;
-        if (fc >= 30) {
-          videoFps.value = Math.round(fc / ((performance.now() - last) / 1000));
-          return;
-        }
-        requestAnimationFrame(cb);
-      };
-      requestAnimationFrame(cb);
-    }
+    if (metaDuration > 0) ensureDefaultChapter(metaDuration);
+    // 避免 captureStream + rAF 检测导致编辑页卡顿；展示时再按需估算
+    if (!videoFps.value && metaDuration > 0) videoFps.value = 30;
   }
 
   function onTick(e: Event) {
     const v = e.target as HTMLVideoElement;
+    const actualPlaying = !v.paused && !v.ended;
+    if (isPlaying.value !== actualPlaying) {
+      isPlaying.value = actualPlaying;
+    }
     const seekLocked =
       videoChapterSyncPaused || chapterNavLock.value || presentationChapterTransition;
     if (!seekLocked) {
       currentTime.value = v.currentTime;
     }
 
-    if (sceneBootstrapBusy.value || routeGateLoading.value) {
+    if (sceneBootstrapBusy.value || editorInitializing.value) {
       syncChapterSubtitle(v);
       return;
     }
@@ -5314,22 +5685,8 @@ export function useMovieEditor() {
             seekTime: next.startTime,
             userGesture: false
           });
-        } else {
-          presentationChapterTransition = true;
-          v.pause();
-          const holdTime = Math.min(navChapter.endTime, v.duration || navChapter.endTime);
-          try {
-            v.currentTime = holdTime;
-          } catch {
-            /* ignore */
-          }
-          currentTime.value = holdTime;
-          chapterPlayTarget.value = playTarget;
-          syncPresentationUiFromChapter(navChapter);
+        } else if (next) {
           chapterAutoNext.value = false;
-          lastPresentationAutoSwitchChapterId = playTarget.id;
-          syncCurrentChapterAnimationFromVideo();
-          presentationChapterTransition = false;
         }
         syncChapterSubtitle(v);
         return;
@@ -5349,37 +5706,25 @@ export function useMovieEditor() {
     }
 
     if (chapterPlayTarget.value && !viewOnly.value && !isPreviewMode.value) {
+      // 编辑态：即使有 playTarget，也要按视频时间同步树选中与进度
+      syncEditModePlaybackFromVideo(v);
       if (!v.paused) {
         ensureVideoSyncedChapterAnimation();
       } else {
         syncPausedChapterAnimation(v, ci);
       }
       syncChapterSubtitle(v);
+      syncIntroPresentation();
       return;
     }
 
-    if (ci !== playingIdx.value) {
-      playingIdx.value = ci;
-      if (ci >= 0) {
-        const ch = timelineChapters.value[ci];
-        selectedChapterId.value = ch.id;
-        if (!viewOnly.value && !isPreviewMode.value) {
-          navigateToChapter(ch, ci, { seek: false, cameraMode: "auto" });
-        }
-        if (!v.paused) ensureVideoSyncedChapterAnimation();
-      }
-    } else if (!v.paused) {
-      const ch = ci >= 0 ? timelineChapters.value[ci] : null;
-      if (ch && chapterHasAnimation(ch)) {
-        ensureVideoSyncedChapterAnimation();
-      } else if (_chAnimLock && !chAnimWallclock) {
-        stopChapterAnimation();
-      }
+    if (!viewOnly.value && !isPreviewMode.value) {
+      syncEditModePlaybackFromVideo(v);
+      syncChapterSubtitle(v);
+      syncIntroPresentation();
+      return;
     }
 
-    if (!videoChapterSyncPaused && !chapterNavLock.value) {
-      syncPausedChapterAnimation(v, ci);
-    }
     syncChapterSubtitle(v);
     syncIntroPresentation();
   }
@@ -5393,7 +5738,10 @@ export function useMovieEditor() {
     syncIntroPresentation();
   }
 
+  let ignoreVideoErrorUntil = 0;
+
   function onVideoErr() {
+    if (performance.now() < ignoreVideoErrorUntil) return;
     toastShow("视频加载失败，请检查文件或CORS设置", "error");
   }
 
@@ -5463,12 +5811,23 @@ export function useMovieEditor() {
 
   function uploadVideo(file: File) {
     if (!currProj.value) return false;
+    ensureProjectNodes(currProj.value);
+    let videoId = videoNodeUploadTargetId.value || activeVideoId.value;
+    let video = videoId ? getNodeById(currProj.value.nodes, videoId) : null;
+    if (!video || !isVideoNode(video)) {
+      sceneNodeApi.addVideoNode();
+      video = currProj.value.nodes.filter(isVideoNode).at(-1) ?? null;
+      if (!video) return false;
+      videoId = video.id;
+    }
+    activeVideoId.value = video.id;
+    selectedNodeId.value = video.id;
     const url = URL.createObjectURL(file);
-    resetChaptersForNewVideo();
-    pStore.setVideoInfo(url, 0, 0, 0);
+    sceneNodeApi.setVideoNodeInfo(video, url, 0, 0, 0);
     toastShow("视频已导入");
     syncVideoElementSrc(url);
     void tryLoadPendingModelSet();
+    videoNodeUploadTargetId.value = null;
     return false;
   }
 
@@ -5479,21 +5838,97 @@ export function useMovieEditor() {
     video.volume = 1;
   }
 
+  function resolveEffectiveVideoLoop() {
+    // 展示/预览避免浏览器循环导致进度条突然回到起点，交给章节逻辑控制。
+    if (viewOnly.value || isPreviewMode.value) return false;
+    return isLooping.value;
+  }
+
+  function clearVideoElementSrc(options?: { silent?: boolean }) {
+    const video = videoEl.value;
+    if (!video) return;
+    if (options?.silent !== false) {
+      ignoreVideoErrorUntil = performance.now() + 800;
+    }
+    try {
+      video.pause();
+    } catch {
+      /* ignore */
+    }
+    try {
+      video.removeAttribute("src");
+      delete video.dataset.editorSrc;
+      video.load();
+    } catch {
+      /* ignore */
+    }
+  }
+
   function syncVideoElementSrc(src?: string) {
-    const url = src || videoSrc.value;
+    const raw = src || videoSrc.value;
+    if (!raw) return;
+
+    // 已失效的 blob（刷新后或被存成 /blob:...）无法播放，提示重新上传
+    if (isTransientMediaUrl(raw)) {
+      const live = unwrapTransientMediaUrl(raw);
+      if (!live || live.startsWith("data:")) {
+        toastShow("视频地址已失效，请重新上传视频文件", "error");
+        return;
+      }
+      // blob: 仅当前页会话有效；若页面已刷新则 fetch 会失败，交给 error 处理
+      const applyBlob = () => {
+        if (!videoEl.value) return false;
+        const video = videoEl.value;
+        ignoreVideoErrorUntil = 0;
+        video.dataset.editorSrc = live;
+        video.preload = "metadata";
+        video.removeAttribute("crossorigin");
+        video.src = live;
+        video.loop = resolveEffectiveVideoLoop();
+        video.playbackRate = playbackRate.value;
+        syncVideoAudioState();
+        video.load();
+        return true;
+      };
+      if (!applyBlob()) nextTick(() => applyBlob());
+      return;
+    }
+
+    const url = resolveAssetUrl(raw);
     if (!url) return;
     const presentation = viewOnly.value || isPreviewMode.value;
     const resolvedUrl =
       presentation && isCoarsePointerDevice() ? url : isCoarsePointerDevice() ? withVideoPosterFragment(url) : url;
     const apply = () => {
       if (!videoEl.value) return false;
-      videoEl.value.preload = presentation && isCoarsePointerDevice() ? "auto" : "metadata";
-      videoEl.value.src = resolvedUrl;
-      if (url.startsWith("http")) videoEl.value.setAttribute("crossorigin", "anonymous");
-      videoEl.value.loop = isLooping.value;
-      videoEl.value.playbackRate = playbackRate.value;
+      const video = videoEl.value;
+      const currentSrc = video.dataset.editorSrc || "";
+      if (currentSrc === url && video.src && !video.error) {
+        video.loop = resolveEffectiveVideoLoop();
+        video.playbackRate = playbackRate.value;
+        syncVideoAudioState();
+        return true;
+      }
+      // 换源瞬间可能触发 error，短暂忽略
+      ignoreVideoErrorUntil = performance.now() + 400;
+      video.dataset.editorSrc = url;
+      video.preload = presentation && isCoarsePointerDevice() ? "auto" : "metadata";
+      video.src = resolvedUrl;
+      // 同源 /editor-api 代理不需要 crossorigin，避免部分浏览器误判 CORS
+      try {
+        const abs = new URL(resolvedUrl, window.location.href);
+        if (abs.origin !== window.location.origin) {
+          video.setAttribute("crossorigin", "anonymous");
+        } else {
+          video.removeAttribute("crossorigin");
+        }
+      } catch {
+        video.removeAttribute("crossorigin");
+      }
+      video.loop = resolveEffectiveVideoLoop();
+      video.playbackRate = playbackRate.value;
       syncVideoAudioState();
-      if (!isCoarsePointerDevice() || presentation) videoEl.value.load();
+      if (!isCoarsePointerDevice() || presentation) video.load();
       return true;
     };
     if (apply()) return;
@@ -5505,12 +5940,19 @@ export function useMovieEditor() {
       .then(() => {
         // 1. 清除项目数据
         if (currProj.value) {
-          currProj.value.videoSrc = null;
-          currProj.value.videoDuration = 0;
-          currProj.value.videoWidth = 0;
-          currProj.value.videoHeight = 0;
-          currProj.value.videoDisplayWidth = 0;
-          currProj.value.chapters = [];
+          const video = activeVideoNode.value;
+          if (video) {
+            video.videoSrc = null;
+            video.videoDuration = 0;
+            video.videoWidth = 0;
+            video.videoHeight = 0;
+            video.videoDisplayWidth = 0;
+            currProj.value.nodes = currProj.value.nodes.filter(
+              n => !(n.type === "animation" && n.parentId === video.id)
+            );
+          } else {
+            currProj.value.nodes = [];
+          }
           currProj.value.subtitles = [];
           currProj.value.models = [];
         }
@@ -5550,7 +5992,7 @@ export function useMovieEditor() {
         selectedChapterId.value = null;
         selModelId.value = null;
         lastSelModelId = null;
-        showVideoPip.value = true;
+        showVideoPip.value = false;
         videoFps.value = 0;
 
         // 6. 重置相机到默认位置
@@ -5675,6 +6117,7 @@ export function useMovieEditor() {
     const navChapter = resolvePresentationNavChapter(chapter);
     const target = navChapter.startTime;
     if (isPresentationNavChapterAtTime(navChapter, video.currentTime)) return;
+    if (video.currentTime > navChapter.endTime + CHAPTER_END_EPS) return;
     try {
       video.currentTime = target;
       currentTime.value = video.currentTime;
@@ -5739,7 +6182,23 @@ export function useMovieEditor() {
           });
       } else {
         chapterPlayTarget.value = null;
-        video.play().catch(() => {});
+        if (video.ended || video.currentTime >= Math.max((duration.value || video.duration || 0) - CHAPTER_END_EPS, 0)) {
+          const ci = findChIdx(video.currentTime);
+          const resumeChapter = ci >= 0 ? timelineChapters.value[ci] : timelineChapters.value[0];
+          const resumeAt = resumeChapter?.startTime ?? 0;
+          try {
+            video.currentTime = Math.max(0, resumeAt);
+            currentTime.value = video.currentTime;
+          } catch {
+            /* ignore */
+          }
+        }
+        void video.play().catch(() => {
+          void waitForVideoReady().then(ok => {
+            if (!ok || !videoEl.value) return;
+            void videoEl.value.play().catch(() => {});
+          });
+        });
       }
     } else {
       video.pause();
@@ -7261,8 +7720,7 @@ export function useMovieEditor() {
 
     const target = clampVideoTime(time, video);
     const wasPlaying = !video.paused;
-    const shouldPlay =
-      options?.autoplay ?? (options?.userGesture ? true : wasPlaying || (viewOnly.value || isPreviewMode.value));
+    const shouldPlay = options?.autoplay ?? (viewOnly.value || isPreviewMode.value ? true : wasPlaying);
 
     if (viewOnly.value || isPreviewMode.value) {
       const navChapterAtTarget = getPresentationChapterAtVideoTime(target);
@@ -7298,10 +7756,18 @@ export function useMovieEditor() {
     chapterPlayTarget.value = null;
     await seekVideoTo(target, { pause: !shouldPlay });
     currentTime.value = video.currentTime;
-    const playback = getPlaybackChapterAtTime(video.currentTime);
-    if (playback) {
-      syncPresentationUiFromChapter(playback);
-      syncCurrentChapterAnimationFromVideo();
+    if (!viewOnly.value && !isPreviewMode.value) {
+      editPlaybackSyncChapterId = null;
+      editPlaybackSyncElapsed = -1;
+      syncEditModePlaybackFromVideo(video);
+    } else {
+      const playback = getPlaybackChapterAtTime(video.currentTime);
+      if (playback) {
+        syncPresentationUiFromChapter(playback);
+        syncCurrentChapterAnimationFromVideo();
+      } else {
+        resetAllModelsToDefault();
+      }
     }
     if (shouldPlay) {
       try {
@@ -7425,6 +7891,25 @@ export function useMovieEditor() {
     return chapter;
   }
 
+  function resolvePlayableChapterForPresentationAtTime(chapter: Chapter, time: number): Chapter {
+    const descendantIds = new Set([chapter.id, ...getAllDescendantChapterIds(chapter.id)]);
+    const timeMatchedAnimated = chapters.value
+      .filter(item => {
+        if (!descendantIds.has(item.id)) return false;
+        if (!chapterHasAnimation(item)) return false;
+        return time >= item.startTime - CHAPTER_TIME_EPS && time < item.endTime - CHAPTER_END_EPS;
+      })
+      .sort((a, b) => {
+        const spanDiff = (a.endTime - a.startTime) - (b.endTime - b.startTime);
+        if (Math.abs(spanDiff) > CHAPTER_TIME_EPS) return spanDiff;
+        return b.startTime - a.startTime;
+      });
+    if (timeMatchedAnimated.length > 0) {
+      return timeMatchedAnimated[0];
+    }
+    return resolvePlayableChapterForPresentation(chapter);
+  }
+
   function resetEditPlaybackBeforePresentation() {
     stopChapterAnimation();
     chapterPlayTarget.value = null;
@@ -7452,7 +7937,7 @@ export function useMovieEditor() {
     if (!resolved) return;
 
     const { chapter: startResolvedChapter, idx } = resolved;
-    const autoplay = options?.autoplay ?? !isCoarsePointerDevice();
+    const autoplay = options?.autoplay ?? true;
 
     presentationChapterTransition = true;
     videoChapterSyncPaused = true;
@@ -7539,19 +8024,44 @@ export function useMovieEditor() {
       keepPlaying?: boolean;
     }
   ): Promise<void> {
+    presentationChapterTransition = false;
+    videoChapterSyncPaused = false;
     const syncVideo = options?.syncVideo ?? false;
-    const navChapter =
-      syncVideo && (viewOnly.value || isPreviewMode.value) ? resolvePresentationNavChapter(ch) : ch;
-    const playableChapter =
-      syncVideo && (viewOnly.value || isPreviewMode.value)
-        ? resolvePlayableChapterForPresentation(navChapter)
-        : navChapter;
+    const presentationSync = syncVideo && (viewOnly.value || isPreviewMode.value);
+    const navChapter = presentationSync ? resolvePresentationNavChapter(ch) : ch;
+    const playableChapter = presentationSync
+      ? resolvePlayableChapterForPresentationAtTime(navChapter, options?.seekTime ?? navChapter.startTime)
+      : navChapter;
     const navResolved = resolveChapter(navChapter);
     const playableResolved = resolveChapter(playableChapter);
     if (!navResolved || !playableResolved) return;
 
     const { chapter: navCh, idx: navIdx } = navResolved;
     const { chapter: playableCh } = playableResolved;
+    let video = videoEl.value;
+    const playbackReq = ++chapterPlaybackRequestSeq;
+    let switchedVideoSource = false;
+
+    if (syncVideo && playableCh.parentId) {
+      const targetVideo = getNodeById(nodes.value, playableCh.parentId);
+      if (targetVideo && isVideoNode(targetVideo) && targetVideo.videoSrc) {
+        if (activeVideoId.value !== targetVideo.id) {
+          activeVideoId.value = targetVideo.id;
+          switchedVideoSource = true;
+        }
+        const beforeSrc = video?.dataset.editorSrc || "";
+        syncVideoElementSrc(targetVideo.videoSrc);
+        video = videoEl.value;
+        const afterSrc = video?.dataset.editorSrc || "";
+        if (beforeSrc !== afterSrc) switchedVideoSource = true;
+      }
+    }
+
+    if (syncVideo && video && (switchedVideoSource || video.readyState < HTMLMediaElement.HAVE_METADATA)) {
+      await waitForVideoReady();
+      if (playbackReq !== chapterPlaybackRequestSeq) return;
+      video = videoEl.value;
+    }
 
     if (viewOnly.value || isPreviewMode.value) {
       syncPresentationUiFromChapter(navChapter);
@@ -7575,10 +8085,8 @@ export function useMovieEditor() {
       persistActiveChapterDrafts(playableCh);
     }
 
-    const video = videoEl.value;
-    const autoplay =
-      options?.autoplay ?? (options?.userGesture ? true : !isCoarsePointerDevice());
-    const keepPlaying = !!(options?.keepPlaying && video && !video.paused && !video.ended);
+    const autoplay = options?.autoplay ?? true;
+    const keepPlaying = !!(options?.keepPlaying && video && !video.ended);
     debugViewPlayback("startChapterPlayback:begin", {
       clickedChapterId: ch.id,
       clickedChapterName: ch.name,
@@ -7597,7 +8105,7 @@ export function useMovieEditor() {
     let target =
       options?.seekTime ??
       (syncVideo && (viewOnly.value || isPreviewMode.value) ? navCh.startTime : playableCh.startTime);
-    if (syncVideo && (viewOnly.value || isPreviewMode.value)) {
+    if (syncVideo && (viewOnly.value || isPreviewMode.value) && options?.seekTime === undefined) {
       target = Math.max(
         navCh.startTime,
         Math.min(target, navCh.endTime - CHAPTER_END_EPS)
@@ -7605,12 +8113,15 @@ export function useMovieEditor() {
     }
     const visualElapsed = Math.max(0, target - playableCh.startTime);
     const needsSeek = !!(video && Math.abs(video.currentTime - target) >= CHAPTER_TIME_EPS);
-    const playbackReq = ++chapterPlaybackRequestSeq;
     ++seekGeneration;
 
     presentationChapterTransition = true;
     videoChapterSyncPaused = true;
     chapterAutoNext.value = true;
+    if (viewOnly.value || isPreviewMode.value) {
+      // 先更新进度条反馈，再等待媒体 seek 完成，避免点击后绿色进度停留在旧位置。
+      currentTime.value = target;
+    }
 
     try {
       stopChapterAnimation();
@@ -7750,7 +8261,12 @@ export function useMovieEditor() {
         if (activeVideo && Math.abs(activeVideo.currentTime - target) < CHAPTER_TIME_EPS) {
           currentTime.value = activeVideo.currentTime;
         }
-        if (chapterPlayTarget.value) {
+        // 编辑态播放后清掉 playTarget，让 onTick 按视频时间持续同步节点选中
+        if (!viewOnly.value && !isPreviewMode.value) {
+          chapterPlayTarget.value = null;
+          editPlaybackSyncChapterId = playableCh.id;
+          editPlaybackSyncElapsed = Math.max(0, (activeVideo?.currentTime ?? target) - playableCh.startTime);
+        } else if (chapterPlayTarget.value) {
           lastPresentationAutoSwitchChapterId = chapterPlayTarget.value.id;
         }
       }
@@ -7760,8 +8276,9 @@ export function useMovieEditor() {
   function jumpToChapter(ch: Chapter, seekTime?: number) {
     const video = videoEl.value;
     const wasPlaying = !!(video && !video.paused);
+    const presentation = viewOnly.value || isPreviewMode.value;
     const navChapter =
-      viewOnly.value || isPreviewMode.value ? resolvePresentationNavChapter(ch) : ch;
+      presentation ? resolvePresentationNavChapter(ch) : ch;
     let targetTime = seekTime ?? navChapter.startTime;
     if (viewOnly.value || isPreviewMode.value) {
       targetTime = Math.max(
@@ -7771,9 +8288,9 @@ export function useMovieEditor() {
     }
     void startChapterPlayback(ch, {
       syncVideo: true,
-      autoplay: wasPlaying || true,
+      autoplay: presentation ? true : wasPlaying,
       userGesture: true,
-      keepPlaying: wasPlaying,
+      keepPlaying: presentation ? true : wasPlaying,
       seekTime: targetTime
     });
   }
@@ -7789,9 +8306,9 @@ export function useMovieEditor() {
       const wasPlaying = !videoEl.value.paused;
       void startChapterPlayback(targetChapter, {
         syncVideo: true,
-        autoplay: wasPlaying || true,
+        autoplay: true,
         userGesture: true,
-        keepPlaying: wasPlaying,
+        keepPlaying: true,
         seekTime: targetChapter.startTime
       });
       return;
@@ -7813,7 +8330,7 @@ export function useMovieEditor() {
     if (prevIdx >= 0) {
       void startChapterPlayback(timelineChapters.value[prevIdx], {
         syncVideo: true,
-        autoplay: true,
+        autoplay: !videoEl.value.paused,
         userGesture: true
       });
     }
@@ -7830,9 +8347,9 @@ export function useMovieEditor() {
       const wasPlaying = !videoEl.value.paused;
       void startChapterPlayback(targetChapter, {
         syncVideo: true,
-        autoplay: wasPlaying || true,
+        autoplay: true,
         userGesture: true,
-        keepPlaying: wasPlaying,
+        keepPlaying: true,
         seekTime: targetChapter.startTime
       });
       return;
@@ -7849,7 +8366,7 @@ export function useMovieEditor() {
     if (nextIdx < 0) return;
     void startChapterPlayback(timelineChapters.value[nextIdx], {
       syncVideo: true,
-      autoplay: true,
+      autoplay: !videoEl.value.paused,
       userGesture: true
     });
   }
@@ -7862,6 +8379,60 @@ export function useMovieEditor() {
 
   function saveTitle() {
     if (currProj.value) pStore.updateProject({ title: projectTitle.value } as any);
+  }
+
+  function createNewSceneDraft() {
+    const proj = currProj.value;
+    if (!proj) return;
+    const newTitle = "未命名场景";
+
+    stopChapterAnimation();
+    cancelPendingChapterNavWork();
+    cancelCameraTransitionSilently();
+    chapterPlayTarget.value = null;
+    chapterAutoNext.value = false;
+    presentationUiChapterId.value = null;
+    presentationNavIndex.value = -1;
+    lastPresentationAutoSwitchChapterId = null;
+    videoChapterSyncPaused = false;
+    presentationChapterTransition = false;
+    chapterNavLock.value = false;
+
+    ensureProjectNodes(proj);
+    proj.videoSrc = null;
+    proj.videoDuration = 0;
+    proj.videoWidth = 0;
+    proj.videoHeight = 0;
+    proj.videoDisplayWidth = 0;
+    proj.nodes = [];
+    proj.subtitles = [];
+
+    sceneCode.value = null;
+    shareLink.value = "";
+    sceneSavedAt.value = "";
+    projectTitle.value = newTitle;
+    proj.title = newTitle;
+    pStore.updateProject({ title: newTitle } as any);
+
+    currentTime.value = 0;
+    duration.value = 0;
+    isPlaying.value = false;
+    playingIdx.value = -1;
+    selectedNodeId.value = null;
+    selectedChapterId.value = null;
+    activeVideoId.value = null;
+    videoOnlyMode.value = false;
+    showVideoPip.value = false;
+    displaySubtitle.value = false;
+    clearVideoElementSrc({ silent: true });
+    selectionEditDrafts.clear();
+    editPlaybackSyncChapterId = null;
+    editPlaybackSyncElapsed = -1;
+    resetLiveAnimEditorBuffers();
+    resetAllModelsToDefault();
+    syncIntroPresentation();
+
+    sceneSavedSignature.value = sceneDraftSignature.value;
   }
 
   function syncProjectTitleToStore() {
@@ -7988,22 +8559,59 @@ export function useMovieEditor() {
     }
   }
 
+  function buildSceneDraftSignature() {
+    const proj = currProj.value;
+    if (!proj) return "";
+    ensureProjectNodes(proj);
+    const modelIds = new Set(proj.models.map(m => m.id));
+    const nodeList = JSON.parse(JSON.stringify(proj.nodes)) as SceneNode[];
+    const animations = getAnimationNodes(nodeList);
+    sanitizeChaptersForModels(animations, modelIds);
+    stripRuntimeAnimFieldsFromChapters(animations);
+    const firstVideo = nodeList.find(n => n.type === "video");
+    return JSON.stringify({
+      title: projectTitle.value.trim() || editSceneToolName.value.trim() || "未命名场景",
+      videoSrc: firstVideo && firstVideo.type === "video" ? firstVideo.videoSrc : proj.videoSrc,
+      videoDuration: firstVideo && firstVideo.type === "video" ? firstVideo.videoDuration : proj.videoDuration,
+      videoWidth: firstVideo && firstVideo.type === "video" ? firstVideo.videoWidth : proj.videoWidth,
+      videoHeight: firstVideo && firstVideo.type === "video" ? firstVideo.videoHeight : proj.videoHeight,
+      videoDisplayWidth:
+        firstVideo && firstVideo.type === "video" ? firstVideo.videoDisplayWidth : proj.videoDisplayWidth || 0,
+      nodes: nodeList,
+      subtitles: JSON.parse(JSON.stringify(proj.subtitles)),
+      models: proj.models.map(m => ({
+        id: m.id,
+        name: m.name,
+        type: m.type,
+        color: m.color,
+        path: getModelSourcePath(m),
+        basePosition: m.basePosition
+      })),
+      sceneSettings: collectSceneSettingsData()
+    });
+  }
+
   function buildScenePayload() {
     const proj = currProj.value;
     if (!proj) return null;
+    ensureProjectNodes(proj);
     const modelIds = new Set(proj.models.map(m => m.id));
-    const chapters = JSON.parse(JSON.stringify(proj.chapters)) as Chapter[];
-    sanitizeChaptersForModels(chapters, modelIds);
-    stripRuntimeAnimFieldsFromChapters(chapters);
+    const nodeList = JSON.parse(JSON.stringify(proj.nodes)) as SceneNode[];
+    const animations = getAnimationNodes(nodeList);
+    sanitizeChaptersForModels(animations, modelIds);
+    stripRuntimeAnimFieldsFromChapters(animations);
+    const firstVideo = nodeList.find(n => n.type === "video");
     return {
+      schemaVersion: SCHEMA_VERSION,
       title: syncProjectTitleToStore(),
       modelSetCode: modelSetCode.value || undefined,
-      videoSrc: proj.videoSrc,
-      videoDuration: proj.videoDuration,
-      videoWidth: proj.videoWidth,
-      videoHeight: proj.videoHeight,
-      videoDisplayWidth: proj.videoDisplayWidth || 0,
-      chapters,
+      videoSrc: firstVideo && firstVideo.type === "video" ? firstVideo.videoSrc : proj.videoSrc,
+      videoDuration: firstVideo && firstVideo.type === "video" ? firstVideo.videoDuration : proj.videoDuration,
+      videoWidth: firstVideo && firstVideo.type === "video" ? firstVideo.videoWidth : proj.videoWidth,
+      videoHeight: firstVideo && firstVideo.type === "video" ? firstVideo.videoHeight : proj.videoHeight,
+      videoDisplayWidth:
+        firstVideo && firstVideo.type === "video" ? firstVideo.videoDisplayWidth : proj.videoDisplayWidth || 0,
+      nodes: nodeList,
       subtitles: JSON.parse(JSON.stringify(proj.subtitles)),
       models: proj.models.map(m => ({
         id: m.id,
@@ -8029,15 +8637,12 @@ export function useMovieEditor() {
     clearEditorThreeScene();
     if (currProj.value) {
       currProj.value.models = [];
-      currProj.value.chapters = [];
+      currProj.value.nodes = [];
       currProj.value.subtitles = [];
-      currProj.value.videoSrc = null;
-      currProj.value.videoDuration = 0;
-      currProj.value.videoWidth = 0;
-      currProj.value.videoHeight = 0;
-      currProj.value.videoDisplayWidth = 0;
     }
     selectedChapterId.value = null;
+    selectedNodeId.value = null;
+    activeVideoId.value = null;
     selModelId.value = null;
     selModelNodeId.value = null;
     lastSelModelId = null;
@@ -8045,10 +8650,13 @@ export function useMovieEditor() {
 
   async function rehydrateEditorSessionFromProject() {
     const proj = currProj.value;
-    if (!proj?.videoSrc || !proj.chapters?.length) return false;
+    ensureProjectNodes(proj);
+    const firstVideo = proj?.nodes.find(n => n.type === "video" && n.videoSrc);
+    if (!firstVideo || firstVideo.type !== "video") return false;
 
+    sceneNodeApi.setActiveVideo(firstVideo.id);
     syncVideoElementSrc();
-    duration.value = proj.videoDuration || 0;
+    duration.value = firstVideo.videoDuration || 0;
 
     for (const m of models.value) {
       if (m.url && !meshes.has(m.id)) await loadGLB(m);
@@ -8130,6 +8738,7 @@ export function useMovieEditor() {
         }
         dedupeProjectModelsByAsset();
         ensureAllModelMixers();
+        await finalizeSceneVisualBootstrap();
         if (meshes.size > 0) applyChapterCameraForLoadedModels();
       } finally {
         importingModel.value = false;
@@ -8258,7 +8867,6 @@ export function useMovieEditor() {
     if (
       !code ||
       viewOnly.value ||
-      !hasVideo.value ||
       !currProj.value ||
       modelSetModelsLoaded.value ||
       sceneBootstrapBusy.value
@@ -8268,8 +8876,10 @@ export function useMovieEditor() {
     await loadModelSetByCode(code);
   }
 
-  async function applyFetchedSceneData(sceneData: any, code: string) {
-    sceneBootstrapBusy.value = true;
+  async function applyFetchedSceneData(sceneData: any, code: string, options?: { manageBusy?: boolean }) {
+    const manageBusy = options?.manageBusy !== false;
+    if (manageBusy) sceneBootstrapBusy.value = true;
+    sceneLightsPinnedFromSettings = false;
     try {
       const proj = currProj.value || pStore.createProject(sceneData.title || "未命名场景");
       projectTitle.value = sceneData.title || proj.title;
@@ -8279,6 +8889,7 @@ export function useMovieEditor() {
         viewCameraBaseFov = null;
       }
       sceneCode.value = sceneData.code || code;
+      sceneSavedAt.value = sceneData.updatedAt || sceneData.createdAt || "";
       modelSetCode.value = sceneData.modelSetCode || null;
       modelSetModelsLoaded.value = true;
       pendingModelSetCode.value = null;
@@ -8290,10 +8901,50 @@ export function useMovieEditor() {
       proj.videoWidth = sceneData.videoWidth || 0;
       proj.videoHeight = sceneData.videoHeight || 0;
       proj.videoDisplayWidth = sceneData.videoDisplayWidth || 0;
-      proj.chapters = Array.isArray(sceneData.chapters)
-        ? (JSON.parse(JSON.stringify(sceneData.chapters)) as Chapter[])
+      if (Array.isArray(sceneData.nodes) && sceneData.nodes.length) {
+        proj.nodes = JSON.parse(JSON.stringify(sceneData.nodes));
+        proj.schemaVersion = sceneData.schemaVersion || SCHEMA_VERSION;
+      } else {
+        proj.chapters = Array.isArray(sceneData.chapters)
+          ? (JSON.parse(JSON.stringify(sceneData.chapters)) as Chapter[])
+          : [];
+      }
+      ensureProjectNodes(proj);
+      let clearedStaleBlobVideo = false;
+      for (const node of proj.nodes) {
+        if (node.type === "video" && node.videoSrc) {
+          // 保留服务端相对路径，绑定播放时再 resolve；清理误存的 blob
+          try {
+            if (isTransientMediaUrl(node.videoSrc)) {
+              node.videoSrc = null;
+              clearedStaleBlobVideo = true;
+              continue;
+            }
+            const u = node.videoSrc;
+            if (/^https?:\/\//i.test(u)) {
+              const parsed = new URL(u);
+              node.videoSrc =
+                parsed.pathname.replace(/^\/editor-api(?=\/|$)/, "") || node.videoSrc;
+            } else {
+              node.videoSrc = u.replace(/^\/editor-api(?=\/|$)/, "");
+            }
+          } catch {
+            /* keep original */
+          }
+        }
+      }
+      if (clearedStaleBlobVideo) {
+        toastShow("检测到未上传到服务器的临时视频，请重新上传视频后再保存", "warning");
+      }
+      if (isTransientMediaUrl(proj.videoSrc || "")) {
+        proj.videoSrc = null;
+      }
+      proj.subtitles = Array.isArray(sceneData.subtitles)
+        ? sceneData.subtitles.map((sub: Subtitle) => ({
+            ...sub,
+            parentNodeId: sub.parentNodeId || proj.nodes.find(n => n.type === "video")?.id || ""
+          }))
         : [];
-      proj.subtitles = Array.isArray(sceneData.subtitles) ? sceneData.subtitles : [];
       proj.models = [];
 
       const loadedAssetKeys = new Set<string>();
@@ -8315,63 +8966,94 @@ export function useMovieEditor() {
         await applySceneSettingsFromServer(sceneData.sceneSettings);
       }
       const loadedModelIds = new Set(proj.models.map(m => m.id));
-      sanitizeChaptersForModels(proj.chapters, loadedModelIds);
-      stripRuntimeAnimFieldsFromChapters(proj.chapters);
+      sanitizeChaptersForModels(getAnimationNodes(proj.nodes), loadedModelIds);
+      stripRuntimeAnimFieldsFromChapters(getAnimationNodes(proj.nodes));
       dedupeProjectModelsByAsset();
       pruneAllChapterModelConfigs();
     } finally {
-      sceneBootstrapBusy.value = false;
+      if (manageBusy) sceneBootstrapBusy.value = false;
     }
   }
 
   async function syncEditorAfterSceneLoad() {
-    if (videoSrc.value) {
-      syncVideoElementSrc();
-      duration.value = currProj.value?.videoDuration || 0;
+    // 编辑态刷新：只准备节点数据，不自动挂载/展示视频；视频仅在点击视频节点后显示
+    const firstVideo = nodes.value.find(n => n.type === "video" && n.videoSrc);
+    if (firstVideo && firstVideo.type === "video") {
+      activeVideoId.value = firstVideo.id;
+      const storedDur = firstVideo.videoDuration;
+      if (Number.isFinite(storedDur) && storedDur > 0) duration.value = storedDur;
     }
-    if (chapters.value.length > 0) {
-      const ch = timelineChapters.value[0] ?? chapters.value[0];
-      selectedChapterId.value = ch.id;
-      const dur = getChapterCameraTransitionSec(ch);
-      if (meshes.size > 0 && isDefaultChapterCamera(ch)) {
-        applyChapterModelState(ch, 0);
-        frameCameraOnSceneModels(dur, ch);
-      } else {
-        applyChapter(ch);
+
+    selectedChapterId.value = null;
+    selectedNodeId.value = null;
+    videoOnlyMode.value = false;
+    showVideoPip.value = viewOnly.value || isPreviewMode.value;
+
+    if (viewOnly.value || isPreviewMode.value) {
+      if (firstVideo && firstVideo.type === "video" && firstVideo.videoSrc) {
+        syncVideoElementSrc(firstVideo.videoSrc);
+      } else if (videoSrc.value) {
+        syncVideoElementSrc();
       }
-      syncChapterForm(ch);
-      syncModelSelectionForChapter(ch);
+      const roots = rootSceneNodes.value.filter(n => n.type === "group" || n.type === "video");
+      const firstExpandable = roots.find(n => getChildNodes(nodes.value, n.id).length > 0);
+      expandedNodeIds.value = firstExpandable ? new Set([firstExpandable.id]) : new Set();
+    } else {
+      // 编辑态：清空 video 元素，避免刷新后黑窗/加载失败闪现
+      clearVideoElementSrc({ silent: true });
+      const expanded = new Set<string>();
+      for (const n of nodes.value) {
+        if ((n.type === "group" || n.type === "video") && getChildNodes(nodes.value, n.id).length > 0) {
+          expanded.add(n.id);
+        }
+      }
+      expandedNodeIds.value = expanded;
     }
-    if (videoEl.value) {
+
+    resetAllModelsToDefault();
+    await finalizeSceneVisualBootstrap();
+    if (meshes.size > 0) {
+      // 刷新后只框选模型到视野，不自动选中动画/打开视频
+      frameCameraOnSceneModels(0);
+    }
+
+    if (videoEl.value && (viewOnly.value || isPreviewMode.value)) {
       videoEl.value.pause();
       videoEl.value.currentTime = 0;
     }
     currentTime.value = 0;
+    isPlaying.value = false;
     syncVideoAudioState();
-    applyAntialiasing();
-    nextTick(adaptPresentationViewport);
+    await nextTick();
+    handleResize();
+    adaptPresentationViewport();
+    sceneSavedSignature.value = sceneDraftSignature.value;
   }
 
   async function loadSceneByCode(code: string): Promise<"ok" | "not-found" | "error"> {
+    sceneBootstrapBusy.value = true;
     try {
       clearAllEditorModels();
       const sceneData = await fetchScene(code);
-      await applyFetchedSceneData(sceneData, code);
+      await applyFetchedSceneData(sceneData, code, { manageBusy: false });
       await syncEditorAfterSceneLoad();
       return "ok";
     } catch (e: any) {
       if (e?.status === 404) return "not-found";
       toastShow("加载场景失败: " + (e?.message || "未知错误"), "error");
       return "error";
+    } finally {
+      sceneBootstrapBusy.value = false;
     }
   }
 
   async function loadSceneForEdit(code: string): Promise<boolean> {
+    sceneBootstrapBusy.value = true;
     try {
       clearAllEditorModels();
       const sceneData = await fetchScene(code);
       editSceneLinkEntry.value = false;
-      await applyFetchedSceneData(sceneData, code);
+      await applyFetchedSceneData(sceneData, code, { manageBusy: false });
       await syncEditorAfterSceneLoad();
       isPreviewMode.value = false;
       await nextTick();
@@ -8380,6 +9062,8 @@ export function useMovieEditor() {
     } catch (e: any) {
       toastShow("加载场景失败: " + (e?.message || "未知错误"), "error");
       return false;
+    } finally {
+      sceneBootstrapBusy.value = false;
     }
   }
 
@@ -8407,11 +9091,15 @@ export function useMovieEditor() {
   async function restoreSceneSettingsForEditor(modelSetCode: string) {
     SETTINGS_KEY = getSceneSettingsStorageKey(modelSetCode);
     const restoredFromServer = await hydrateSceneSettingsFromServer(modelSetCode, sceneCode.value);
-    if (restoredFromServer) return;
+    if (restoredFromServer) {
+      sceneLightsPinnedFromSettings = true;
+      return;
+    }
     const prevSkip = skipStoredSceneSettings;
     skipStoredSceneSettings = false;
     try {
       loadAllSettings();
+      sceneLightsPinnedFromSettings = true;
       applySettings();
       applyGrid();
       applyFog();
@@ -8423,7 +9111,7 @@ export function useMovieEditor() {
       applyAntialiasing();
       const settings = collectSceneSettingsData() as { envMapUrl?: string; envMapIsHdr?: boolean };
       if (settings.envMapUrl) {
-        loadEnvironmentMapFromUrl(settings.envMapUrl, !!settings.envMapIsHdr);
+        await loadEnvironmentMapFromUrlAsync(settings.envMapUrl, !!settings.envMapIsHdr);
       }
     } catch {
       /* ignore */
@@ -8433,16 +9121,55 @@ export function useMovieEditor() {
   }
 
   async function tryLoadSavedSceneForModelSet(code: string): Promise<boolean> {
-    sceneBootstrapBusy.value = true;
     try {
       const list = await fetchSceneList(code);
       if (!list.length) return false;
       return await loadSceneForEdit(list[0].code);
     } catch {
       return false;
-    } finally {
-      sceneBootstrapBusy.value = false;
     }
+  }
+
+  async function uploadTransientVideoSrc(src: string): Promise<string | null> {
+    const live = unwrapTransientMediaUrl(src);
+    if (!live || !live.startsWith("blob:")) return null;
+    try {
+      const r = await fetch(live);
+      const b = await r.blob();
+      if (!b || b.size <= 0) return null;
+      const ext = (b.type.split("/")[1] || "mp4").replace(/[^a-z0-9]/gi, "").toLowerCase() || "mp4";
+      const uploaded = await uploadSceneVideo(new File([b], `scene-video.${ext}`, { type: b.type || "video/mp4" }));
+      return uploaded.path || uploaded.url || null;
+    } catch (e) {
+      console.warn("uploadTransientVideoSrc failed", e);
+      return null;
+    }
+  }
+
+  /** 保存前把各视频节点的 blob 上传为持久路径，避免刷新后失效 */
+  async function persistVideoSourcesInPayload(payload: ReturnType<typeof buildScenePayload>) {
+    if (!payload) return false;
+    let ok = true;
+    for (const node of payload.nodes) {
+      if (node.type !== "video" || !node.videoSrc) continue;
+      if (!isTransientMediaUrl(node.videoSrc)) continue;
+      const path = await uploadTransientVideoSrc(node.videoSrc);
+      if (!path) {
+        ok = false;
+        node.videoSrc = toPersistableAssetPath(node.videoSrc);
+        continue;
+      }
+      node.videoSrc = path;
+      const live = getNodeById(nodes.value, node.id);
+      if (live && isVideoNode(live)) live.videoSrc = path;
+    }
+    const firstVideo = payload.nodes.find(n => n.type === "video" && n.videoSrc);
+    payload.videoSrc =
+      firstVideo && firstVideo.type === "video" ? firstVideo.videoSrc : toPersistableAssetPath(payload.videoSrc);
+    if (currProj.value && payload.videoSrc) {
+      currProj.value.videoSrc = payload.videoSrc;
+    }
+    return ok;
   }
 
   async function saveSceneToServer() {
@@ -8455,21 +9182,23 @@ export function useMovieEditor() {
     if (!payload) return null;
     savingScene.value = true;
     try {
-      if (currProj.value.videoSrc?.startsWith("blob:")) {
-        const r = await fetch(currProj.value.videoSrc);
-        const b = await r.blob();
-        const ext = (b.type.split("/")[1] || "mp4").replace(/[^a-z0-9]/gi, "").toLowerCase();
-        const uploaded = await uploadSceneVideo(new File([b], `scene-video.${ext}`, { type: b.type || "video/mp4" }));
-        payload.videoSrc = uploaded.path || uploaded.url;
-        currProj.value.videoSrc = resolveAssetUrl(payload.videoSrc);
-        syncVideoElementSrc(currProj.value.videoSrc);
+      const uploadedOk = await persistVideoSourcesInPayload(payload);
+      if (!uploadedOk) {
+        toastShow("有视频仍是本地临时文件且上传失败，请重新选择视频后再保存", "error");
+        return null;
+      }
+      if (payload.nodes.some(n => n.type === "video" && isTransientMediaUrl(n.videoSrc || ""))) {
+        toastShow("请先重新上传视频文件后再保存场景", "error");
+        return null;
       }
       const result = sceneCode.value ? await updateSceneOnBackend(sceneCode.value, payload) : await saveSceneToBackend(payload);
       sceneCode.value = result.code;
       shareLink.value = result.previewUrl ? rewireEditorFrontendHost(result.previewUrl) : buildShareLink(result.code);
+      sceneSavedAt.value = result.updatedAt || result.createdAt || new Date().toISOString();
       sceneListVersion.value += 1;
       saveAllSettings();
       resumeProjectPersist();
+      sceneSavedSignature.value = sceneDraftSignature.value;
       toastShow(sceneCode.value ? "场景已保存" : "场景已创建", "success");
       return result;
     } catch (e: any) {
@@ -8645,6 +9374,9 @@ export function useMovieEditor() {
   }
 
   function selectChapter(ch: Chapter) {
+    videoOnlyMode.value = false;
+    if (ch.parentId) sceneNodeApi.setActiveVideo(ch.parentId);
+    selectedNodeId.value = ch.id;
     const video = videoEl.value;
     if (video && !video.paused) {
       video.pause();
@@ -8728,6 +9460,8 @@ export function useMovieEditor() {
     chAnimWallclockMaxDur = 0;
     videoAnimLastSyncAt = 0;
     _chAnimLock = false;
+    editPlaybackSyncChapterId = null;
+    editPlaybackSyncElapsed = -1;
     invalidateChapterAnimTargetsCache();
   }
 
@@ -8735,7 +9469,10 @@ export function useMovieEditor() {
     const video = videoEl.value;
     if (!video) return;
     const ch = resolvePresentationPlaybackChapter(video);
-    if (!ch) return;
+    if (!ch || !chapterHasAnyModelEdits(ch)) {
+      resetAllModelsToDefault();
+      return;
+    }
     applyChapterAnimOnly(ch, getPresentationAnimElapsed(video, ch));
   }
 
@@ -8807,26 +9544,34 @@ export function useMovieEditor() {
     return ensureVideoSyncedChapterAnimation() || startVideoSyncedChapterAnimation(ch);
   }
 
+  function highlightSceneNode(nodeId: string) {
+    selectedNodeId.value = nodeId;
+    const node = getNodeById(nodes.value, nodeId);
+    if (node && isAnimationNode(node)) {
+      selectedChapterId.value = nodeId;
+      if (node.parentId) activeVideoId.value = node.parentId;
+    }
+  }
+
   function playChapter(ch: Chapter) {
+    selectedNodeId.value = ch.id;
+    selectedChapterId.value = ch.id;
+    videoOnlyMode.value = false;
+    if (ch.parentId) activeVideoId.value = ch.parentId;
+
     const resolved = resolveChapter(ch);
     if (!resolved) return;
-    const { chapter, idx } = resolved;
+    const { chapter } = resolved;
+    const video = videoEl.value;
+    const wasPlaying = !!(video && !video.paused);
 
-    if (selectedChapterId.value !== chapter.id) {
-      navigateToChapter(chapter, idx, {
-        seek: false,
-        previewAnimation: true,
-        cameraMode: "playback",
-        visualElapsed: 0
-      });
-    } else {
-      if (restartChapterPreviewPlayback(chapter)) {
-        toastShow("正在播放节点动画", "success");
-      } else {
-        toastShow("当前节点没有动画", "warning");
-      }
-      return;
-    }
+    void startChapterPlayback(chapter, {
+      syncVideo: true,
+      autoplay: true,
+      keepPlaying: wasPlaying,
+      userGesture: true,
+      seekTime: chapter.startTime
+    });
 
     if (chapterHasAnimation(chapter)) toastShow("正在播放节点动画", "success");
     else toastShow("当前节点没有动画", "warning");
@@ -9143,12 +9888,13 @@ export function useMovieEditor() {
       return;
     }
 
-    const activeChapter = ch ?? getActiveChapter();
+    // 未显式传入时只用当前选中动画；禁止回退到第一章，避免未选中时套用线框/高亮盖住贴图
+    const activeChapter = ch !== undefined ? ch : selectedChapter.value;
     const defaultCfg = createDefaultModelConfig();
 
     if (!activeChapter) {
       applyModelConfigToEditor(defaultCfg);
-      applyMConfig(model, defaultCfg);
+      resetModelTreeToDefault(model);
       modelFormRevision.value++;
       return;
     }
@@ -9213,7 +9959,23 @@ export function useMovieEditor() {
 
   function resetChaptersForNewVideo() {
     if (!currProj.value) return;
-    currProj.value.chapters = [];
+    const videoId = videoNodeUploadTargetId.value || activeVideoId.value;
+    if (videoId) {
+      const video = getNodeById(currProj.value.nodes, videoId);
+      if (video && isVideoNode(video)) {
+        const deleteIds = new Set([videoId, ...getDescendantNodeIds(currProj.value.nodes, videoId)]);
+        currProj.value.nodes = currProj.value.nodes.filter(n => !deleteIds.has(n.id) || n.id !== videoId);
+        getVideoAnimations(currProj.value.nodes, videoId).forEach(() => {});
+        currProj.value.nodes = currProj.value.nodes.filter(
+          n => !(n.type === "animation" && n.parentId === videoId)
+        );
+        video.videoSrc = null;
+        video.videoDuration = 0;
+        video.videoWidth = 0;
+        video.videoHeight = 0;
+        video.videoDisplayWidth = 0;
+      }
+    }
     selectedChapterId.value = null;
     playingIdx.value = -1;
     chapterPlayTarget.value = null;
@@ -9221,96 +9983,130 @@ export function useMovieEditor() {
 
   function ensureDefaultChapter(videoDur?: number) {
     if (!currProj.value) return;
-    const dur = videoDur ?? currProj.value.videoDuration ?? duration.value;
-    if (dur <= 0 || currProj.value.chapters.length > 0) return;
+    const dur = videoDur ?? duration.value;
+    if (dur <= 0) return;
+    ensureProjectNodes(currProj.value);
+    let video = activeVideoId.value ? getNodeById(currProj.value.nodes, activeVideoId.value) : null;
+    if (!video || !isVideoNode(video)) {
+      video = currProj.value.nodes.find(isVideoNode) ?? null;
+    }
+    if (!video || !isVideoNode(video) || !video.videoSrc) return;
+    if (getVideoAnimations(currProj.value.nodes, video.id).length > 0) return;
 
-    const ch = chStore.createChapter(currProj.value.id, "节点 1", 0, dur);
-    ensureChapterModelConfigsMap(ch);
-    currProj.value.chapters.push(ch);
-    selectedChapterId.value = ch.id;
-    syncChapterForm(ch);
-    applyChapter(ch);
+    sceneNodeApi.addAnimationNode(video.id);
   }
 
   function addChapter() {
-    if (!currProj.value || !hasVideo.value) return;
-    const dur = currProj.value.videoDuration || duration.value;
-    if (dur <= 0) {
-      toastShow("请等待视频加载完成", "warning");
-      return;
-    }
-
-    const proj = currProj.value;
-
-    if (timelineChapters.value.length === 0) {
-      ensureDefaultChapter(dur);
-      toastShow("已添加节点 1");
-      return;
-    }
-
-    const nextRange = getNextChapterRange(undefined);
-    if (!nextRange) {
-      toastShow("视频时间已无可用区间，无法再添加节点", "warning");
-      return;
-    }
-
-    if (nextRange.splitChapter) {
-      chStore.updateChapter(nextRange.splitChapter, { endTime: nextRange.startTime });
-    }
-
-    const rootCount = timelineChapters.value.length;
-    const newCh = chStore.createChapter(proj.id, `节点 ${rootCount + 1}`, nextRange.startTime, nextRange.endTime);
-    ensureChapterModelConfigsMap(newCh);
-    proj.chapters.push(newCh);
-
-    syncChapterForm(newCh);
-    applyChapter(newCh);
-    toastShow(`已添加节点 ${rootCount + 1}`);
+    const videoId = activeVideoId.value;
+    if (videoId) sceneNodeApi.addAnimationNode(videoId);
+    else toastShow("请先选择或添加视频节点", "warning");
   }
 
   function addChildChapter(parent: Chapter) {
-    if (!currProj.value) return;
-
-    const nextRange = getNextChapterRange(parent.id);
-    if (!nextRange) {
-      toastShow("父节点时间范围内已无可用区间，无法再添加子节点", "warning");
-      return;
-    }
-
-    if (nextRange.splitChapter) {
-      chStore.updateChapter(nextRange.splitChapter, { endTime: nextRange.startTime });
-    }
-
-    const children = getSortedChapterChildren(parent.id);
-    const childIndex = children.length + 1;
-    const newCh = chStore.createChapter(
-      currProj.value.id,
-      `${parent.name} - 子节点 ${childIndex}`,
-      nextRange.startTime,
-      nextRange.endTime,
-      parent.id
-    );
-    newCh.camera = JSON.parse(JSON.stringify(parent.camera));
-    ensureChapterModelConfigsMap(newCh);
-
-    currProj.value.chapters.push(newCh);
-    syncChapterForm(newCh);
-    applyChapter(newCh);
-    chapterFormRevision.value++;
-    toastShow(`已添加子节点 ${childIndex}`);
+    if (parent.parentId) sceneNodeApi.addAnimationNode(parent.parentId);
+    else toastShow("动画节点需挂在视频下", "warning");
   }
 
   function canAddChildChapter(parent: Chapter) {
-    return !!getNextChapterRange(parent.id);
+    return !!parent.parentId && !!getNextChapterRange(parent.parentId);
   }
 
-  function getChapterChildren(chapterId: string): Chapter[] {
-    return chapters.value.filter(ch => ch.parentId === chapterId);
+  function getChapterChildren(videoId: string): Chapter[] {
+    return getVideoAnimations(nodes.value, videoId);
   }
 
   function getAllDescendantChapterIds(chapterId: string): string[] {
-    return getDescendantChapterIds(chapters.value, chapterId);
+    return getDescendantNodeIds(nodes.value, chapterId);
   }
+
+  function applyVideoNodePlayback(video: SceneVideoNode) {
+    videoOnlyMode.value = true;
+    showVideoPip.value = true;
+    if (!video.videoSrc) {
+      toastShow("该视频节点尚未上传视频文件", "warning");
+      return;
+    }
+
+    if (isTransientMediaUrl(video.videoSrc)) {
+      const live = unwrapTransientMediaUrl(video.videoSrc);
+      // 刷新后 blob 已失效，或被错误存成 /blob:...
+      if (!live || live.startsWith("data:") || !live.startsWith("blob:")) {
+        toastShow("视频未正确保存到服务器，请重新上传后再保存场景", "error");
+        return;
+      }
+      // 仍是当前会话 blob，尝试播放；失败则 onVideoErr 提示
+    }
+
+    const storedDur = video.videoDuration;
+    if (Number.isFinite(storedDur) && storedDur > 0) duration.value = storedDur;
+
+    const bindAndSeek = () => {
+      syncVideoElementSrc(video.videoSrc || undefined);
+      const v = videoEl.value;
+      if (!v) return false;
+      try {
+        v.pause();
+      } catch {
+        /* ignore */
+      }
+      // 等元数据后再 seek，避免未就绪时 currentTime=0 触发异常
+      const seekToStart = () => {
+        try {
+          if (Number.isFinite(v.currentTime)) v.currentTime = 0;
+        } catch {
+          /* ignore */
+        }
+        currentTime.value = 0;
+        isPlaying.value = false;
+      };
+      if (v.readyState >= HTMLMediaElement.HAVE_METADATA) seekToStart();
+      else v.addEventListener("loadedmetadata", seekToStart, { once: true });
+      return true;
+    };
+
+    // video 组件是 v-if 挂载，需等 DOM 就绪后再绑 src
+    if (bindAndSeek()) return;
+    void nextTick(async () => {
+      for (let i = 0; i < 20; i++) {
+        if (bindAndSeek()) return;
+        await new Promise(r => setTimeout(r, 50));
+      }
+      toastShow("视频播放器未就绪，请再点一次视频节点", "warning");
+    });
+  }
+
+  function hideVideoPip() {
+    showVideoPip.value = false;
+    clearVideoElementSrc({ silent: true });
+    isPlaying.value = false;
+  }
+
+  const sceneNodeApi = createSceneNodeEditorApi({
+    currProj,
+    nodes,
+    activeVideoId,
+    selectedNodeId,
+    selectedChapterId,
+    expandedNodeIds,
+    sceneNodeDraggingId,
+    sceneNodeDropTargetId,
+    videoNodeUploadTargetId,
+    duration,
+    getNextChapterRange,
+    ensureChapterModelConfigsMap,
+    syncChapterForm,
+    applyChapter,
+    applyVideoNodePlayback,
+    syncVideoElementSrc,
+    resetAllModelsToDefault,
+    onClearAnimationSelection: () => {
+      stopChapterAnimation();
+      chapterPlayTarget.value = null;
+    },
+    hideVideoPip,
+    videoOnlyMode,
+    chapterFormRevision
+  });
 
   function isChapterPlaying(ch: Chapter): boolean {
     return isChapterListActive(ch) && (isPlaying.value || !!chapterPlayTarget.value || presentationChapterTransition);
@@ -9326,26 +10122,17 @@ export function useMovieEditor() {
         break;
       case "dup":
         {
-          const clone = chStore.createChapter(ch.projectId, ch.name + " (副本)", ch.startTime, ch.endTime, ch.parentId);
-          Object.assign(clone.camera, ch.camera);
-          clone.modelConfigs = JSON.parse(JSON.stringify(ch.modelConfigs));
-          currProj.value?.chapters.push(clone);
+          if (!currProj.value) break;
+          const clone = JSON.parse(JSON.stringify(ch)) as Chapter;
+          clone.id = `anim_${Date.now()}`;
+          clone.name = ch.name + " (副本)";
+          currProj.value.nodes.push(clone);
           toastShow("节点已复制");
         }
         break;
       case "del":
-        ElMessageBox.confirm(`删除"${ch.name}"？`, "确认", { type: "warning" })
-          .then(() => {
-            if (currProj.value) {
-              const deleteIds = new Set([ch.id, ...getAllDescendantChapterIds(ch.id)]);
-              currProj.value.chapters = currProj.value.chapters.filter(c => !deleteIds.has(c.id));
-              if (selectedChapterId.value && deleteIds.has(selectedChapterId.value)) {
-                selectedChapterId.value = null;
-              }
-            }
-            toastShow("节点已删除");
-          })
-          .catch(() => {});
+        sceneNodeApi.deleteSceneNode(ch);
+        break;
     }
   }
 
@@ -9390,16 +10177,7 @@ export function useMovieEditor() {
 
   function deleteChapter() {
     if (!selectedChapter.value) return;
-    ElMessageBox.confirm(`删除"${selectedChapter.value.name}"？`, "确认", { type: "warning" })
-      .then(() => {
-        if (currProj.value) {
-          const deleteIds = new Set([selectedChapter.value!.id, ...getAllDescendantChapterIds(selectedChapter.value!.id)]);
-          currProj.value.chapters = currProj.value.chapters.filter(c => !deleteIds.has(c.id));
-          if (selectedChapterId.value && deleteIds.has(selectedChapterId.value)) selectedChapterId.value = null;
-        }
-        toastShow("节点已删除");
-      })
-      .catch(() => {});
+    sceneNodeApi.deleteSceneNode(selectedChapter.value);
   }
 
   function liveCam() {
@@ -9478,7 +10256,7 @@ export function useMovieEditor() {
     if (selModelId.value !== modelId) selModelNodeId.value = null;
     selModelId.value = modelId;
     if (modelId) lastSelModelId = modelId;
-    if (sync && modelId) syncModelForm(getActiveChapter());
+    if (sync && modelId) syncModelForm(selectedChapter.value);
     updateSelectionHighlight();
   }
 
@@ -9490,7 +10268,7 @@ export function useMovieEditor() {
 
   function restoreLastModelSelection() {
     if (selModelId.value) return;
-    const ch = getActiveChapter();
+    const ch = selectedChapter.value;
     const chapterModelList = getChapterModels(ch);
     if (chapterModelList.length === 0) return;
 
@@ -9902,6 +10680,17 @@ export function useMovieEditor() {
         );
       }
     }
+
+    // 编辑态下强制按当前动画配置全量重算一次可视效果，
+    // 避免章节切换后的临时态导致 outline/wireframe/highlight 不刷新。
+    if (
+      ch &&
+      !viewOnly.value &&
+      !isPreviewMode.value &&
+      ["outline", "wireframe", "highlight", "outlineColor", "wireframeColor", "modelHighlightColor"].includes(field)
+    ) {
+      applyChapterEditorVisualState(ch);
+    }
   }
 
   // Subtitles
@@ -9942,7 +10731,18 @@ export function useMovieEditor() {
       editingSId = null;
     } else {
       if (!currProj.value) return;
-      const s = sStore.createSubtitle(currProj.value.id, subForm.text, normalizedStart, normalizedEnd);
+      const parentNodeId = selectedNodeId.value || selectedChapterId.value || activeVideoId.value;
+      if (!parentNodeId) {
+        toastShow("请先选择视频或动画节点", "warning");
+        return;
+      }
+      const s = sStore.createSubtitle(
+        currProj.value.id,
+        parentNodeId,
+        subForm.text,
+        normalizedStart,
+        normalizedEnd
+      );
       s.color = subForm.color;
       s.backgroundColor = subForm.backgroundColor;
       s.displayMode = "fadeIn";
@@ -10031,13 +10831,15 @@ export function useMovieEditor() {
     persistAllChapterDrafts();
     resetEditPlaybackBeforePresentation();
     isPreviewMode.value = true;
+    showVideoPip.value = true;
+    if (videoSrc.value) syncVideoElementSrc(videoSrc.value);
     syncEditorGizmosVisibility();
     syncPresentationInteractionMode();
     syncVideoAudioState();
     syncPresentationRenderProfile();
 
     void beginPresentationPlayback(getPresentationStartChapter(), {
-      autoplay: !isCoarsePointerDevice()
+      autoplay: true
     });
 
     nextTick(() => {
@@ -10050,6 +10852,7 @@ export function useMovieEditor() {
     if (viewOnly.value || !isPreviewMode.value) return;
 
     isPreviewMode.value = false;
+    showVideoPip.value = false;
     chapterPlayTarget.value = null;
     presentationUiChapterId.value = null;
     presentationNavIndex.value = -1;
@@ -10097,6 +10900,7 @@ export function useMovieEditor() {
 
   // Keyboard
   function onKey(e: KeyboardEvent) {
+    if (editorInitializing.value) return;
     if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
     if (e.code === "Space") {
       e.preventDefault();
@@ -10151,6 +10955,20 @@ export function useMovieEditor() {
     const chapterChanged = !!(selectedChapterId.value && selectedChapterId.value !== prevChapterId);
 
     if (chapterChanged && ch) {
+      // 章节切换时先把上一章节当前选中模型的临时编辑会话落入草稿，
+      // 避免动画1的面板状态在动画2里继续沿用造成“串配置”错觉。
+      if (!viewOnly.value && !isPreviewMode.value && prevChapterId && prevModelId) {
+        captureSelectionSession(prevChapterId, prevModelId, selModelNodeId.value);
+        const prevChapter = chapters.value.find(item => item.id === prevChapterId);
+        if (prevChapter) {
+          flushChapterDraftsToModelConfigs(prevChapter);
+          sanitizeChapterModelConfigs(prevChapter);
+        }
+      }
+      clearLiveAnimEditorState();
+      if (selModel.value) {
+        syncModelForm(ch);
+      }
       lastIntroStateKey = "";
       queueMicrotask(() => {
         syncIntroPresentation();
@@ -10188,6 +11006,7 @@ export function useMovieEditor() {
 
   // Lifecycle
   onMounted(async () => {
+    try {
     const queryCode = (route.query.code as string) || "";
     const isViewMode = (route.query.mode as string) === "view" && !!queryCode;
     const routeProjectId = (route.query.id as string) || "";
@@ -10209,12 +11028,11 @@ export function useMovieEditor() {
       syncPresentationRenderProfile();
       syncPresentationInteractionMode();
       adaptPresentationViewport();
-      routeGateLoading.value = false;
       handleResize();
       window.addEventListener("resize", handleResize);
       if (timelineChapters.value.length > 0) {
         void beginPresentationPlayback(getPresentationStartChapter(), {
-          autoplay: !isCoarsePointerDevice()
+          autoplay: true
         });
       }
       return;
@@ -10229,19 +11047,25 @@ export function useMovieEditor() {
       modelSetModelsLoaded.value = false;
       sceneCode.value = null;
       shareLink.value = "";
+      sceneSavedAt.value = "";
       SETTINGS_KEY = getSceneSettingsStorageKey(queryCode);
 
       if (routeProjectId) {
         const existing = pStore.projects.find(p => p.id === routeProjectId) as any;
-        const canReuse =
-          existing && !existing.videoSrc && (existing.chapters?.length || 0) === 0 && (existing.models?.length || 0) === 0;
-        if (existing && !canReuse) {
-          pStore.setCurrentProject(existing);
-          projectTitle.value = existing.title || defaultTitle;
-        } else if (canReuse) {
+        if (existing) {
+          // 带 code 的编辑入口刷新后只展示服务端已保存内容，不恢复本地未保存草稿
+          existing.title = defaultTitle;
+          existing.videoSrc = null;
+          existing.videoDuration = 0;
+          existing.videoWidth = 0;
+          existing.videoHeight = 0;
+          existing.videoDisplayWidth = 0;
+          existing.nodes = [];
+          existing.models = [];
+          existing.subtitles = [];
+          existing.updatedAt = new Date().toISOString();
           pStore.setCurrentProject(existing);
           projectTitle.value = defaultTitle;
-          existing.title = defaultTitle;
         } else {
           pStore.clearCurrentProject();
           pStore.ensureProject(routeProjectId, defaultTitle);
@@ -10273,7 +11097,6 @@ export function useMovieEditor() {
       }
     }
 
-    routeGateLoading.value = false;
     pStore.clearInvalidVideoData();
     await nextTick();
     init3D();
@@ -10281,8 +11104,33 @@ export function useMovieEditor() {
     let loadedFromServer = false;
     if (queryCode && !isViewMode) {
       suspendProjectPersist();
-      await restoreSceneSettingsForEditor(queryCode);
+      // 有已保存场景时直接加载（场景内含设置），避免先 hydrate 再 load 导致 HDR/PMREM 重复烘焙
       loadedFromServer = await tryLoadSavedSceneForModelSet(queryCode);
+      if (!loadedFromServer) {
+        await restoreSceneSettingsForEditor(queryCode);
+      }
+    }
+
+    if (!loadedFromServer && queryCode && !isViewMode) {
+      // 无已保存场景时：仍加载模型集/本地模型，保证刷新后默认可见
+      await tryLoadPendingModelSet();
+      for (const m of models.value) {
+        if (m.url && !meshes.has(m.id)) await loadGLB(m);
+      }
+      for (const m of models.value) {
+        refreshModelHierarchyIfLoaded(m.id, m.name);
+      }
+      dedupeProjectModelsByAsset();
+      ensureAllModelMixers();
+      await finalizeSceneVisualBootstrap();
+      if (meshes.size > 0) {
+        resetAllModelsToDefault();
+        frameCameraOnSceneModels(0);
+      }
+      showVideoPip.value = false;
+      videoOnlyMode.value = false;
+      selectedChapterId.value = null;
+      selectedNodeId.value = null;
     }
 
     if (!loadedFromServer && !queryCode && videoSrc.value) {
@@ -10302,35 +11150,43 @@ export function useMovieEditor() {
       for (const m of models.value) {
         refreshModelHierarchyIfLoaded(m.id, m.name);
       }
-
-      if (chapters.value.length > 0) {
-        selectedChapterId.value = chapters.value[0].id;
-        if (meshes.size > 0) {
-          applyChapterCameraForLoadedModels();
-        } else {
-          applyChapter(chapters.value[0]);
-          syncChapterForm(chapters.value[0]);
-        }
-        syncModelSelectionForChapter(chapters.value[0]);
-      }
-    } else if (loadedFromServer && chapters.value.length > 0 && !selectedChapterId.value) {
-      selectedChapterId.value = chapters.value[0].id;
-      syncModelSelectionForChapter(chapters.value[0]);
     }
 
     if (chapters.value.length > 0) {
       pruneAllChapterModelConfigs();
     }
 
-    const bootChapter = getActiveChapter();
-    if (bootChapter && meshes.size > 0) {
-      syncChapterVisualState(bootChapter, 0);
+    if (!loadedFromServer) {
+      selectedChapterId.value = null;
+      selectedNodeId.value = null;
+      videoOnlyMode.value = false;
+      if (!viewOnly.value && !isPreviewMode.value) showVideoPip.value = false;
+      if (meshes.size > 0) {
+        resetAllModelsToDefault();
+        frameCameraOnSceneModels(0);
+      }
     }
 
     handleResize();
     window.addEventListener("resize", handleResize);
     stripPreviewModeFromLocation();
+    sceneSavedSignature.value = sceneDraftSignature.value;
     setTimeout(() => rootEl.value?.focus(), 100);
+    } catch (e) {
+      console.error("[movie-editor] boot failed", e);
+      toastShow("编辑器初始化失败", "error");
+      try {
+        if (renderer && scene) {
+          ensureDefaultViewportEnvironment();
+          applyBackgroundFromSettings();
+          handleResize();
+        }
+      } catch {
+        /* ignore recovery errors */
+      }
+    } finally {
+      editorBootLoading.value = false;
+    }
   });
 
   onUnmounted(() => {
@@ -10383,6 +11239,22 @@ export function useMovieEditor() {
     };
   };
 
+  function renameActiveVideoNode(name: string) {
+    const video = activeVideoNode.value;
+    if (!video) return;
+    video.name = name.trim() || video.name;
+    video.updatedAt = new Date().toISOString();
+  }
+
+  function renameSelectedGroup(name: string) {
+    const id = selectedNodeId.value;
+    if (!id || !currProj.value) return;
+    const node = currProj.value.nodes.find(n => n.id === id);
+    if (!node || node.type !== "group") return;
+    node.name = name.trim() || node.name;
+    node.updatedAt = new Date().toISOString();
+  }
+
   return reactive({
     bindRef,
     Close,
@@ -10434,14 +11306,18 @@ export function useMovieEditor() {
     tooltipText,
     isPreviewMode,
     viewOnly,
-    routeGateLoading,
+    editorBootLoading,
+    editorInitializing,
     rightTab,
     videoFps,
     modelSetCode,
     pendingModelSetCode,
     sceneCode,
     shareLink,
+    sceneSavedAt,
     savingScene,
+    sceneHasUnsavedChanges,
+    canSaveScene,
     sceneListVersion,
     chapterFormRevision,
     chForm,
@@ -10570,6 +11446,7 @@ export function useMovieEditor() {
     toastShow,
     uploadVideo,
     removeVideo,
+    createNewSceneDraft,
     onDragOver,
     onDragLeave,
     onVideoDrop,
@@ -10597,6 +11474,7 @@ export function useMovieEditor() {
     saveTitle,
     selectChapter,
     playChapter,
+    highlightSceneNode,
     addChapter,
     addChildChapter,
     canAddChildChapter,
@@ -10613,6 +11491,33 @@ export function useMovieEditor() {
     getPresentationNavChapters,
     resolvePresentationNavChapter,
     chCmd,
+    deleteSceneNode: sceneNodeApi.deleteSceneNode,
+    selectSceneNode: sceneNodeApi.selectSceneNode,
+    addGroupNode: sceneNodeApi.addGroupNode,
+    addVideoNode: sceneNodeApi.addVideoNode,
+    addAnimationNode: sceneNodeApi.addAnimationNode,
+    getSceneNodeChildren: sceneNodeApi.getSceneNodeChildren,
+    isSceneNodeExpanded: sceneNodeApi.isSceneNodeExpanded,
+    toggleSceneNodeExpanded: sceneNodeApi.toggleSceneNodeExpanded,
+    isSceneNodeSelected: isTreeNodeHighlighted,
+    getVideoNodeSrc: sceneNodeApi.getVideoNodeSrc,
+    moveSceneVideoToGroup: sceneNodeApi.moveSceneVideoToGroup,
+    startDragSceneVideo: sceneNodeApi.startDragSceneVideo,
+    endDragSceneVideo: sceneNodeApi.endDragSceneVideo,
+    setSceneNodeDropTarget: sceneNodeApi.setSceneNodeDropTarget,
+    triggerVideoNodeUpload: sceneNodeApi.triggerVideoNodeUpload,
+    renameActiveVideoNode,
+    renameSelectedGroup,
+    nodes,
+    rootSceneNodes,
+    selectedNodeId,
+    activeVideoId,
+    expandedNodeIds,
+    sceneNodeDraggingId,
+    sceneNodeDropTargetId,
+    videoOnlyMode,
+    showNodePanel,
+    activeVideoNode,
     saveChF,
     saveChapterFull,
     deleteChapter,

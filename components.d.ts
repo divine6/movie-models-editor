@@ -31,6 +31,8 @@ declare module 'vue' {
     EditorOverlays: typeof import('./src/components/business/movie-editor/editor-overlays.vue')['default']
     EditorProgressBar: typeof import('./src/components/business/movie-editor/editor-progress-bar.vue')['default']
     EditorSceneListDrawer: typeof import('./src/components/business/movie-editor/editor-scene-list-drawer.vue')['default']
+    EditorSceneNodeTree: typeof import('./src/components/business/movie-editor/editor-scene-node-tree.vue')['default']
+    EditorSceneNodeTreeItem: typeof import('./src/components/business/movie-editor/editor-scene-node-tree-item.vue')['default']
     EditorScenePanel: typeof import('./src/components/business/movie-editor/editor-scene-panel.vue')['default']
     EditorSegmentTransform: typeof import('./src/components/business/movie-editor/editor-segment-transform.vue')['default']
     EditorSubtitlePanel: typeof import('./src/components/business/movie-editor/editor-subtitle-panel.vue')['default']
