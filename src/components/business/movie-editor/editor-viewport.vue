@@ -55,9 +55,9 @@ import { useMovieEditorContext } from "@/composables/useMovieEditorContext";
 const editor = useMovieEditorContext();
 
 function onViewportDblClick(e: MouseEvent) {
-  if (!editor.hasVideo || editor.isPreviewMode) return;
-  if ((e.target as HTMLElement).closest(".pip-group, .viewport-play-hint, .viewport-preview-nav")) return;
-  if (editor.pickModelAtViewport(e.clientX, e.clientY)) return;
+  // 展示/预览：仅双击屏幕切换播放（与触控双击一致）；编辑态不由此切换。
+  if (!editor.hasVideo || !(editor.viewOnly || editor.isPreviewMode)) return;
+  if ((e.target as HTMLElement).closest(".pip-group, .viewport-play-hint, .viewport-preview-nav, .progress-area, .chapter-list-panel")) return;
   editor.togglePlay();
 }
 </script>

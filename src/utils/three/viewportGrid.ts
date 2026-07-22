@@ -6,7 +6,7 @@ function createGridMaterial(color: number): THREE.LineBasicMaterial {
   return new THREE.LineBasicMaterial({
     color,
     transparent: true,
-    opacity: 0.55,
+    opacity: 0.45,
     depthWrite: false,
     fog: true,
     toneMapped: false

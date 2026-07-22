@@ -306,8 +306,13 @@
         }
 
         &.is-drop-target {
-          background: rgb(74 222 128 / 8%);
-          border-color: rgb(74 222 128 / 35%);
+          background: rgb(74 222 128 / 12%);
+          border-color: rgb(74 222 128 / 45%);
+        }
+
+        &.is-drop-forbidden {
+          background: rgb(248 113 113 / 10%);
+          border-color: rgb(248 113 113 / 40%);
         }
       }
 
@@ -319,6 +324,18 @@
         color: var(--editor-text-muted);
       }
 
+      .scene-node-segment-track {
+        background: rgb(255 255 255 / 10%);
+
+        &.is-active {
+          background: rgb(74 222 128 / 18%);
+        }
+      }
+
+      .scene-node-segment-fill {
+        background: var(--editor-accent);
+      }
+
       .scene-node-toggle {
         color: var(--editor-text-muted);
       }
@@ -327,12 +344,25 @@
         --el-button-text-color: var(--editor-text-muted);
         --el-button-hover-text-color: var(--editor-accent);
         --el-button-hover-bg-color: rgb(255 255 255 / 6%);
+
+        &.is-playing {
+          --el-button-text-color: var(--editor-accent);
+        }
       }
 
       .scene-node-action-btn.el-button--danger.is-text {
         --el-button-text-color: #f87171;
         --el-button-hover-text-color: #fca5a5;
         --el-button-hover-bg-color: rgb(127 29 29 / 28%);
+      }
+
+      .scene-node-row.playing {
+        background: var(--editor-accent-soft) !important;
+
+        .scene-node-name {
+          color: var(--editor-accent);
+          font-weight: 500;
+        }
       }
 
       .video-node-detail-hint {

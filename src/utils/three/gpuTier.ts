@@ -60,16 +60,20 @@ export function detectGpuTierProfile(
   if (coarsePointer) tier = Math.min(tier, 2) as GpuTierLevel;
 
   const maxDprTable: Record<GpuTierLevel, number> = {
-    0: coarsePointer ? Math.min(dpr, 1.5) : 1.25,
-    1: coarsePointer ? Math.min(dpr, 2) : 1.75,
-    2: coarsePointer ? Math.min(dpr, 2.5) : 2,
-    3: coarsePointer ? Math.min(dpr, 2.5) : 2
+    // 手机：靠 SMAA + 中等 DPR；电脑：可到 2x
+    0: coarsePointer ? Math.min(dpr, 1.5) : 1.5,
+    1: coarsePointer ? Math.min(dpr, 1.75) : 2,
+    2: coarsePointer ? Math.min(dpr, 1.85) : 2,
+    3: coarsePointer ? Math.min(dpr, 2) : 2
   };
 
   return {
     tier,
     maxPresentationDpr: maxDprTable[tier],
-    /** tier≥1 且 WebGL2 时启用 Composer MSAA（具体 sample 数由渲染层按动画状态调节） */
-    enableComposerMsaa: tier >= 1 && isWebGL2
+    /**
+     * Composer MSAA 很吃显存。
+     * 电脑：tier≥1 开 2x；手机：不开（SMAA 更划算，也更不容易 context loss）
+     */
+    enableComposerMsaa: !coarsePointer && tier >= 1 && isWebGL2
   };
 }

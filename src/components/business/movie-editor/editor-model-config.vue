@@ -76,15 +76,12 @@
 
     <editor-model-animation :form-data="formData" :on-apply="applyLive" />
   </div>
-  <div v-else-if="editor.selectedChapter" class="model-config-empty">
-    <base-empty size="small" :text="$t('OpWeb.Editor.NoModelSelected', '当前未选中模型')" />
-  </div>
 </template>
 
 <script setup lang="ts" name="editor-model-config">
-import { reactive, unref, watch } from "vue";
+import { nextTick, reactive, unref, watch } from "vue";
 
-import { createDefaultModelConfig, DEFAULT_OUTLINE_COLOR, DEFAULT_WIREFRAME_COLOR, DEFAULT_MODEL_HIGHLIGHT_COLOR } from "@/composables/movie-editor/utils/modelConfig";
+import { DEFAULT_OUTLINE_COLOR, DEFAULT_WIREFRAME_COLOR, DEFAULT_MODEL_HIGHLIGHT_COLOR } from "@/composables/movie-editor/utils/modelConfig";
 import { useMovieEditorContext } from "@/composables/useMovieEditorContext";
 import { useTranslate } from "@/hooks/useTranslate";
 
@@ -117,7 +114,10 @@ const syncFromEditor = () => {
 
   isSyncingModelForm = true;
   Object.assign(formData, editor.getModelFormSnapshot());
-  isSyncingModelForm = false;
+  // 等本轮字段 watch 跑完再放开，避免章节切换时把旧开关写进新节点
+  nextTick(() => {
+    isSyncingModelForm = false;
+  });
 };
 
 watch(

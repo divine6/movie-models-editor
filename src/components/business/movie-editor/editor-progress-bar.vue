@@ -1,6 +1,11 @@
 <template>
   <div class="progress-area" :class="{ 'preview-progress': editor.isPreviewMode }" @click.stop>
-    <div :ref="editor.bindRef('trackEl')" class="progress-track progress-track--chapters" @click="editor.seekTrack">
+    <div
+      :ref="editor.bindRef('trackEl')"
+      class="progress-track progress-track--chapters"
+      @click="onTrackClick"
+      @pointerup="onTrackPointerUp"
+    >
       <div class="prog-playback" :style="{ width: `${trailPct}%` }" />
       <div class="prog-segs prog-segs--absolute">
         <div
@@ -124,5 +129,24 @@ function onSegmentClick(ch: Chapter, e: MouseEvent) {
   const ratio = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
   const seekTime = ch.startTime + ratio * (ch.endTime - ch.startTime);
   editor.jumpToChapter(ch, seekTime);
+}
+
+let suppressTrackClickUntil = 0;
+
+function onTrackClick(e: MouseEvent) {
+  if (performance.now() < suppressTrackClickUntil) return;
+  const target = e.target as HTMLElement;
+  if (target.closest(".prog-seg")) return;
+  editor.seekTrack(e);
+}
+
+function onTrackPointerUp(e: PointerEvent) {
+  if (e.pointerType === "mouse" && e.button !== 0) return;
+  const target = e.target as HTMLElement;
+  if (target.closest(".prog-seg")) return;
+  e.preventDefault();
+  // pointerup already seeks; suppress the synthetic click that browsers emit after touch.
+  suppressTrackClickUntil = performance.now() + 500;
+  editor.seekTrack(e);
 }
 </script>

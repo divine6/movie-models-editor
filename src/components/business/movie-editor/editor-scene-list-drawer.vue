@@ -130,9 +130,11 @@ async function loadScenes() {
       }
       return scene;
     });
+    editor.savedSceneCount = scenes.value.length;
   } catch (e: any) {
     ElMessage.error(e?.message || "加载场景列表失败");
     scenes.value = [];
+    editor.savedSceneCount = 0;
   } finally {
     loading.value = false;
   }
@@ -209,6 +211,7 @@ async function onDelete(row: EditorServerSceneItem) {
   try {
     await deleteScene(row.code);
     scenes.value = scenes.value.filter(item => item.code !== row.code);
+    editor.savedSceneCount = scenes.value.length;
     if (editor.sceneCode === row.code) {
       editor.sceneCode = null;
       editor.shareLink = "";

@@ -54,8 +54,8 @@ echo Service:     movie-editor
 echo ========================================
 echo.
 
-echo [1/5] Build Docker image...
-powershell -NoProfile -ExecutionPolicy Bypass -File "%PROJECT_ROOT%\scripts\docker-build.ps1" -Tag "%FULL_IMAGE%"
+echo [1/5] Build Docker image (local frontend + runtime)...
+powershell -NoProfile -ExecutionPolicy Bypass -File "%PROJECT_ROOT%\scripts\docker-build.ps1" -Tag "%FULL_IMAGE%" -LocalFrontend
 if errorlevel 1 (
   echo [ERROR] Docker build failed.
   exit /b 1
@@ -94,26 +94,15 @@ if /i not "%IMAGE_TAG%"=="latest" (
 )
 echo.
 
-echo [4/5] Apply K8s manifests...
-kubectl apply -f "%SCRIPT_DIR%deploy.yaml"
+echo [4/5] Apply K8s manifests and rollout...
+call "%SCRIPT_DIR%_kubectl-apply.cmd" "%SCRIPT_DIR%deploy.yaml" "%FULL_IMAGE%"
 if errorlevel 1 (
-  echo [ERROR] kubectl apply failed.
-  exit /b 1
-)
-
-kubectl set image deployment/movie-editor movie-editor="%FULL_IMAGE%" -n u3d
-if errorlevel 1 (
-  echo [ERROR] kubectl set image failed.
+  echo [ERROR] K8s deploy failed. Image is already in Harbor; run deploy-k8s.bat after updating kubeconfig.
   exit /b 1
 )
 echo.
 
-echo [5/5] Wait for rollout...
-kubectl rollout status deployment/movie-editor -n u3d --timeout=300s
-if errorlevel 1 (
-  echo [ERROR] Rollout failed. Check: kubectl describe pod -l app=movie-editor -n u3d
-  exit /b 1
-)
+echo [5/5] Done.
 
 echo.
 echo ========================================

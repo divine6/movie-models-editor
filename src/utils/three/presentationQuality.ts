@@ -38,7 +38,7 @@ export function probePresentationBufferCap(viewportEdgePx: number, maxTextureSiz
 
 /**
  * 展示模式像素比：min(设备DPR, 配置档位, GPU分档上限, 缓冲上限) × 性能缩放
- * perfScale 仅在动画播放掉帧时由渲染层自动降低，不改动画逻辑
+ * 掉帧时由 perfScale 降负荷；保持 SMAA，不靠过高 DPR/MSAA 硬扛
  */
 export function resolvePresentationPixelRatio(
   configuredTier: number,
@@ -52,8 +52,9 @@ export function resolvePresentationPixelRatio(
   const dpr = getDevicePixelRatio();
   const edge = Math.max(viewportWidth, viewportHeight, 1);
   const bufferCap = probePresentationBufferCap(edge, maxTextureSize);
-  const qualityCap = Math.min(tier, gpuProfile.maxPresentationDpr, dpr);
-  const ratio = Math.min(qualityCap, bufferCap) * Math.max(0.75, Math.min(perfScale, 1));
+  // 配置档与 GPU 上限取交，再不超过设备 DPR
+  const qualityCap = Math.min(Math.max(tier, 1.25), gpuProfile.maxPresentationDpr, dpr);
+  const ratio = Math.min(qualityCap, bufferCap) * Math.max(0.78, Math.min(perfScale, 1));
   return Math.max(1, Math.round(ratio * 100) / 100);
 }
 

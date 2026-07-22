@@ -31,6 +31,8 @@ type Deps = {
   expandedNodeIds: Ref<Set<string>>;
   sceneNodeDraggingId: Ref<string | null>;
   sceneNodeDropTargetId: Ref<string | null>;
+  /** allow=可放入高亮, forbid=禁止放入, null=无拖放悬停 */
+  sceneNodeDropKind: Ref<"allow" | "forbid" | null>;
   videoNodeUploadTargetId: Ref<string | null>;
   duration: Ref<number>;
   getNextChapterRange: (
@@ -113,6 +115,34 @@ export function createSceneNodeEditorApi(deps: Deps) {
     deps.expandedNodeIds.value = next;
   }
 
+  /** 展开目标节点祖先；预览手风琴模式下折叠同级其它分组/视频 */
+  function revealSceneNodeInTree(nodeId: string, options?: { accordion?: boolean }) {
+    const node = getNodeById(deps.nodes.value, nodeId);
+    if (!node) return;
+    const next = new Set(deps.expandedNodeIds.value);
+
+    if (options?.accordion && isAnimationNode(node)) {
+      const videoParent = node.parentId ? getNodeById(deps.nodes.value, node.parentId) : null;
+      const siblings = videoParent?.parentId
+        ? getChildNodes(deps.nodes.value, videoParent.parentId)
+        : getRootNodes(deps.nodes.value);
+      for (const sibling of siblings) {
+        if (videoParent && sibling.id === videoParent.id) continue;
+        if (isGroupNode(sibling) || isVideoNode(sibling)) {
+          collapseExpandableDescendants(sibling.id, next);
+          next.delete(sibling.id);
+        }
+      }
+    }
+
+    let current: SceneNode | undefined | null = node;
+    while (current?.parentId) {
+      next.add(current.parentId);
+      current = getNodeById(deps.nodes.value, current.parentId);
+    }
+    deps.expandedNodeIds.value = next;
+  }
+
   function addExpandedNode(id: string) {
     if (deps.expandedNodeIds.value.has(id)) return;
     const next = new Set(deps.expandedNodeIds.value);
@@ -146,7 +176,7 @@ export function createSceneNodeEditorApi(deps: Deps) {
     expandAncestors(node.id);
 
     if (isAnimationNode(node)) {
-      deps.selectedChapterId.value = node.id;
+      // 章节 id 由 applyChapter → navigateToChapter 设置，避免提前改 id 导致上一章 live 段落错落到新章
       deps.videoOnlyMode.value = false;
       if (node.parentId) setActiveVideo(node.parentId, { syncElement: true });
       deps.applyChapter(node);
@@ -278,15 +308,26 @@ export function createSceneNodeEditorApi(deps: Deps) {
 
   function startDragSceneVideo(videoId: string) {
     deps.sceneNodeDraggingId.value = videoId;
+    deps.sceneNodeDropTargetId.value = null;
+    deps.sceneNodeDropKind.value = null;
   }
 
   function endDragSceneVideo() {
     deps.sceneNodeDraggingId.value = null;
     deps.sceneNodeDropTargetId.value = null;
+    deps.sceneNodeDropKind.value = null;
   }
 
-  function setSceneNodeDropTarget(id: string | null) {
+  function setSceneNodeDropTarget(id: string | null, kind: "allow" | "forbid" | null = null) {
     deps.sceneNodeDropTargetId.value = id;
+    deps.sceneNodeDropKind.value = id ? kind : null;
+  }
+
+  function canDropDraggedVideoTo(targetParentId: string | null): boolean {
+    const videoId = deps.sceneNodeDraggingId.value;
+    if (!videoId || !deps.currProj.value) return false;
+    const normalized = targetParentId === "__root__" ? null : targetParentId;
+    return canDropVideoInTarget(deps.currProj.value.nodes, videoId, normalized);
   }
 
   function triggerVideoNodeUpload(videoId: string) {
@@ -310,6 +351,7 @@ export function createSceneNodeEditorApi(deps: Deps) {
     rootSceneNodes,
     isSceneNodeExpanded,
     toggleSceneNodeExpanded,
+    revealSceneNodeInTree,
     isSceneNodeSelected,
     getVideoNodeSrc,
     selectSceneNode,
@@ -321,6 +363,7 @@ export function createSceneNodeEditorApi(deps: Deps) {
     startDragSceneVideo,
     endDragSceneVideo,
     setSceneNodeDropTarget,
+    canDropDraggedVideoTo,
     triggerVideoNodeUpload,
     setVideoNodeInfo,
     setActiveVideo,

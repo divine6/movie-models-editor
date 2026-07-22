@@ -1024,7 +1024,7 @@
       overflow: visible;
       transform: none;
       pointer-events: none;
-      z-index: 30;
+      z-index: 90;
     }
 
     .view-canvas {
@@ -1048,6 +1048,7 @@
     .viewport-play-hint-icon,
     .viewport-preview-nav-btn {
       pointer-events: auto !important;
+      z-index: 91;
     }
 
     &.view-only-route {
@@ -1119,6 +1120,11 @@
 
         .pip-group--view-fixed {
           max-width: none;
+          /* 手机展示页固定右上（避开顶栏），对齐设计位，不沿用桌面拖动坐标 */
+          left: auto !important;
+          right: var(--preview-pip-right) !important;
+          top: var(--preview-pip-top) !important;
+          width: min(50vw, 240px) !important;
         }
       }
 
@@ -1133,6 +1139,10 @@
 
         .pip-group--view-fixed {
           max-width: none;
+          left: auto !important;
+          right: var(--preview-pip-right) !important;
+          top: var(--preview-pip-top) !important;
+          width: min(50vw, 240px) !important;
         }
       }
     }

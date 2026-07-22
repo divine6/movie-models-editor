@@ -77,11 +77,11 @@
         <div class="chapter-fov-field">
           <label class="chapter-field-label">{{ $t("OpWeb.Editor.Fov", "FOV") }}</label>
           <div class="chapter-fov-row">
-            <el-slider v-model="cameraForm.fov" :min="20" :max="120" :step="1" size="small" />
+            <el-slider v-model="cameraForm.fov" :min="10" :max="60" :step="1" size="small" />
             <el-input-number
               v-model="cameraForm.fov"
-              :min="20"
-              :max="120"
+              :min="10"
+              :max="60"
               :step="1"
               :controls="false"
               size="small"
@@ -170,7 +170,7 @@ const syncForms = () => {
     targetX: round3(ch.camera.target[0]),
     targetY: round3(ch.camera.target[1]),
     targetZ: round3(ch.camera.target[2]),
-    fov: ch.camera.fov,
+    fov: Math.min(60, Math.max(10, ch.camera.fov)),
     transitionSec: ch.camera.transitionSec ?? cameraForm.transitionSec ?? 0.5
   });
   void nextTick(() => {
@@ -209,6 +209,7 @@ watch(
     cameraForm.targetX = round3(cameraForm.targetX);
     cameraForm.targetY = round3(cameraForm.targetY);
     cameraForm.targetZ = round3(cameraForm.targetZ);
+    cameraForm.fov = Math.min(60, Math.max(10, cameraForm.fov));
     editor.applyCameraFormSnapshot({ ...cameraForm });
     editor.applyCameraFormToViewport();
     const ch = activeChapter.value;

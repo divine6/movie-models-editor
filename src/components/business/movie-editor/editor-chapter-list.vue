@@ -34,25 +34,26 @@
           />
         </div>
 
-        <div v-if="editor.selectedChapter" class="chapter-panel-detail">
+        <div v-if="selectedAnimationNode" class="chapter-panel-detail">
           <div class="chapter-detail-head">
-            <span>{{ $t("OpWeb.Editor.ChapterInfo", "节点信息") }}</span>
-            <span v-if="editor.selectedChapter" class="chapter-detail-sub">{{ editor.selectedChapter.name }}</span>
+            <span>动画信息</span>
+            <span class="chapter-detail-sub">{{ selectedAnimationNode.name || "未命名动画" }}</span>
           </div>
           <editor-chapter-form />
         </div>
 
-        <div v-else-if="editor.activeVideoNode && editor.videoOnlyMode" class="chapter-panel-detail">
+        <div v-else-if="selectedVideoNode" class="chapter-panel-detail">
           <div class="chapter-detail-head">
             <span>视频信息</span>
-            <span class="chapter-detail-sub">{{ editor.activeVideoNode.name }}</span>
+            <span class="chapter-detail-sub">{{ selectedVideoNode.name || "未命名视频" }}</span>
           </div>
           <div class="video-node-detail" data-testid="video-node-detail">
             <div class="chapter-form-field">
               <label class="chapter-field-label">{{ $t("OpWeb.Common.Name", "名称") }}</label>
               <el-input
-                :model-value="editor.activeVideoNode.name"
+                :model-value="selectedVideoNode.name"
                 size="small"
+                placeholder="视频名称"
                 @update:model-value="editor.renameActiveVideoNode"
               />
             </div>
@@ -60,14 +61,20 @@
           </div>
         </div>
 
-        <div v-else-if="editor.selectedNodeId" class="chapter-panel-detail">
+        <div v-else-if="selectedGroupNode" class="chapter-panel-detail">
           <div class="chapter-detail-head">
             <span>分组信息</span>
+            <span class="chapter-detail-sub">{{ selectedGroupNode.name || "未命名分组" }}</span>
           </div>
           <div class="video-node-detail">
             <div class="chapter-form-field">
               <label class="chapter-field-label">{{ $t("OpWeb.Common.Name", "名称") }}</label>
-              <el-input :model-value="selectedGroupName" size="small" @update:model-value="editor.renameSelectedGroup" />
+              <el-input
+                :model-value="selectedGroupNode.name"
+                size="small"
+                placeholder="分组名称"
+                @update:model-value="editor.renameSelectedGroup"
+              />
             </div>
           </div>
         </div>
@@ -100,17 +107,20 @@ const presentationDrawerOpen = computed(() => {
   return isNarrowScreen.value ? drawerOpen.value : true;
 });
 
-const selectedGroupName = computed(() => {
+const selectedNode = computed(() => {
   const id = editor.selectedNodeId;
-  if (!id) return "";
-  const node = editor.nodes.find(n => n.id === id);
-  return node?.type === "group" ? node.name : "";
+  if (!id) return null;
+  return editor.nodes.find(n => n.id === id) ?? null;
 });
+const selectedAnimationNode = computed(() =>
+  selectedNode.value?.type === "animation" ? selectedNode.value : null
+);
+const selectedVideoNode = computed(() => (selectedNode.value?.type === "video" ? selectedNode.value : null));
+const selectedGroupNode = computed(() => (selectedNode.value?.type === "group" ? selectedNode.value : null));
 
 const onPreviewChapterPlay = (chapter: Chapter) => {
-  editor.highlightSceneNode(chapter.id);
   if (editor.viewOnly || editor.isPreviewMode) {
-    // 与进度条/左右切段同一套“seek + 强制续播”路径，避免停在目标点不往后播。
+    // 统一走 jump/seek，避免先 highlight 再跳转导致列表/进度条短暂不同步
     editor.jumpToChapter(chapter);
   } else {
     const wasPlaying = !!(editor.videoEl && (!editor.videoEl.paused || editor.isPlaying));
@@ -121,8 +131,10 @@ const onPreviewChapterPlay = (chapter: Chapter) => {
       keepPlaying: wasPlaying
     });
   }
+  // Delay closing the drawer so the touch cannot click-through onto the play button
+  // (which would immediately pause after a play jump). Keep short so切章体感更即时。
   if (!editor.viewOnly || (typeof window !== "undefined" && window.innerWidth <= 768)) {
-    hideChapterDrawer();
+    window.setTimeout(() => hideChapterDrawer(), 180);
   }
 };
 

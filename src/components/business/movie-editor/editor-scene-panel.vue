@@ -27,7 +27,7 @@
                     :step="0.05"
                     :controls="false"
                     size="small"
-                    @input="editor.applySettings"
+                    @input="numApply('ambIntensity', editor.applySettings)"
                   />
                 </div>
               </div>
@@ -91,7 +91,7 @@
                       :max="LIGHT_MAX"
                       :step="0.05"
                       size="small"
-                      @input="editor.applySceneLights"
+                      @input="lightNumApply(n => { if (selectedLight) selectedLight.intensity = n })"
                     /><el-input-number
                       v-model="selectedLight.intensity"
                       :min="0"
@@ -99,7 +99,7 @@
                       :step="0.05"
                       :controls="false"
                       size="small"
-                      @input="editor.applySceneLights"
+                      @input="lightNumApply(n => { if (selectedLight) selectedLight.intensity = n })"
                     />
                   </div>
                 </div>
@@ -115,7 +115,7 @@
                           :max="POS_MAX"
                           :step="0.05"
                           size="small"
-                          @input="editor.applySceneLights"
+                          @input="lightNumApply(n => { if (selectedLight) selectedLight.position[axis.idx] = n })"
                         /><el-input-number
                           v-model="selectedLight.position[axis.idx]"
                           :min="POS_MIN"
@@ -123,7 +123,7 @@
                           :step="0.05"
                           :controls="false"
                           size="small"
-                          @input="editor.applySceneLights"
+                          @input="lightNumApply(n => { if (selectedLight) selectedLight.position[axis.idx] = n })"
                         />
                       </div>
                     </div>
@@ -141,7 +141,7 @@
                           :max="180"
                           :step="0.05"
                           size="small"
-                          @input="editor.applySceneLights"
+                          @input="lightNumApply(n => { if (selectedLight) selectedLight.rotation[axis.idx] = n })"
                         /><el-input-number
                           v-model="selectedLight.rotation[axis.idx]"
                           :min="-180"
@@ -149,7 +149,7 @@
                           :step="0.05"
                           :controls="false"
                           size="small"
-                          @input="editor.applySceneLights"
+                          @input="lightNumApply(n => { if (selectedLight) selectedLight.rotation[axis.idx] = n })"
                         />
                       </div>
                     </div>
@@ -169,7 +169,7 @@
                         :max="100"
                         :step="0.05"
                         size="small"
-                        @input="editor.applySceneLights"
+                        @input="lightNumApply(n => { if (selectedLight) selectedLight.distance = n })"
                       /><el-input-number
                         v-model="selectedLight.distance"
                         :min="0"
@@ -177,7 +177,7 @@
                         :step="0.05"
                         :controls="false"
                         size="small"
-                        @input="editor.applySceneLights"
+                        @input="lightNumApply(n => { if (selectedLight) selectedLight.distance = n })"
                       />
                     </div>
                   </div>
@@ -190,7 +190,7 @@
                         :max="5"
                         :step="0.05"
                         size="small"
-                        @input="editor.applySceneLights"
+                        @input="lightNumApply(n => { if (selectedLight) selectedLight.decay = n })"
                       /><el-input-number
                         v-model="selectedLight.decay"
                         :min="0"
@@ -198,7 +198,7 @@
                         :step="0.05"
                         :controls="false"
                         size="small"
-                        @input="editor.applySceneLights"
+                        @input="lightNumApply(n => { if (selectedLight) selectedLight.decay = n })"
                       />
                     </div>
                   </div>
@@ -213,7 +213,7 @@
                         :max="90"
                         :step="0.05"
                         size="small"
-                        @input="editor.applySceneLights"
+                        @input="lightNumApply(n => { if (selectedLight) selectedLight.angle = n })"
                       /><el-input-number
                         v-model="selectedLight.angle"
                         :min="1"
@@ -221,7 +221,7 @@
                         :step="0.05"
                         :controls="false"
                         size="small"
-                        @input="editor.applySceneLights"
+                        @input="lightNumApply(n => { if (selectedLight) selectedLight.angle = n })"
                       />
                     </div>
                   </div>
@@ -234,7 +234,7 @@
                         :max="1"
                         :step="0.05"
                         size="small"
-                        @input="editor.applySceneLights"
+                        @input="lightNumApply(n => { if (selectedLight) selectedLight.penumbra = n })"
                       /><el-input-number
                         v-model="selectedLight.penumbra"
                         :min="0"
@@ -242,7 +242,7 @@
                         :step="0.05"
                         :controls="false"
                         size="small"
-                        @input="editor.applySceneLights"
+                        @input="lightNumApply(n => { if (selectedLight) selectedLight.penumbra = n })"
                       />
                     </div>
                   </div>
@@ -260,10 +260,16 @@
               <div class="sp-module-title">材质设置（当前模型）</div>
               <p v-if="!editor.selModel" class="sp-hint">请先在模型列表中选择一个模型</p>
               <template v-else>
+                <p class="sp-mat-target-name" :title="editor.modelDisplayName">
+                  当前选中：{{ editor.modelDisplayName }}
+                  <span v-if="editor.selModelNode" class="sp-mat-target-type">
+                    （{{ editor.selModelNode.objectType }}）
+                  </span>
+                </p>
                 <p class="sp-hint">
                   {{
                     editor.selModelNodeId
-                      ? "作用于当前选中的模型部件"
+                      ? "作用于当前选中的模型部件（已隔离材质，不会改到其它部件）"
                       : "作用于当前选中的整个模型"
                   }}
                 </p>
@@ -285,7 +291,7 @@
                       :max="1"
                       :step="0.05"
                       size="small"
-                      @input="editor.applyMatToCurModel"
+                      @input="numApply('matRoughness', editor.applyMatToCurModel)"
                     /><el-input-number
                       v-model="editor.matRoughness"
                       :min="0"
@@ -293,7 +299,7 @@
                       :step="0.05"
                       :controls="false"
                       size="small"
-                      @input="editor.applyMatToCurModel"
+                      @input="numApply('matRoughness', editor.applyMatToCurModel)"
                     />
                   </div>
                 </div>
@@ -306,7 +312,7 @@
                       :max="1"
                       :step="0.05"
                       size="small"
-                      @input="editor.applyMatToCurModel"
+                      @input="numApply('matMetalness', editor.applyMatToCurModel)"
                     /><el-input-number
                       v-model="editor.matMetalness"
                       :min="0"
@@ -314,7 +320,7 @@
                       :step="0.05"
                       :controls="false"
                       size="small"
-                      @input="editor.applyMatToCurModel"
+                      @input="numApply('matMetalness', editor.applyMatToCurModel)"
                     />
                   </div>
                 </div>
@@ -327,7 +333,7 @@
                       :max="5"
                       :step="0.05"
                       size="small"
-                      @input="editor.applyMatToCurModel"
+                      @input="numApply('matNormalStr', editor.applyMatToCurModel)"
                     /><el-input-number
                       v-model="editor.matNormalStr"
                       :min="0"
@@ -335,7 +341,7 @@
                       :step="0.05"
                       :controls="false"
                       size="small"
-                      @input="editor.applyMatToCurModel"
+                      @input="numApply('matNormalStr', editor.applyMatToCurModel)"
                     />
                   </div>
                 </div>
@@ -348,7 +354,7 @@
                       :max="5"
                       :step="0.05"
                       size="small"
-                      @input="editor.applyMatToCurModel"
+                      @input="numApply('matEmissiveInt', editor.applyMatToCurModel)"
                     /><el-input-number
                       v-model="editor.matEmissiveInt"
                       :min="0"
@@ -356,7 +362,7 @@
                       :step="0.05"
                       :controls="false"
                       size="small"
-                      @input="editor.applyMatToCurModel"
+                      @input="numApply('matEmissiveInt', editor.applyMatToCurModel)"
                     />
                   </div>
                 </div>
@@ -374,22 +380,22 @@
               <div class="sp-field">
                 <label>强度</label>
                 <div class="sp-slider-row">
-                  <el-slider v-model="editor.bloomIntensity" :min="0" :max="3" :step="0.05" size="small" @input="editor.toggleBloom" />
+                  <el-slider v-model="editor.bloomIntensity" :min="0" :max="1.5" :step="0.05" size="small" @input="numApply('bloomIntensity', editor.toggleBloom)" />
                   <el-input-number
                     v-model="editor.bloomIntensity"
                     :min="0"
-                    :max="3"
+                    :max="1.5"
                     :step="0.05"
                     :controls="false"
                     size="small"
-                    @input="editor.toggleBloom"
+                    @input="numApply('bloomIntensity', editor.toggleBloom)"
                   />
                 </div>
               </div>
               <div class="sp-field">
                 <label>阈值</label>
                 <div class="sp-slider-row">
-                  <el-slider v-model="editor.bloomThreshold" :min="0" :max="1" :step="0.05" size="small" @input="editor.toggleBloom" />
+                  <el-slider v-model="editor.bloomThreshold" :min="0" :max="1" :step="0.05" size="small" @input="numApply('bloomThreshold', editor.toggleBloom)" />
                   <el-input-number
                     v-model="editor.bloomThreshold"
                     :min="0"
@@ -397,14 +403,14 @@
                     :step="0.05"
                     :controls="false"
                     size="small"
-                    @input="editor.toggleBloom"
+                    @input="numApply('bloomThreshold', editor.toggleBloom)"
                   />
                 </div>
               </div>
               <div class="sp-field">
                 <label>半径</label>
                 <div class="sp-slider-row">
-                  <el-slider v-model="editor.bloomRadius" :min="0" :max="1" :step="0.05" size="small" @input="editor.toggleBloom" />
+                  <el-slider v-model="editor.bloomRadius" :min="0" :max="1" :step="0.05" size="small" @input="numApply('bloomRadius', editor.toggleBloom)" />
                   <el-input-number
                     v-model="editor.bloomRadius"
                     :min="0"
@@ -412,7 +418,7 @@
                     :step="0.05"
                     :controls="false"
                     size="small"
-                    @input="editor.toggleBloom"
+                    @input="numApply('bloomRadius', editor.toggleBloom)"
                   />
                 </div>
               </div>
@@ -495,7 +501,7 @@
               <div class="sp-field">
                 <label>曝光度</label>
                 <div class="sp-slider-row">
-                  <el-slider v-model="editor.ppExposure" :min="0" :max="5" :step="0.05" size="small" @input="editor.applyToneMapping" />
+                  <el-slider v-model="editor.ppExposure" :min="0" :max="5" :step="0.05" size="small" @input="editor.setPpExposure" />
                   <el-input-number
                     v-model="editor.ppExposure"
                     :min="0"
@@ -503,14 +509,14 @@
                     :step="0.05"
                     :controls="false"
                     size="small"
-                    @input="editor.applyToneMapping"
+                    @input="editor.setPpExposure"
                   />
                 </div>
               </div>
               <div class="sp-field">
                 <label>对比度</label>
                 <div class="sp-slider-row">
-                  <el-slider v-model="editor.ppContrast" :min="-1" :max="1" :step="0.05" size="small" @input="editor.toggleColor" />
+                  <el-slider v-model="editor.ppContrast" :min="-1" :max="1" :step="0.05" size="small" @input="editor.setPpContrast" />
                   <el-input-number
                     v-model="editor.ppContrast"
                     :min="-1"
@@ -518,14 +524,14 @@
                     :step="0.05"
                     :controls="false"
                     size="small"
-                    @input="editor.toggleColor"
+                    @input="editor.setPpContrast"
                   />
                 </div>
               </div>
               <div class="sp-field">
                 <label>饱和度</label>
                 <div class="sp-slider-row">
-                  <el-slider v-model="editor.ppSaturation" :min="-1" :max="1" :step="0.05" size="small" @input="editor.toggleColor" />
+                  <el-slider v-model="editor.ppSaturation" :min="-1" :max="1" :step="0.05" size="small" @input="editor.setPpSaturation" />
                   <el-input-number
                     v-model="editor.ppSaturation"
                     :min="-1"
@@ -533,7 +539,7 @@
                     :step="0.05"
                     :controls="false"
                     size="small"
-                    @input="editor.toggleColor"
+                    @input="editor.setPpSaturation"
                   />
                 </div>
               </div>
@@ -561,7 +567,7 @@
               <div class="sp-field">
                 <label>环境旋转（°）</label>
                 <div class="sp-slider-row">
-                  <el-slider v-model="editor.envRotation" :min="0" :max="360" :step="0.05" size="small" @input="editor.applyEnv" />
+                  <el-slider v-model="editor.envRotation" :min="0" :max="360" :step="0.05" size="small" @input="editor.setEnvRotation" />
                   <el-input-number
                     v-model="editor.envRotation"
                     :min="0"
@@ -569,14 +575,14 @@
                     :step="0.05"
                     :controls="false"
                     size="small"
-                    @input="editor.applyEnv"
+                    @input="editor.setEnvRotation"
                   />
                 </div>
               </div>
               <div class="sp-field">
                 <label>环境贴图强度</label>
                 <div class="sp-slider-row">
-                  <el-slider v-model="editor.envIntensityVal" :min="0" :max="5" :step="0.05" size="small" @input="editor.applyEnv" />
+                  <el-slider v-model="editor.envIntensityVal" :min="0" :max="5" :step="0.05" size="small" @input="editor.setEnvIntensityVal" />
                   <el-input-number
                     v-model="editor.envIntensityVal"
                     :min="0"
@@ -584,13 +590,15 @@
                     :step="0.05"
                     :controls="false"
                     size="small"
-                    @input="editor.applyEnv"
+                    @input="editor.setEnvIntensityVal"
                   />
                 </div>
               </div>
               <div class="sp-field">
-                <label>模型反射强度</label>
-                <p class="sp-hint">1 = 保持模型原始材质；大于 1 仅增强环境反射，不改贴图</p>
+                <label>模型镜面反射</label>
+                <p class="sp-hint">
+                  1 = 原始；约 2～3 玻璃镜面感（压粗糙度 + 反射增强）
+                </p>
                 <div class="sp-slider-row">
                   <el-slider
                     v-model="editor.envReflectionIntensity"
@@ -598,7 +606,7 @@
                     :max="5"
                     :step="0.05"
                     size="small"
-                    @input="editor.applyEnv"
+                    @input="editor.setEnvReflectionIntensity"
                   />
                   <el-input-number
                     v-model="editor.envReflectionIntensity"
@@ -607,7 +615,7 @@
                     :step="0.05"
                     :controls="false"
                     size="small"
-                    @input="editor.applyEnv"
+                    @input="editor.setEnvReflectionIntensity"
                   />
                 </div>
               </div>
@@ -625,7 +633,7 @@
               <div class="sp-field">
                 <label>近距</label>
                 <div class="sp-slider-row">
-                  <el-slider v-model="editor.fogNear" :min="0" :max="80" :step="0.05" size="small" @input="editor.applyFog" />
+                  <el-slider v-model="editor.fogNear" :min="0" :max="80" :step="0.05" size="small" @input="numApply('fogNear', editor.applyFog)" />
                   <el-input-number
                     v-model="editor.fogNear"
                     :min="0"
@@ -633,14 +641,14 @@
                     :step="0.05"
                     :controls="false"
                     size="small"
-                    @input="editor.applyFog"
+                    @input="numApply('fogNear', editor.applyFog)"
                   />
                 </div>
               </div>
               <div class="sp-field">
                 <label>远距</label>
                 <div class="sp-slider-row">
-                  <el-slider v-model="editor.fogFar" :min="1" :max="120" :step="0.05" size="small" @input="editor.applyFog" />
+                  <el-slider v-model="editor.fogFar" :min="1" :max="120" :step="0.05" size="small" @input="numApply('fogFar', editor.applyFog)" />
                   <el-input-number
                     v-model="editor.fogFar"
                     :min="1"
@@ -648,7 +656,7 @@
                     :step="0.05"
                     :controls="false"
                     size="small"
-                    @input="editor.applyFog"
+                    @input="numApply('fogFar', editor.applyFog)"
                   />
                 </div>
               </div>
@@ -662,7 +670,7 @@
               <div class="sp-field">
                 <label>强度</label>
                 <div class="sp-slider-row">
-                  <el-slider v-model="editor.shadowIntensity" :min="0" :max="3" :step="0.05" size="small" @input="editor.applyShadow" />
+                  <el-slider v-model="editor.shadowIntensity" :min="0" :max="3" :step="0.05" size="small" @input="numApply('shadowIntensity', editor.applyShadowIntensity)" />
                   <el-input-number
                     v-model="editor.shadowIntensity"
                     :min="0"
@@ -670,7 +678,7 @@
                     :step="0.05"
                     :controls="false"
                     size="small"
-                    @input="editor.applyShadow"
+                    @input="numApply('shadowIntensity', editor.applyShadowIntensity)"
                   />
                 </div>
               </div>
@@ -707,7 +715,7 @@
                     :max="200"
                     :step="0.05"
                     size="small"
-                    @input="editor.applyGrid"
+                    @input="numApply('gridSize', editor.applyGrid)"
                   />
                 </div>
                 <div class="sp-field">
@@ -718,14 +726,14 @@
                     :max="100"
                     :step="0.05"
                     size="small"
-                    @input="editor.applyGrid"
+                    @input="numApply('gridDivisions', editor.applyGrid)"
                   />
                 </div>
               </div>
               <div class="sp-field">
                 <label>高度</label>
                 <div class="sp-slider-row">
-                  <el-slider v-model="editor.gridHeight" :min="-5" :max="5" :step="0.05" size="small" @input="editor.applyGrid" />
+                  <el-slider v-model="editor.gridHeight" :min="-5" :max="5" :step="0.05" size="small" @input="numApply('gridHeight', editor.applyGrid)" />
                   <el-input-number
                     v-model="editor.gridHeight"
                     :min="-5"
@@ -733,7 +741,7 @@
                     :step="0.05"
                     :controls="false"
                     size="small"
-                    @input="editor.applyGrid"
+                    @input="numApply('gridHeight', editor.applyGrid)"
                     @change="onGridHeightChange"
                     @blur="onGridHeightBlur"
                   />
@@ -753,7 +761,7 @@
 </template>
 
 <script setup lang="ts" name="editor-scene-panel">
-import { computed, ref } from "vue";
+import { computed, isRef, ref } from "vue";
 
 import { ANTIALIAS_RATIO_PRESETS } from "@/composables/movie-editor/constants";
 import { useMovieEditorContext } from "@/composables/useMovieEditorContext";
@@ -784,6 +792,28 @@ const antialiasingModeHint = computed(
   () => editor.ANTIALIASING_MODE_OPTIONS.find(o => o.value === editor.antialiasingMode)?.hint ?? ""
 );
 
+/**
+ * el-input-number 输入过程中只 emit input、尚未写回 v-model；
+ * 必须先把事件值写入，再调用 apply，否则会用旧值（滑块正常、手动输入无效）。
+ */
+function numApply(key: string, apply: () => void) {
+  return (val?: number | null) => {
+    if (typeof val === "number" && Number.isFinite(val)) {
+      const slot = (editor as Record<string, unknown>)[key];
+      if (isRef(slot)) (slot as { value: number }).value = val;
+      else (editor as Record<string, unknown>)[key] = val;
+    }
+    apply();
+  };
+}
+
+function lightNumApply(assign: (n: number) => void) {
+  return (val?: number | null) => {
+    if (typeof val === "number" && Number.isFinite(val)) assign(val);
+    editor.applySceneLights();
+  };
+}
+
 function setAntialiasRatio(value: number) {
   editor.maxPixelRatio = value;
   editor.applyAntialiasing();
@@ -792,7 +822,8 @@ function setAntialiasRatio(value: number) {
 function onGridHeightChange(value: number | string | undefined) {
   const num = Number(value);
   if (Number.isFinite(num)) {
-    editor.gridHeight = num;
+    if (isRef(editor.gridHeight)) (editor.gridHeight as { value: number }).value = num;
+    else editor.gridHeight = num;
   }
   editor.applyGrid();
 }
@@ -852,6 +883,24 @@ async function onEnvFileChange(e: Event) {
   &--inline {
     margin: -4px 0 8px;
     line-height: 1.45;
+  }
+}
+
+.sp-mat-target-name {
+  margin: 0 0 6px;
+  padding: 6px 8px;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.4;
+  color: rgb(220 230 240 / 92%);
+  word-break: break-all;
+  background: rgb(255 255 255 / 6%);
+  border: 1px solid rgb(255 255 255 / 10%);
+  border-radius: 6px;
+
+  .sp-mat-target-type {
+    font-weight: 400;
+    color: var(--text-color-3);
   }
 }
 

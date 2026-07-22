@@ -15,7 +15,7 @@
     <div class="video-pip" :class="{ 'is-loading': videoLoading }" :style="videoPipBoxStyle">
       <video
         :ref="editor.bindRef('videoEl')"
-        :muted="false"
+        :muted="editor.viewOnly || editor.isPreviewMode"
         preload="metadata"
         playsinline
         @loadstart="onVideoLoadStart"
@@ -27,6 +27,7 @@
         @waiting="onVideoWaiting"
         @playing="onVideoLoaded"
         @pause="editor.onVideoPause"
+        @seeked="editor.onVideoSeeked"
         @ended="editor.onVideoEnd"
         @error="onVideoLoadError"
       />
@@ -45,7 +46,7 @@
         <el-icon class="is-loading video-pip-loading__icon"><Loading /></el-icon>
       </div>
       <button
-        v-if="!editor.viewOnly"
+        v-if="!editor.viewOnly && !editor.isPreviewMode"
         class="video-pip-del"
         type="button"
         @mousedown.stop
@@ -55,7 +56,7 @@
         ✕
       </button>
     </div>
-    <div v-if="!editor.viewOnly" class="video-info-bar">
+    <div v-if="!editor.viewOnly && !editor.isPreviewMode" class="video-info-bar">
       <span class="vi-item">
         <span class="vi-label">{{ $t("OpWeb.Editor.Duration", "时长") }}</span>
         <span class="vi-value">{{ editor.fmt(editor.duration) }}</span>
@@ -69,7 +70,12 @@
         <span class="vi-value">{{ editor.videoFps }}fps</span>
       </span>
     </div>
-    <div v-if="!editor.viewOnly" class="pip-resize-handle" title="缩放" @mousedown.stop="onPipResizeStart" />
+    <div
+      v-if="!editor.viewOnly && !editor.isPreviewMode"
+      class="pip-resize-handle"
+      title="缩放"
+      @mousedown.stop="onPipResizeStart"
+    />
   </div>
 </template>
 
@@ -95,6 +101,8 @@ const { pipGroupRef, pipStyle, pipDragging, pipResizing, placePipToRight, onPipD
   getVideoDisplayTop: () => editor.activeVideoNode?.videoDisplayTop,
   getVideoDisplayXRatio: () => editor.activeVideoNode?.videoDisplayXRatio,
   getVideoDisplayYRatio: () => editor.activeVideoNode?.videoDisplayYRatio,
+  getVideoDisplayViewportWidth: () => editor.activeVideoNode?.videoDisplayViewportWidth,
+  getVideoDisplayViewportHeight: () => editor.activeVideoNode?.videoDisplayViewportHeight,
   setVideoDisplayWidth: width => {
     if (editor.activeVideoNode) editor.activeVideoNode.videoDisplayWidth = width;
   },
@@ -110,13 +118,17 @@ const { pipGroupRef, pipStyle, pipDragging, pipResizing, placePipToRight, onPipD
     if (!editor.activeVideoNode) return;
     editor.activeVideoNode.videoDisplayXRatio = xRatio;
     editor.activeVideoNode.videoDisplayYRatio = yRatio;
+  },
+  setVideoDisplayViewportSize: (width, height) => {
+    if (!editor.activeVideoNode) return;
+    editor.activeVideoNode.videoDisplayViewportWidth = width;
+    editor.activeVideoNode.videoDisplayViewportHeight = height;
   }
 });
 
 const videoLoading = ref(false);
 const isMobile = ref(false);
 let loadingTimer: ReturnType<typeof setTimeout> | null = null;
-let pipApplyTimer: ReturnType<typeof setTimeout> | null = null;
 
 function clearLoadingTimer() {
   if (loadingTimer) {
@@ -125,19 +137,12 @@ function clearLoadingTimer() {
   }
 }
 
-function clearPipApplyTimer() {
-  if (pipApplyTimer) {
-    clearTimeout(pipApplyTimer);
-    pipApplyTimer = null;
-  }
-}
-
 function applyStoredPipLayout() {
+  // 立即按已存位置落位，避免先闪默认位再跳到正确位
+  placePipToRight(true, true);
   nextTick(() => {
     placePipToRight(true, true);
     requestAnimationFrame(() => placePipToRight(true, true));
-    clearPipApplyTimer();
-    pipApplyTimer = setTimeout(() => placePipToRight(true, true), 120);
   });
 }
 
@@ -175,10 +180,17 @@ function startLoadingIndicator() {
 }
 
 function onVideoLoadStart() {
+  // 展示/预览：只有 syncVideoElementSrc 真正换源时才出加载遮罩（避免切章/seek 被当成刷新）。
+  if (editor.viewOnly || editor.isPreviewMode) {
+    const video = editor.videoEl;
+    if (!video || video.dataset.editorReloading !== "1") return;
+  }
   startLoadingIndicator();
 }
 
 function onVideoLoaded() {
+  const video = editor.videoEl;
+  if (video) delete video.dataset.editorReloading;
   clearLoadingTimer();
   videoLoading.value = false;
 }
@@ -198,7 +210,9 @@ function onVideoLoadError() {
 }
 
 function onVideoWaiting() {
-  if (!editor.isPlaying && !editor.viewOnly && !editor.isPreviewMode) return;
+  // 展示页切章/拖进度条会频繁 waiting：遮罩会被当成「视频又刷新了」
+  if (editor.viewOnly || editor.isPreviewMode) return;
+  if (!editor.isPlaying) return;
   startLoadingIndicator();
 }
 
@@ -229,7 +243,6 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   clearLoadingTimer();
-  clearPipApplyTimer();
 });
 
 watch(
@@ -258,8 +271,13 @@ watch(
 
 watch(
   () => editor.activeVideoId,
-  () => {
-    if (!editor.showVideoPip) return;
+  (id, prev) => {
+    if (!editor.showVideoPip || !id || id === prev) return;
+    // 仅视频节点真正切换时重排 PiP；同源切章不要挪窗口（看起来像刷新）。
+    const video = editor.videoEl;
+    if (video?.dataset.editorSrcKey && video.getAttribute("src") && !video.error) {
+      return;
+    }
     applyStoredPipLayout();
   }
 );
@@ -268,6 +286,14 @@ watch(
   () => editor.showVideoPip,
   visible => {
     if (!visible) return;
+    applyStoredPipLayout();
+  }
+);
+
+watch(
+  () => editor.isPreviewMode,
+  () => {
+    if (!editor.showVideoPip || !editor.hasVideo) return;
     applyStoredPipLayout();
   }
 );

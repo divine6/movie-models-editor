@@ -5,6 +5,8 @@
 **/.gitignore
 **/dist
 **/dist-*
+!movie-models-editor/dist-tenant
+!movie-models-editor/dist-tenant/**
 **/*.log
 **/.DS_Store
 **/.vscode

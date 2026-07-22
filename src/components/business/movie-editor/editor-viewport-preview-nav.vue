@@ -1,11 +1,13 @@
 <template>
-  <div class="viewport-preview-nav" @click.stop @pointerdown.stop>
+  <div class="viewport-preview-nav">
     <button
       class="viewport-preview-nav-btn viewport-preview-nav-btn--prev"
       type="button"
       title="上一章"
-      :disabled="!canPrev"
-      @click.stop="onPrev"
+      :class="{ 'is-disabled': !canPrev }"
+      :aria-disabled="!canPrev"
+      @pointerdown.capture="onPrevPointerDown"
+      @click.capture="onPrevClick"
     >
       <svg
         class="viewport-preview-nav-btn__icon"
@@ -26,8 +28,10 @@
       class="viewport-preview-nav-btn viewport-preview-nav-btn--next"
       type="button"
       title="下一章"
-      :disabled="!canNext"
-      @click.stop="onNext"
+      :class="{ 'is-disabled': !canNext }"
+      :aria-disabled="!canNext"
+      @pointerdown.capture="onNextPointerDown"
+      @click.capture="onNextClick"
     >
       <svg
         class="viewport-preview-nav-btn__icon"
@@ -61,6 +65,9 @@ const canPrev = computed(() => {
   void editor.presentationUiChapterId;
   void editor.presentationNavIndex;
   void editor.presentationTimelineChapterIdx;
+  void editor.presentationPlaybackSession?.navChapterId;
+  void editor.presentationPlaybackSession?.requestId;
+  void editor.presentationDisplayTime;
   return editor.canPresentationPrevChapter();
 });
 
@@ -71,16 +78,56 @@ const canNext = computed(() => {
   void editor.presentationUiChapterId;
   void editor.presentationNavIndex;
   void editor.presentationTimelineChapterIdx;
+  void editor.presentationPlaybackSession?.navChapterId;
+  void editor.presentationPlaybackSession?.requestId;
+  void editor.presentationDisplayTime;
   return editor.canPresentationNextChapter();
 });
 
-function onPrev() {
-  if (!canPrev.value) return;
-  editor.prevCh();
+let lastNavAt = 0;
+/** 触控已在 pointerdown 处理时，吞掉后续合成 click，防止连跳 */
+let ignoreClickUntil = 0;
+
+function fireNav(direction: "prev" | "next") {
+  const allowed = direction === "prev" ? canPrev.value : canNext.value;
+  if (!allowed) return;
+  const now = performance.now();
+  if (now - lastNavAt < 160) return;
+  lastNavAt = now;
+  if (direction === "prev") editor.prevCh();
+  else editor.nextCh();
 }
 
-function onNext() {
-  if (!canNext.value) return;
-  editor.nextCh();
+function onPrevPointerDown(e: PointerEvent) {
+  if (e.button !== 0 && e.pointerType === "mouse") return;
+  // 手机/触控：在 pointerdown 立即导航（不要先设 ignore 再调会自检 ignore 的函数）
+  if (e.pointerType === "mouse") return;
+  e.preventDefault();
+  e.stopPropagation();
+  ignoreClickUntil = performance.now() + 500;
+  fireNav("prev");
+}
+
+function onNextPointerDown(e: PointerEvent) {
+  if (e.button !== 0 && e.pointerType === "mouse") return;
+  if (e.pointerType === "mouse") return;
+  e.preventDefault();
+  e.stopPropagation();
+  ignoreClickUntil = performance.now() + 500;
+  fireNav("next");
+}
+
+function onPrevClick(e: MouseEvent) {
+  e.preventDefault();
+  e.stopPropagation();
+  if (performance.now() < ignoreClickUntil) return;
+  fireNav("prev");
+}
+
+function onNextClick(e: MouseEvent) {
+  e.preventDefault();
+  e.stopPropagation();
+  if (performance.now() < ignoreClickUntil) return;
+  fireNav("next");
 }
 </script>

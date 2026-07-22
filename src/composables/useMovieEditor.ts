@@ -48,6 +48,8 @@ import {
   ANTIALIASING_MODE_OPTIONS,
   CHAPTER_END_EPS,
   CHAPTER_TIME_EPS,
+  DEFAULT_ANIMATION_NODE_DURATION,
+  MIN_ANIMATION_NODE_DURATION,
   CHAPTER_CAMERA_SWITCH_EDIT_SEC,
   CHAPTER_CAMERA_SWITCH_MAX_SEC,
   CHAPTER_CAMERA_SWITCH_MIN_SEC,
@@ -89,7 +91,7 @@ import { createTimelineHelpers } from "@/composables/movie-editor/utils/timeline
 import { exportPlayer } from "@/composables/usePlayerExport";
 import { resumeProjectPersist, suspendProjectPersist } from "@/utils/projectPersist";
 import { createSceneNodeEditorApi } from "@/composables/movie-editor/sceneNodeEditorApi";
-import { getDescendantChapterIds, resolveActiveChapterAtTime } from "@/utils/chapterTree";
+import { getDescendantChapterIds } from "@/utils/chapterTree";
 import { ensureProjectNodes, SCHEMA_VERSION } from "@/utils/sceneMigration";
 import {
   flattenSceneNodeTree,
@@ -109,6 +111,7 @@ import { isCoarsePointerDevice, withVideoPosterFragment } from "@/utils/device";
 import {
   type Chapter,
   type Model,
+  type ModelType,
   type SceneNode,
   type SceneVideoNode,
   type ModelConfig,
@@ -149,7 +152,8 @@ import { createViewportEnvironment, disposeViewportEnvironment } from "@/utils/t
 import { createEnvReflectionProbe, type EnvReflectionProbe } from "@/utils/three/envReflectionProbe";
 import { applyMeshTextureQuality, resolvePresentationPixelRatio } from "@/utils/three/presentationQuality";
 import {
-  applyGltfEnvMapIntensity,
+  applyGltfSpecularGlassReflection,
+  clearBoundSceneEnvMaps,
   prepareGltfMaterials,
   updateGltfMaterialBaseOverrides
 } from "@/utils/three/gltfMaterials";
@@ -171,6 +175,28 @@ export function useMovieEditor() {
   const currentTime = ref(0);
   const duration = ref(0);
   const isPlaying = ref(false);
+  type PresentationPlaybackPhase = "paused" | "playing" | "seeking" | "ended" | "blocked";
+  type PresentationPlaybackIntent = "play" | "pause";
+  type PresentationPlaybackSession = {
+    phase: PresentationPlaybackPhase;
+    intent: PresentationPlaybackIntent;
+    committedTime: number;
+    targetTime: number;
+    navChapterId: string | null;
+    playableChapterId: string | null;
+    requestId: number;
+    autoAdvance: boolean;
+  };
+  const presentationPlaybackSession = reactive<PresentationPlaybackSession>({
+    phase: "paused",
+    intent: "pause",
+    committedTime: 0,
+    targetTime: 0,
+    navChapterId: null,
+    playableChapterId: null,
+    requestId: 0,
+    autoAdvance: false
+  });
   const isLooping = ref(true);
   const playbackRate = ref<number>(1);
   const playingIdx = ref(-1);
@@ -180,6 +206,7 @@ export function useMovieEditor() {
   const expandedNodeIds = ref<Set<string>>(new Set());
   const sceneNodeDraggingId = ref<string | null>(null);
   const sceneNodeDropTargetId = ref<string | null>(null);
+  const sceneNodeDropKind = ref<"allow" | "forbid" | null>(null);
   const videoNodeUploadTargetId = ref<string | null>(null);
   const videoOnlyMode = ref(false);
   const selModelId = ref<string | null>(null);
@@ -218,9 +245,27 @@ export function useMovieEditor() {
   const sceneSavedAt = ref("");
   const savingScene = ref(false);
   const sceneListVersion = ref(0);
+  /** 当前模型集下已保存场景数量（编辑列表≥1 才可打开） */
+  const savedSceneCount = ref(0);
   const sceneSavedSignature = ref("");
   const editSceneCompanyName = ref("");
   const editSceneToolName = ref("");
+
+  async function refreshSavedSceneCount() {
+    const code = modelSetCode.value;
+    if (!code) {
+      savedSceneCount.value = 0;
+      return;
+    }
+    try {
+      const list = await fetchSceneList(code);
+      savedSceneCount.value = Array.isArray(list) ? list.length : 0;
+    } catch {
+      savedSceneCount.value = 0;
+    }
+  }
+
+  const canOpenSceneList = computed(() => !!modelSetCode.value && savedSceneCount.value >= 1);
 
   // Forms
   const chForm = reactive({ name: "", startTime: 0, endTime: 0 });
@@ -261,6 +306,9 @@ export function useMovieEditor() {
   let chAnimChapterId: string | null = null;
   let editPlaybackSyncChapterId: string | null = null;
   let editPlaybackSyncElapsed = -1;
+  let lastVideoPlaybackSyncTime = -1;
+  /** 编辑态播放中已运镜的章节，避免 timeupdate 重复触发镜头 */
+  let editPlaybackCameraChapterId: string | null = null;
   let chAnimWallclock = false;
   let chAnimWallclockStart = 0;
   let chAnimWallclockMaxDur = 0;
@@ -274,11 +322,15 @@ export function useMovieEditor() {
   const presentationUiChapterId = ref<string | null>(null);
   /** 展示/预览：导航列表中的当前索引（暂停/章节边界时与视频时间解耦） */
   const presentationNavIndex = ref(-1);
+  /** 展示/预览：列表高亮修订号，强制树节点重算 active */
+  const presentationUiRevision = ref(0);
   const chapterAutoNext = ref(false);
   /** 展示/预览模式章节衔接中：避免 pause 回调误停动画 */
   let presentationChapterTransition = false;
   /** 展示态跳转后应当继续播放：忽略 seek 引起的 pause，并强制续播 */
   let presentationExpectPlaying = false;
+  /** 用户显式暂停：忽略 seek/ended 触发的误 play */
+  let presentationUserWantsPaused = false;
   let presentationResumeTimer: ReturnType<typeof setTimeout> | null = null;
   const chapterNavLock = ref(false);
   const isCameraTransitioning = ref(false);
@@ -289,9 +341,14 @@ export function useMovieEditor() {
   let chapterNavFollowUpRaf = 0;
   let chapterPlaybackRequestSeq = 0;
   let presentationChapterCooldownUntil = 0;
+  /** 用户手动 seek/左右键后短时间内钉住列表高亮（与自动切段 cooldown 分离） */
+  let presentationManualNavUntil = 0;
+  /** 展示态 seek 目标：媒体未落点前禁止用 video.currentTime 回刷进度/动画 */
+  let presentationSeekTargetTime: number | null = null;
   let lastPresentationAutoSwitchChapterId: string | null = null;
   let lastPresentationPlaybackChapterId: string | null = null;
-  let presentationProgressResumeAt = 0;
+  /** 片尾 UI 已同步过一次，避免每帧 resolve */
+  let presentationEndedUiSynced = false;
   let segmentPlaybackRafId: number | null = null;
   let segmentPlaybackGeneration = 0;
   let activeSegmentPlaybackSeg: any = null;
@@ -300,7 +357,7 @@ export function useMovieEditor() {
   const totalPlaying = ref(false);
   const totalProgress = ref(0);
   const animDirty = ref(false);
-  /** live animSegments 归属的 modelId::nodeId，防止切换选中时误把旧段落到新目标上 */
+  /** live animSegments 归属的 chapterId|modelId::nodeId，防止切动画时误把旧段落写入其它节点 */
   let animSegmentsOwnerKey: string | null = null;
 
   type SelectionEditDraft = {
@@ -479,12 +536,38 @@ export function useMovieEditor() {
   const presentationNavChapters = computed(() => getPresentationNavChapters());
   const presentationTimelineChapterIdx = computed(() => {
     if (!viewOnly.value && !isPreviewMode.value) return currentChapterIdx.value;
+    const navIdx = getActivePresentationNavIndex();
+    if (navIdx >= 0) return navIdx;
     const activeId = getActiveChapterIdForUi();
     if (!activeId) return currentChapterIdx.value;
     const ch = chapters.value.find(c => c.id === activeId);
     if (!ch) return currentChapterIdx.value;
     return getTimelineChapterIndex(ch);
   });
+  const presentationDisplayTime = computed(() =>
+    presentationPlaybackSession.phase === "seeking"
+      ? presentationPlaybackSession.targetTime
+      : presentationPlaybackSession.committedTime
+  );
+  const presentationCurrentNavChapterId = computed(
+    () => presentationPlaybackSession.navChapterId
+  );
+  const presentationDisplayPlaying = computed(
+    () =>
+      presentationPlaybackSession.intent === "play" &&
+      (presentationPlaybackSession.phase === "playing" ||
+        presentationPlaybackSession.phase === "seeking")
+  );
+  watch(presentationDisplayTime, value => {
+    if (viewOnly.value || isPreviewMode.value) currentTime.value = value;
+  });
+  watch(presentationDisplayPlaying, value => {
+    if (viewOnly.value || isPreviewMode.value) isPlaying.value = value;
+  });
+  /** 展示态意外暂停后的续播节流，避免 RAF/pause 回调打爆 play() */
+  let presentationBlockedResumeAt = 0;
+  /** 片尾循环命令节流，避免 seeking 卡住时既不重发也不前进 */
+  let presentationLoopCommandAt = 0;
   const playbackRateLabel = computed(() => {
     const rate = playbackRate.value;
     return Number.isInteger(rate) ? `${rate}x` : `${rate}x`;
@@ -503,6 +586,11 @@ export function useMovieEditor() {
   const canSaveScene = computed(
     () => hasVideo.value && chapters.value.length > 0 && sceneHasUnsavedChanges.value && !savingScene.value
   );
+
+  /** 将当前草稿记为「已对齐已保存」，用于加载/刷新后消除误报红点 */
+  function markSceneAsSavedBaseline() {
+    sceneSavedSignature.value = buildSceneDraftSignature();
+  }
   const models = computed(() => currProj.value?.models || []);
   const subtitles = computed(() => currProj.value?.subtitles || []);
   const selectedChapter = computed(() => chapters.value.find(c => c.id === selectedChapterId.value));
@@ -589,6 +677,8 @@ export function useMovieEditor() {
   ).normalize();
   let viewCameraBaseFov: number | null = null;
   let viewportPickState: { x: number; y: number; time: number } | null = null;
+  /** 展示页触控双击：与桌面 dblclick 分工，避免单击误切播放 */
+  let presentationTapGesture: { x: number; y: number; time: number } | null = null;
   let onCanvasPointerDown: ((e: PointerEvent) => void) | null = null;
   let onCanvasPointerUp: ((e: PointerEvent) => void) | null = null;
   let onCanvasPointerMove: ((e: PointerEvent) => void) | null = null;
@@ -629,13 +719,51 @@ export function useMovieEditor() {
     camera = new THREE.PerspectiveCamera(50, w / Math.max(h, 1), 0.1, 200);
     camera.position.set(...DEFAULT_CAMERA.position);
 
-    renderer = new THREE.WebGLRenderer({
-      canvas: canvasEl.value,
-      antialias: true,
-      powerPreference: "high-performance",
-      alpha: false,
-      depth: true
-    });
+    // 热更新/重复初始化前先释放旧上下文，避免浏览器触发 “context loss blocked”
+    if (renderer) {
+      try {
+        composer?.dispose?.();
+      } catch {
+        /* ignore */
+      }
+      composer = undefined;
+      try {
+        renderer.forceContextLoss?.();
+      } catch {
+        /* ignore */
+      }
+      try {
+        renderer.dispose();
+      } catch {
+        /* ignore */
+      }
+      renderer = undefined as unknown as THREE.WebGLRenderer;
+    }
+
+    const coarse = isCoarsePointerDevice();
+    const makeRenderer = (antialias: boolean) =>
+      new THREE.WebGLRenderer({
+        canvas: canvasEl.value!,
+        antialias,
+        // 手机用 default，high-performance 在部分机型更容易触发 context loss
+        powerPreference: coarse ? "default" : "high-performance",
+        alpha: false,
+        depth: true,
+        failIfMajorPerformanceCaveat: false
+      });
+
+    try {
+      renderer = makeRenderer(true);
+    } catch (e) {
+      console.warn("[movie-editor] WebGL antialias init failed, retry without antialias", e);
+      try {
+        renderer = makeRenderer(false);
+      } catch (e2) {
+        console.error("[movie-editor] WebGL context create failed", e2);
+        toastShow("3D 渲染初始化失败，请关闭其它 3D 页面后刷新", "error");
+        throw e2;
+      }
+    }
     renderer.setPixelRatio(getRenderPixelRatio());
     renderer.setSize(w, h);
     renderer.shadowMap.enabled = false;
@@ -650,7 +778,7 @@ export function useMovieEditor() {
     controls.enableDamping = true;
     controls.dampingFactor = 0.08;
     controls.enablePan = false;
-    controls.minDistance = 2;
+    controls.minDistance = 0.5;
     controls.maxDistance = 30;
     controls.maxPolarAngle = Math.PI / 2;
     bindControlsInteraction();
@@ -756,8 +884,24 @@ export function useMovieEditor() {
       viewportPickState = null;
 
       if (isPresentationInteraction()) {
-        if (!wasDrag && isPreviewMode.value && !viewOnly.value && !isCoarsePointerDevice()) {
-          tryTogglePlayOnPreviewTap(e.clientX, e.clientY);
+        // 播放/暂停只允许：进度条按钮，或双击/双触屏幕。单击、左右键、列表不得切换。
+        if (
+          !wasDrag &&
+          e.pointerType !== "mouse" &&
+          (viewOnly.value || isPreviewMode.value)
+        ) {
+          const now = performance.now();
+          const prev = presentationTapGesture;
+          const nearPrev =
+            !!prev &&
+            Math.hypot(e.clientX - prev.x, e.clientY - prev.y) < 48 &&
+            now - prev.time < 360;
+          if (nearPrev) {
+            presentationTapGesture = null;
+            togglePlay();
+          } else {
+            presentationTapGesture = { x: e.clientX, y: e.clientY, time: now };
+          }
         }
         return;
       }
@@ -1059,7 +1203,11 @@ export function useMovieEditor() {
       extent = Math.max(_focusSize.x, _focusSize.y, _focusSize.z, 1);
     }
 
-    const minOrbit = Math.max(extent * 0.55, 1.5);
+    // 编辑态：滚轮可推进到距模型约 0.5m；展示态仍保留更保守的下限以免穿模。
+    const minOrbit =
+      viewOnly.value || isPreviewMode.value
+        ? Math.max(extent * 0.55, 1.5)
+        : 0.5;
     let maxOrbit = Math.max(extent * 4.2, 14);
     if (viewOnly.value || isPreviewMode.value) {
       if (shouldUsePresentationSafeFitCamera()) {
@@ -1333,11 +1481,122 @@ export function useMovieEditor() {
 
   function applySceneLights() {
     syncSceneLights();
+    // 拖动灯光滑块：同步灯光；applyShadow 仅在贴图结构变化时重建，避免闪屏
     applyShadow();
+  }
+
+  function applyShadowGroundOpacity() {
+    if (groundMesh?.material && "opacity" in groundMesh.material) {
+      (groundMesh.material as THREE.ShadowMaterial).opacity = shadowIntensity.value * 0.5;
+    }
+  }
+
+  let lastShadowRebuildKey = "";
+
+  function applyShadow() {
+    if (!renderer || !scene) return;
+    const rebuildKey = [
+      shadowEnabled.value ? 1 : 0,
+      shadowMapSize.value,
+      shadowType.value,
+      shadowBias.value,
+      shadowNormalBias.value,
+      [...sceneLights.value]
+        .map(l => `${l.id}:${l.castShadow ? 1 : 0}:${l.type}`)
+        .sort()
+        .join("|")
+    ].join(";");
+    const needsRebuild = rebuildKey !== lastShadowRebuildKey;
+    lastShadowRebuildKey = rebuildKey;
+
+    renderer.shadowMap.enabled = shadowEnabled.value;
+    if (needsRebuild) {
+      switch (shadowType.value) {
+        case "basic":
+          renderer.shadowMap.type = THREE.BasicShadowMap;
+          break;
+        case "vsm":
+          renderer.shadowMap.type = THREE.VSMShadowMap;
+          break;
+        case "pcf":
+          renderer.shadowMap.type = THREE.PCFShadowMap;
+          break;
+        default:
+          renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+      }
+    }
+
+    let shadowCaster: THREE.DirectionalLight | null = null;
+    for (const runtime of sceneLightRuntimes.values()) {
+      const light = runtime.light;
+      light.castShadow = false;
+      if (
+        shadowEnabled.value &&
+        runtime.config.castShadow &&
+        light instanceof THREE.DirectionalLight &&
+        !shadowCaster
+      ) {
+        shadowCaster = light;
+        light.castShadow = true;
+        if (needsRebuild) {
+          light.shadow.mapSize.set(shadowMapSize.value, shadowMapSize.value);
+          light.shadow.bias = shadowBias.value;
+          light.shadow.normalBias = shadowNormalBias.value;
+          light.shadow.camera.near = 0.5;
+          light.shadow.camera.far = 60;
+          light.shadow.camera.left = -15;
+          light.shadow.camera.right = 15;
+          light.shadow.camera.top = 15;
+          light.shadow.camera.bottom = -15;
+          light.shadow.camera.updateProjectionMatrix();
+          // 仅在贴图尺寸/类型等真正变化时丢弃旧 shadow map
+          if (light.shadow.map) {
+            light.shadow.map.dispose();
+            light.shadow.map = null;
+          }
+        }
+      }
+    }
+
+    if (shadowEnabled.value) {
+      if (!groundMesh || !groundMesh.parent) {
+        const geo = new THREE.PlaneGeometry(40, 40);
+        const mat = new THREE.ShadowMaterial({ transparent: true });
+        groundMesh = new THREE.Mesh(geo, mat);
+        groundMesh.rotation.x = -Math.PI / 2;
+        groundMesh.position.y = 0;
+        groundMesh.receiveShadow = true;
+        scene.add(groundMesh);
+      }
+      applyShadowGroundOpacity();
+    } else if (groundMesh && groundMesh.parent) {
+      scene.remove(groundMesh);
+    }
+
+    if (needsRebuild) {
+      meshes.forEach(m => {
+        m.traverse(child => {
+          const mesh = child as THREE.Mesh;
+          if (mesh.isMesh) {
+            mesh.castShadow = shadowEnabled.value;
+            mesh.receiveShadow = shadowEnabled.value;
+          }
+        });
+      });
+    }
+
+    scheduleSaveSettings();
+  }
+
+  /** 阴影强度滑块：只改地面阴影透明度，避免每帧重建 shadow map 闪屏 */
+  function applyShadowIntensity() {
+    applyShadowGroundOpacity();
     scheduleSaveSettings();
   }
 
   function disposeEnvTextures() {
+    meshes.forEach(root => clearBoundSceneEnvMaps(root));
+    if (envReflectionProbe?.ball) clearBoundSceneEnvMaps(envReflectionProbe.ball);
     if (envMapEquirect) {
       envMapEquirect.dispose();
       envMapEquirect = null;
@@ -1943,6 +2202,8 @@ export function useMovieEditor() {
       target.traverse(child => {
         const mesh = child as THREE.Mesh;
         if (!mesh.isMesh || !mesh.material) return;
+        // GLB 常共享 Material：改色前先克隆，避免改一个部件/模型牵连其它
+        ensureUniqueMeshMaterials(mesh);
         const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
         mats.forEach(applyToMat);
       });
@@ -2027,8 +2288,9 @@ export function useMovieEditor() {
 
     const avgMs = (presentationFrameDts.reduce((a, b) => a + b, 0) / presentationFrameDts.length) * 1000;
     const prev = presentationPerfScale;
-    if (avgMs > 22) presentationPerfScale = Math.max(0.82, presentationPerfScale - 0.03);
-    else if (avgMs < 17) presentationPerfScale = Math.min(1, presentationPerfScale + 0.03);
+    // 掉帧时优先降分辨率（保持 SMAA），比关抗锯齿更划算
+    if (avgMs > 22) presentationPerfScale = Math.max(0.78, presentationPerfScale - 0.04);
+    else if (avgMs < 16.5) presentationPerfScale = Math.min(1, presentationPerfScale + 0.035);
 
     const now = performance.now();
     if (Math.abs(prev - presentationPerfScale) > 0.02 && now - lastPresentationRatioSyncAt > 800) {
@@ -2061,8 +2323,10 @@ export function useMovieEditor() {
         maxPresentationDpr: isCoarsePointerDevice() ? 1.75 : 2,
         enableComposerMsaa: false
       };
+      // 展示页：至少 1.5 档，配合 SMAA；过高会触发手机 context loss
+      const configured = Math.max(maxPixelRatio.value, isCoarsePointerDevice() ? 1.5 : 1.75);
       return resolvePresentationPixelRatio(
-        maxPixelRatio.value,
+        configured,
         w,
         h,
         maxTex,
@@ -2104,9 +2368,13 @@ export function useMovieEditor() {
     if (!composer || isPresentationMode()) return;
     if (camTrans || cameraAnimating || isCameraTransitioning.value) return;
     const pressure = isEditorHeavyMotion() || editorAvgFrameMs > 1000 / 30;
-    const ratio = pressure ? 3 : 2;
-    for (const pass of [outlinePass, hoverOutlinePass, modelConfigOutlinePass]) {
-      if (pass && pass.downSampleRatio !== ratio) pass.downSampleRatio = ratio;
+    // 选中描边始终全分辨率，避免斜视/远近景时出现皱折锯齿；仅悬停与配置高亮在重压时降采样
+    if (outlinePass && outlinePass.downSampleRatio !== 1) {
+      outlinePass.downSampleRatio = 1;
+    }
+    const softRatio = pressure ? 3 : 2;
+    for (const pass of [hoverOutlinePass, modelConfigOutlinePass]) {
+      if (pass && pass.downSampleRatio !== softRatio) pass.downSampleRatio = softRatio;
     }
   }
 
@@ -2123,11 +2391,35 @@ export function useMovieEditor() {
 
     if (outlinePass) outlinePass.enabled = !presentation && hasSelection;
     if (hoverOutlinePass) hoverOutlinePass.enabled = !presentation && hasHover;
-    if (modelConfigOutlinePass) modelConfigOutlinePass.enabled = hasModelCfgOutline;
-    if (bloomPass) bloomPass.enabled = bloomIntensity.value > 0;
-    if (colorPass) colorPass.enabled = true;
-    if (hueSatPass) hueSatPass.enabled = true;
-    if (brightContrastPass) brightContrastPass.enabled = true;
+    if (modelConfigOutlinePass) {
+      modelConfigOutlinePass.enabled = hasModelCfgOutline;
+      if (presentation && hasModelCfgOutline) {
+        modelConfigOutlinePass.downSampleRatio = 1;
+        modelConfigOutlinePass.edgeGlow = 0;
+        modelConfigOutlinePass.edgeThickness = 1.35;
+        modelConfigOutlinePass.edgeStrength = 5.5;
+      }
+    }
+    if (bloomPass) bloomPass.enabled = !presentation && bloomIntensity.value > 0;
+    // 每帧同步色彩校正数值，避免只改了 ref、uniforms 未刷新导致「滑了没效果」
+    if (colorPass) colorPass.enabled = !presentation;
+    if (hueSatPass) {
+      hueSatPass.enabled = !presentation;
+      if (hueSatPass.uniforms?.saturation) {
+        hueSatPass.uniforms.saturation.value = ppSaturation.value;
+      }
+    }
+    if (brightContrastPass) {
+      brightContrastPass.enabled = !presentation;
+      if (brightContrastPass.uniforms?.contrast) {
+        brightContrastPass.uniforms.contrast.value = ppContrast.value;
+      }
+    }
+    // 展示页每帧兜底：SMAA 常开（手机/电脑锯齿主防线，成本远低于高 MSAA）
+    if (presentation) {
+      if (fxaaPass) fxaaPass.enabled = false;
+      if (smaaPass) smaaPass.enabled = true;
+    }
   }
 
   /** 展示模式：SMAA + MSAA 轻量后处理（对齐 Oxide PostProcessing 思路） */
@@ -2159,6 +2451,13 @@ export function useMovieEditor() {
     }
     if (modelConfigOutlinePass) {
       modelConfigOutlinePass.enabled = modelConfigOutlineRegistry.size > 0;
+      // 展示页轮廓必须全分辨率，降采样会让红框锯齿非常明显
+      if (presentation) {
+        modelConfigOutlinePass.downSampleRatio = 1;
+        modelConfigOutlinePass.edgeGlow = 0;
+        modelConfigOutlinePass.edgeThickness = 1.35;
+        modelConfigOutlinePass.edgeStrength = 5.5;
+      }
     }
     if (bloomPass) bloomPass.enabled = !presentation && bloomIntensity.value > 0;
     if (colorPass) colorPass.enabled = !presentation;
@@ -2184,25 +2483,33 @@ export function useMovieEditor() {
     const gpu = isPresentationMode() ? ensurePresentationGpuProfile() : null;
     const presentation = isPresentationMode();
     const editorMotion = !presentation && isEditorHeavyMotion();
+    const coarse = isCoarsePointerDevice();
     const msaaBase = presentation ? gpu?.enableComposerMsaa ?? false : msaaEnabled.value;
-    const msaaAllowed =
-      msaaBase &&
-      gl instanceof WebGL2RenderingContext &&
-      !(presentation && isCoarsePointerDevice() && presentationHeavyMotion) &&
-      !editorMotion;
+
     let samples = 0;
-    if (msaaAllowed) {
-      const tier = gpu?.tier ?? 0;
-      samples = presentation && tier < 2 ? 2 : 4;
+    if (presentation) {
+      // 电脑展示：固定 2x MSAA（不随播放开关，避免 RT 反复重建打爆显存）
+      // 手机展示：0，完全靠 SMAA + DPR（更稳、更省）
+      if (msaaBase && gl instanceof WebGL2RenderingContext && !coarse) {
+        samples = 2;
+      }
+    } else if (msaaBase && gl instanceof WebGL2RenderingContext && !editorMotion) {
+      samples = 4;
     }
-    if (composer.renderTarget1.samples === samples) return;
+
+    // 展示页用 8bit RT：SMAA 更合适，也比 HalfFloat+MSAA 省显存
+    const rtType = presentation ? THREE.UnsignedByteType : THREE.HalfFloatType;
+    const prevRt = composer.renderTarget1;
+    const sameSamples = prevRt?.samples === samples;
+    const sameType = prevRt?.texture?.type === rtType;
+    if (sameSamples && sameType) return;
 
     const ratio = renderer.getPixelRatio();
     const size = renderer.getSize(new THREE.Vector2());
     const pw = Math.max(Math.round(size.width * ratio), 1);
     const ph = Math.max(Math.round(size.height * ratio), 1);
     const rt = new THREE.WebGLRenderTarget(pw, ph, {
-      type: THREE.HalfFloatType,
+      type: rtType,
       samples
     });
     rt.texture.name = "EffectComposer.rt1";
@@ -2223,9 +2530,14 @@ export function useMovieEditor() {
   function syncAntialiasingPasses() {
     const mode = antialiasingMode.value;
     const presentation = isPresentationMode();
-    // 展示直渲走 WebGL MSAA，不再叠 FXAA/SMAA（避免模糊）
-    if (fxaaPass) fxaaPass.enabled = !presentation && mode === "fxaa";
-    if (smaaPass) smaaPass.enabled = !presentation && mode === "smaa";
+    if (presentation) {
+      // 展示页统一走 SMAA（电脑 DPR 高还不明显；手机关了会严重锯齿）
+      if (fxaaPass) fxaaPass.enabled = false;
+      if (smaaPass) smaaPass.enabled = true;
+      return;
+    }
+    if (fxaaPass) fxaaPass.enabled = mode === "fxaa";
+    if (smaaPass) smaaPass.enabled = mode === "smaa";
   }
 
   function syncRendererPresentationState() {
@@ -2269,8 +2581,9 @@ export function useMovieEditor() {
     }
 
     syncRenderPixelRatio();
-    syncPresentationRenderProfile();
+    // 先按编辑器模式同步，再套展示配置（展示必须最后强制开 SMAA）
     syncAntialiasingPasses();
+    syncPresentationRenderProfile();
     if (viewportEl.value) {
       const vw = viewportEl.value.clientWidth;
       const vh = viewportEl.value.clientHeight;
@@ -2305,30 +2618,30 @@ export function useMovieEditor() {
     brightContrastPass = new ShaderPass(BrightnessContrastShader);
     composer.addPass(brightContrastPass);
 
-    // 选中轮廓（蓝色实线）— downSampleRatio 保持 2，过高会导致描边锯齿
+    // 选中轮廓：全分辨率（downSampleRatio=1），降低 glow，减少斜视皱折
     outlinePass = new OutlinePass(size, scene, camera);
-    outlinePass.downSampleRatio = 2;
+    outlinePass.downSampleRatio = 1;
     outlinePass.visibleEdgeColor.set(SELECTION_COLOR);
     outlinePass.hiddenEdgeColor.set(HIDDEN_EDGE_COLOR);
-    outlinePass.edgeStrength = 6.5;
-    outlinePass.edgeThickness = 2.4;
-    outlinePass.edgeGlow = 0.15;
+    outlinePass.edgeStrength = 5;
+    outlinePass.edgeThickness = 1.6;
+    outlinePass.edgeGlow = 0;
     outlinePass.pulsePeriod = 0;
     composer.addPass(outlinePass);
 
-    // 悬停轮廓（浅蓝）— 仅在悬停时启用，downSampleRatio 由 adaptEditorRenderPerf 动态调节
+    // 悬停轮廓（浅蓝）— 可降采样；选中描边不跟随降采样以免发皱
     hoverOutlinePass = new OutlinePass(size, scene, camera);
     hoverOutlinePass.downSampleRatio = 2;
     hoverOutlinePass.visibleEdgeColor.set(HOVER_EDGE_COLOR);
     hoverOutlinePass.hiddenEdgeColor.set(HIDDEN_EDGE_COLOR);
-    hoverOutlinePass.edgeStrength = 4;
-    hoverOutlinePass.edgeThickness = 1.6;
-    hoverOutlinePass.edgeGlow = 0.08;
+    hoverOutlinePass.edgeStrength = 3.5;
+    hoverOutlinePass.edgeThickness = 1.2;
+    hoverOutlinePass.edgeGlow = 0;
     hoverOutlinePass.pulsePeriod = 0;
     hoverOutlinePass.enabled = false;
     composer.addPass(hoverOutlinePass);
 
-    // 模型配置轮廓高亮（与点击选中同款 OutlinePass 强度）
+    // 模型配置轮廓高亮
     modelConfigOutlinePass = new OutlinePass(size, scene, camera);
     modelConfigOutlinePass.downSampleRatio = 2;
     composer.addPass(modelConfigOutlinePass);
@@ -2378,8 +2691,8 @@ export function useMovieEditor() {
   function toggleBloom() {
     if (bloomIntensity.value > 0 && !composer) initComposer();
     if (composer && bloomPass) {
-      bloomPass.strength = bloomIntensity.value;
-      bloomPass.threshold = bloomThreshold.value;
+      bloomPass.strength = bloomIntensity.value * 0.4;
+      bloomPass.threshold = Math.max(0.35, bloomThreshold.value);
       bloomPass.radius = bloomRadius.value;
       bloomPass.enabled = !isPresentationMode() && bloomIntensity.value > 0;
     }
@@ -2393,14 +2706,34 @@ export function useMovieEditor() {
       if (colorPass) colorPass.enabled = colorEnabled;
       if (hueSatPass) {
         hueSatPass.enabled = colorEnabled;
-        if (hueSatPass.uniforms) hueSatPass.uniforms.saturation.value = ppSaturation.value;
+        if (hueSatPass.uniforms?.saturation) {
+          hueSatPass.uniforms.saturation.value = ppSaturation.value;
+        }
       }
       if (brightContrastPass) {
         brightContrastPass.enabled = colorEnabled;
-        if (brightContrastPass.uniforms) brightContrastPass.uniforms.contrast.value = ppContrast.value;
+        if (brightContrastPass.uniforms?.contrast) {
+          brightContrastPass.uniforms.contrast.value = ppContrast.value;
+        }
       }
     }
     scheduleSaveSettings();
+  }
+
+  /** 滑块/输入框共用：必须写闭包内的 ref，避免面板侧赋值写不到真实状态 */
+  function setPpContrast(val?: number | null) {
+    if (typeof val === "number" && Number.isFinite(val)) ppContrast.value = val;
+    toggleColor();
+  }
+
+  function setPpSaturation(val?: number | null) {
+    if (typeof val === "number" && Number.isFinite(val)) ppSaturation.value = val;
+    toggleColor();
+  }
+
+  function setPpExposure(val?: number | null) {
+    if (typeof val === "number" && Number.isFinite(val)) ppExposure.value = val;
+    applyToneMapping();
   }
 
   function applyGrid() {
@@ -2422,10 +2755,11 @@ export function useMovieEditor() {
   });
 
   function applyModelEnvReflectionIntensity(targetRoot?: THREE.Object3D) {
-    // 1 = 保持 GLTF/3ds Max 原始反射；仅缩放 envMapIntensity，绝不改写粗糙度/金属度
     const intensity = Math.max(0, envReflectionIntensity.value);
+    const envI = Math.max(0, envIntensityVal.value);
+    const envTex = envMap ?? scene?.environment ?? null;
     const applyToRoot = (root: THREE.Object3D) => {
-      applyGltfEnvMapIntensity(root, intensity);
+      applyGltfSpecularGlassReflection(root, intensity, envTex as THREE.Texture | null, envI);
     };
     if (targetRoot) {
       applyToRoot(targetRoot);
@@ -2439,82 +2773,39 @@ export function useMovieEditor() {
     const rotY = THREE.MathUtils.degToRad(envRotation.value);
     scene.environmentRotation.set(0, rotY, 0);
     scene.backgroundRotation.set(0, rotY, 0);
-    // 环境贴图强度：全局环境主强度（影响 IBL 主通道）
-    scene.environmentIntensity = envIntensityVal.value;
-    scene.backgroundIntensity = envIntensityVal.value;
-    // 模型反射强度：仅作用在材质 envMapIntensity
+
+    const envI = Math.max(0, envIntensityVal.value);
+    // 环境贴图强度：全局 IBL / 背景；模型镜面反射由材质清漆+粗糙度控制（见 applyModelEnvReflectionIntensity）
+    scene.environmentIntensity = envI;
+    scene.backgroundIntensity = envI;
+
     applyModelEnvReflectionIntensity();
-    if (envReflectionProbe?.ball.material instanceof THREE.MeshStandardMaterial) {
-      envReflectionProbe.ball.material.envMapIntensity = envReflectionIntensity.value;
-      envReflectionProbe.ball.material.needsUpdate = true;
+    if (envReflectionProbe?.ball) {
+      applyGltfSpecularGlassReflection(
+        envReflectionProbe.ball,
+        Math.max(0, envReflectionIntensity.value),
+        (envMap ?? scene.environment) as THREE.Texture | null,
+        envI
+      );
     }
     ensureEnvReflectionSphere();
     syncEditorGizmosVisibility();
     scheduleSaveSettings();
   }
 
-  function applyShadow() {
-    renderer.shadowMap.enabled = shadowEnabled.value;
-    switch (shadowType.value) {
-      case "basic":
-        renderer.shadowMap.type = THREE.BasicShadowMap;
-        break;
-      case "vsm":
-        renderer.shadowMap.type = THREE.VSMShadowMap;
-        break;
-      case "pcf":
-        renderer.shadowMap.type = THREE.PCFShadowMap;
-        break;
-      default:
-        renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-    }
+  function setEnvReflectionIntensity(val?: number | null) {
+    if (typeof val === "number" && Number.isFinite(val)) envReflectionIntensity.value = val;
+    applyEnv();
+  }
 
-    let shadowCaster: THREE.DirectionalLight | null = null;
-    for (const runtime of sceneLightRuntimes.values()) {
-      const light = runtime.light;
-      light.castShadow = false;
-      if (shadowEnabled.value && runtime.config.castShadow && light instanceof THREE.DirectionalLight && !shadowCaster) {
-        shadowCaster = light;
-        light.castShadow = true;
-        light.shadow.mapSize.set(shadowMapSize.value, shadowMapSize.value);
-        light.shadow.bias = shadowBias.value;
-        light.shadow.normalBias = shadowNormalBias.value;
-        light.shadow.camera.near = 0.5;
-        light.shadow.camera.far = 60;
-        light.shadow.camera.left = -15;
-        light.shadow.camera.right = 15;
-        light.shadow.camera.top = 15;
-        light.shadow.camera.bottom = -15;
-        light.shadow.camera.updateProjectionMatrix();
-        light.shadow.map = null;
-      }
-    }
-    // Shadow ground plane
-    if (shadowEnabled.value) {
-      if (!groundMesh || !groundMesh.parent) {
-        let geo = new THREE.PlaneGeometry(40, 40);
-        let mat = new THREE.ShadowMaterial({ transparent: true });
-        groundMesh = new THREE.Mesh(geo, mat);
-        groundMesh.rotation.x = -Math.PI / 2;
-        groundMesh.position.y = 0;
-        groundMesh.receiveShadow = true;
-        scene.add(groundMesh);
-      }
-      groundMesh.material.opacity = shadowIntensity.value * 0.5;
-    } else if (groundMesh && groundMesh.parent) {
-      scene.remove(groundMesh);
-    }
-    // Update all meshes cast/receive shadow
-    meshes.forEach(function (m) {
-      m.traverse(function (child) {
-        if (child.isMesh) {
-          child.castShadow = shadowEnabled.value;
-          child.receiveShadow = shadowEnabled.value;
-        }
-      });
-    });
-    scheduleSaveSettings();
-    renderer.render(scene, camera);
+  function setEnvIntensityVal(val?: number | null) {
+    if (typeof val === "number" && Number.isFinite(val)) envIntensityVal.value = val;
+    applyEnv();
+  }
+
+  function setEnvRotation(val?: number | null) {
+    if (typeof val === "number" && Number.isFinite(val)) envRotation.value = val;
+    applyEnv();
   }
 
   function applyPostProcessing() {
@@ -2522,8 +2813,9 @@ export function useMovieEditor() {
     const key = `${bloomIntensity.value}|${bloomThreshold.value}|${bloomRadius.value}`;
     if (key === lastBloomPostKey) return;
     lastBloomPostKey = key;
-    bloomPass.strength = bloomIntensity.value;
-    bloomPass.threshold = bloomThreshold.value;
+    // 强度做衰减映射：UI 数值直观，实际辉光更克制，避免 0.05 就过亮。
+    bloomPass.strength = bloomIntensity.value * 0.4;
+    bloomPass.threshold = Math.max(0.35, bloomThreshold.value);
     bloomPass.radius = bloomRadius.value;
   }
 
@@ -2567,17 +2859,187 @@ export function useMovieEditor() {
     }
   }
 
-  function syncVideoChapterAnimationInMainLoop(now: number) {
-    if (!_chAnimLock || chAnimWallclock) return;
+  function detectVideoLoopRewind(t: number) {
+    return lastVideoPlaybackSyncTime > 0.2 && t + 0.25 < lastVideoPlaybackSyncTime;
+  }
+
+  /** 章节动画驱动 mesh 时暂停 GLTF 自带动画，避免每帧覆盖自定义位移 */
+  function shouldAdvanceGltfMixers() {
+    return !(_chAnimLock && !chAnimWallclock);
+  }
+
+  function resetGltfMixersForChapterResync() {
+    for (const mixer of mixers) {
+      try {
+        mixer.setTime(0);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
+  /** 视频循环/回退/切章：整树重置后再套章节动画（仅边界调用） */
+  function resyncChapterMeshFromVideo(
+    video: HTMLVideoElement,
+    ch: Chapter,
+    elapsed: number,
+    options?: { rebuildOutlines?: boolean }
+  ) {
+    invalidateChapterAnimTargetsCache(ch.id);
+    invalidateChapterAnimPivotCaches(ch);
+    resetGltfMixersForChapterResync();
+    // 切章或本章含线框/描边/高亮时必须重建；skip 会留下「有模型无线框」或 colorWrite=false 变黑
+    const rebuildOutlines =
+      options?.rebuildOutlines === true || chapterNeedsOutlineRebuild(ch);
+    applyChapterModelState(ch, elapsed, {
+      skipOutlineRebuild: !rebuildOutlines,
+      skipOverlaySync: false,
+      forceElapsed: elapsed,
+      immediatePresent: true
+    });
+    editPlaybackSyncChapterId = ch.id;
+    editPlaybackSyncElapsed = elapsed;
+    lastVideoPlaybackSyncTime = video.currentTime;
+  }
+
+  /** 编辑态是否正跟视频时间刷 mesh（切选中时勿再套 start/end 预览） */
+  function isEditVideoMeshSyncActive() {
+    if (viewOnly.value || isPreviewMode.value) return false;
+    const video = videoEl.value;
+    return !!(video && !video.paused && _chAnimLock && !chAnimWallclock);
+  }
+
+  /** 按当前视频时间整章节刷新 mesh（选中切换时用） */
+  function applyChapterMeshFromCurrentVideo(ch?: Chapter | null) {
+    const video = videoEl.value;
+    const chapter = ch ?? (video ? getPlaybackChapterAtTime(video.currentTime) : selectedChapter.value);
+    if (!chapter) return;
+    if (!chapterHasAnyModelEdits(chapter)) {
+      resetAllModelsToDefault();
+      return;
+    }
+    const elapsed = video ? getChapterAnimElapsed(chapter, video.currentTime) : 0;
+    applyChapterModelState(chapter, elapsed, {
+      skipOutlineRebuild: false,
+      skipOverlaySync: false,
+      forceElapsed: elapsed
+    });
+    editPlaybackSyncChapterId = chapter.id;
+    editPlaybackSyncElapsed = elapsed;
+    if (video) lastVideoPlaybackSyncTime = video.currentTime;
+  }
+
+  /**
+   * 视频驱动章节位移：编辑/预览/展示共用同一套「可播放章节 + elapsed」。
+   * 章节解析与预览 syncPresentationPlaybackFromVideo 一致：nav → resolvePlayable。
+   */
+  function syncVideoDrivenChapterMesh() {
     const video = videoEl.value;
     if (!video || video.paused) return;
-    const activeCh = resolvePresentationPlaybackChapter(video);
-    if (!activeCh || !chapterHasAnimation(activeCh)) return;
-    const targetInterval = 1000 / targetFps.value;
-    if (videoAnimLastSyncAt && now - videoAnimLastSyncAt < targetInterval * 0.9) return;
-    videoAnimLastSyncAt = now;
-    chAnimChapterId = activeCh.id;
-    applyChapterAnimOnly(activeCh, getPresentationAnimElapsed(video, activeCh));
+    if (chAnimWallclock) return;
+
+    // 切章/seek 锁定期：禁止用「尚未 seek 到位」的旧 currentTime 解析上一章。
+    // 否则会出现：动画2已隐藏模型 → 旧时间又把动画1显示态刷回来 → 肉眼闪一下。
+    if (videoChapterSyncPaused || chapterNavLock.value || presentationChapterTransition || video.seeking) {
+      return;
+    }
+
+    const t = video.currentTime;
+    const loopRewind = detectVideoLoopRewind(t);
+    const queryTime = loopRewind ? 0 : t;
+
+    if (loopRewind) chapterPlayTarget.value = null;
+
+    // 优先走统一解析（含 playTarget 钉住），避免仅按 queryTime 在 seek 尾段回刷上一章
+    let ch = resolveVideoPlaybackChapter(video);
+    if (!ch || !chapterBelongsToActiveVideo(ch)) {
+      const navChapter = getPresentationChapterAtVideoTime(queryTime);
+      const playable = navChapter ? resolvePlayableChapterForPresentation(navChapter) : null;
+      ch = chapterBelongsToActiveVideo(playable) ? playable : null;
+    }
+    // 再兜底：严格按当前活动视频时间轴解析，绝不跨视频
+    if (!ch) {
+      ch = activeVideoId.value
+        ? resolveActiveAnimationAtTime(nodes.value, activeVideoId.value, queryTime)
+        : null;
+    }
+
+    if (!ch) {
+      lastVideoPlaybackSyncTime = t;
+      return;
+    }
+
+    // 时间已落入当前章后，playTarget 跟随视频；未落入时 resolve 已钉住目标章，勿改写
+    if (
+      chapterPlayTarget.value?.id !== ch.id &&
+      isChapterInPlaybackRange(ch, queryTime)
+    ) {
+      chapterPlayTarget.value = ch;
+    }
+
+    if (!viewOnly.value && !isPreviewMode.value) {
+      const navForCam = getPresentationChapterAtVideoTime(queryTime) ?? ch;
+      if (editPlaybackCameraChapterId !== ch.id) {
+        editPlaybackCameraChapterId = ch.id;
+        applyChapterCameraForNav(navForCam, "playback");
+      }
+    }
+
+    const elapsed = getChapterAnimElapsed(ch, queryTime);
+    const chapterChanged = editPlaybackSyncChapterId !== ch.id || chAnimChapterId !== ch.id;
+    const elapsedRegressed =
+      !chapterChanged &&
+      !loopRewind &&
+      editPlaybackSyncElapsed > CHAPTER_TIME_EPS &&
+      elapsed + CHAPTER_TIME_EPS < editPlaybackSyncElapsed;
+    // 循环回跳 / 切章 / 时间回退：必须整树重置。仅 applyChapterAnimOnly 不会清掉
+    // 「当前章未配置、但上一章移动过」的子部件，第二轮会从错误姿态起跳。
+    const needsFullResync = loopRewind || chapterChanged || elapsedRegressed;
+
+    _chAnimLock = true;
+    chAnimWallclock = false;
+
+    // 自动切章：先写可见性再动位姿，避免上一章显示态残留一帧
+    if (chapterChanged) {
+      lastPresentationAutoSwitchChapterId = ch.id;
+      applyChapterVisibilityOnly(ch);
+    }
+
+    if (!chapterHasAnyModelEdits(ch)) {
+      if (needsFullResync) {
+        resetAllModelsToDefault();
+        invalidateChapterAnimTargetsCache(ch.id);
+        if (chapterChanged) {
+          applyChapterVisibilityOnly(ch);
+          renderViewportFrame();
+        }
+      }
+      lastVideoPlaybackSyncTime = t;
+      editPlaybackSyncChapterId = ch.id;
+      editPlaybackSyncElapsed = elapsed;
+      chAnimChapterId = ch.id;
+      return;
+    }
+
+    if (needsFullResync || !chapterHasAnimation(ch)) {
+      chAnimChapterId = ch.id;
+      resyncChapterMeshFromVideo(video, ch, elapsed, {
+        // 自动切章：隐藏→显示+线框 必须重建 overlay，否则只见实体不见线框
+        rebuildOutlines: chapterChanged || loopRewind || chapterNeedsOutlineRebuild(ch)
+      });
+      if (loopRewind) lastPresentationAutoSwitchChapterId = null;
+      return;
+    }
+
+    applyChapterAnimOnly(ch, elapsed);
+    chAnimChapterId = ch.id;
+    editPlaybackSyncChapterId = ch.id;
+    editPlaybackSyncElapsed = elapsed;
+    lastVideoPlaybackSyncTime = t;
+  }
+
+  function syncVideoChapterAnimationInMainLoop(_now: number) {
+    // mesh 已在节流前由 syncVideoDrivenChapterMesh 统一处理
   }
 
   function syncWallclockChapterAnimationInMainLoop(now: number) {
@@ -2594,8 +3056,33 @@ export function useMovieEditor() {
     }
   }
 
-  /** 展示/预览：timeupdate 稀疏时仍跟 video 推进进度；期望播放却 paused 时补 play。 */
-  function syncPresentationProgressInMainLoop(now: number) {
+  /** 展示/预览：RAF 只观察并校准 session；媒体副作用只由 command effect 执行。 */
+  function isPresentationAtMediaEnd(video: HTMLVideoElement): boolean {
+    const dur = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : duration.value;
+    if (!(dur > 0)) return false;
+    return video.currentTime >= dur - Math.max(CHAPTER_END_EPS, 0.08);
+  }
+
+  /** Boot/seek race: media still at EOF while session targets an earlier time. */
+  function isStalePresentationMediaEnd(video: HTMLVideoElement): boolean {
+    if (
+      presentationPlaybackSession.phase === "seeking" ||
+      presentationChapterTransition ||
+      videoChapterSyncPaused ||
+      presentationSeekTargetTime != null
+    ) {
+      return true;
+    }
+    // Only suppress EOF during the short post-command settle window (load / seek to start).
+    if (performance.now() >= presentationManualNavUntil) return false;
+    const dur =
+      Number.isFinite(video.duration) && video.duration > 0 ? video.duration : duration.value;
+    if (!(dur > 0)) return false;
+    const target = presentationPlaybackSession.targetTime;
+    return Number.isFinite(target) && target < dur - Math.max(0.5, CHAPTER_END_EPS * 4);
+  }
+
+  function syncPresentationProgressInMainLoop(_now: number) {
     if (!viewOnly.value && !isPreviewMode.value) return;
     const video = videoEl.value;
     if (!video) return;
@@ -2603,28 +3090,89 @@ export function useMovieEditor() {
     const seekLocked =
       videoChapterSyncPaused || chapterNavLock.value || presentationChapterTransition;
 
-    if (!video.seeking && !video.paused && !video.ended) {
-      if (!seekLocked || presentationExpectPlaying) {
-        currentTime.value = video.currentTime;
-      }
-    }
-
-    if (
-      presentationExpectPlaying &&
-      video.paused &&
-      !video.ended &&
-      !presentationChapterTransition &&
-      !videoChapterSyncPaused &&
-      now - presentationProgressResumeAt > 100
-    ) {
-      presentationProgressResumeAt = now;
-      void forceResumeVideoPlayback(video).then(ok => {
-        if (ok) {
-          stopChapterAnimation();
-          ensureVideoSyncedChapterAnimation();
-          syncCurrentChapterAnimationFromVideo();
+    if (video.ended || (video.paused && isPresentationAtMediaEnd(video))) {
+      // Do not overwrite a start/seek command with a stale EOF from cached media.
+      if (isStalePresentationMediaEnd(video)) {
+        if (!seekLocked && presentationPlaybackSession.phase === "seeking") {
+          syncPresentationUiFromTimeline(presentationPlaybackSession.targetTime);
         }
-      });
+        return;
+      }
+      // 播放意图未手动暂停：片尾循环，不把 intent 改成 pause。
+      if (loopPresentationPlaybackFromStart()) return;
+      if (presentationPlaybackSession.phase === "ended") return;
+      presentationPlaybackSession.phase = "ended";
+      presentationPlaybackSession.intent = "pause";
+      presentationPlaybackSession.committedTime = video.currentTime;
+      presentationPlaybackSession.targetTime = video.currentTime;
+      presentationExpectPlaying = false;
+      presentationUserWantsPaused = true;
+      presentationEndedUiSynced = true;
+      clearPresentationResumeTimer();
+      if (!seekLocked) syncPresentationUiFromTimeline(video.currentTime);
+      return;
+    }
+    presentationEndedUiSynced = false;
+
+    if (!video.seeking && !video.paused && !video.ended) {
+      // Stale play() after a pause command: re-assert pause, never adopt as playing.
+      if (presentationPlaybackSession.intent === "pause") {
+        video.pause();
+        return;
+      }
+      const target = presentationPlaybackSession.targetTime;
+      if (canAdoptPresentationVideoTime(video, target)) {
+        presentationSeekTargetTime = null;
+        presentationPlaybackSession.committedTime = video.currentTime;
+        presentationPlaybackSession.phase = "playing";
+      } else if (
+        presentationPlaybackSession.phase === "playing" &&
+        presentationSeekTargetTime == null
+      ) {
+        // 已在播放且无未完成 seek：每帧跟视频时钟，避免进度条一顿一顿。
+        presentationPlaybackSession.committedTime = video.currentTime;
+      }
+      if (maybeAutoAdvancePresentation(video)) return;
+      syncPresentationUiFromTimeline();
+      if (!seekLocked) {
+        syncPresentationPlaybackFromVideo(video);
+      }
+    } else if (
+      presentationPlaybackSession.intent === "play" &&
+      !presentationUserWantsPaused &&
+      video.paused &&
+      !seekLocked
+    ) {
+      // seeking 卡住（seek 完仍 paused）也必须续播，不能只刷 UI。
+      if (
+        presentationPlaybackSession.phase === "seeking" ||
+        presentationPlaybackSession.phase === "playing" ||
+        presentationPlaybackSession.phase === "blocked"
+      ) {
+        presentationPlaybackSession.phase = "blocked";
+        void recoverPresentationPlaybackAfterUnexpectedPause();
+      }
+    } else if (seekLocked || presentationPlaybackSession.phase === "seeking") {
+      syncPresentationUiFromTimeline();
+    }
+  }
+
+  /** 编辑态：RAF 跟视频推进高亮，避免 timeupdate 稀疏或播完仍停在上一章 */
+  function syncEditProgressHighlightInMainLoop() {
+    if (viewOnly.value || isPreviewMode.value) return;
+    const video = videoEl.value;
+    if (!video || video.seeking) return;
+
+    const seekLocked =
+      videoChapterSyncPaused || chapterNavLock.value || presentationChapterTransition;
+    if (seekLocked) return;
+
+    if (!video.paused && !video.ended) {
+      currentTime.value = video.currentTime;
+      syncEditModePlaybackFromVideo(video);
+    } else if (video.ended) {
+      currentTime.value = video.currentTime;
+      syncEditModePlaybackFromVideo(video);
     }
   }
 
@@ -2632,6 +3180,10 @@ export function useMovieEditor() {
     afid = requestAnimationFrame(animate);
     advanceCameraTransition(now);
     syncPresentationProgressInMainLoop(now);
+    syncEditProgressHighlightInMainLoop();
+
+    // 视频驱动位移：编辑/预览共用，放在 FPS 节流之前以免漏掉循环回跳帧
+    syncVideoDrivenChapterMesh();
 
     const targetInterval = 1000 / targetFps.value;
     const sinceLastPresent = viewportLastPresentAt ? now - viewportLastPresentAt : targetInterval;
@@ -2645,10 +3197,11 @@ export function useMovieEditor() {
 
     if (!camTrans) controls.update();
 
-    syncVideoChapterAnimationInMainLoop(now);
-    syncWallclockChapterAnimationInMainLoop(now);
+    if (shouldAdvanceGltfMixers()) {
+      mixers.forEach(m => m.update(frameDtSec));
+    }
 
-    mixers.forEach(m => m.update(frameDtSec));
+    syncWallclockChapterAnimationInMainLoop(now);
 
     // ── 运动段动画播放（段+曲线） ──
     function applyEasing(t: number, type: string): number {
@@ -2861,19 +3414,22 @@ export function useMovieEditor() {
   }
 
   function liveAnimSegmentsHaveEdits(): boolean {
-    if (!selModel.value || animSegments.length === 0) return animDirty.value;
-    if (!animSegmentsBelongToCurrentSelection()) return animDirty.value;
-    return (
-      animDirty.value ||
-      animSegments.some(seg => animSegmentDiffersFromDefault(seg, selModel.value, selModelNodeId.value))
-    );
+    if (!selModel.value || animSegments.length === 0) return false;
+    if (!animSegmentsBelongToCurrentSelection()) return false;
+    return animSegmentsHaveRealEdits(animSegments, selModel.value, selModelNodeId.value);
   }
 
-  function selectionOwnerKey(modelId?: string | null, nodeId?: string | null | undefined): string | null {
+  function selectionOwnerKey(
+    modelId?: string | null,
+    nodeId?: string | null | undefined,
+    chapterId?: string | null | undefined
+  ): string | null {
     const mid = modelId ?? selModelId.value;
     if (!mid) return null;
     const nid = nodeId !== undefined ? nodeId : selModelNodeId.value;
-    return `${mid}::${nid ?? ""}`;
+    const cid = chapterId !== undefined ? chapterId : selectedChapterId.value;
+    // 必须含章节 id：同一子物体在动画 A/B 下是两份独立编辑，不能共享 live 段落归属
+    return `${cid ?? ""}|${mid}::${nid ?? ""}`;
   }
 
   function animSegmentsBelongToCurrentSelection(): boolean {
@@ -2881,8 +3437,17 @@ export function useMovieEditor() {
     return animSegmentsOwnerKey === selectionOwnerKey();
   }
 
-  function bindAnimSegmentsToSelection(modelId?: string | null, nodeId?: string | null | undefined) {
-    animSegmentsOwnerKey = selectionOwnerKey(modelId, nodeId);
+  function animSegmentsBelongToChapter(chapterId: string | null | undefined): boolean {
+    if (!chapterId || !animSegmentsOwnerKey) return false;
+    return animSegmentsOwnerKey.startsWith(`${chapterId}|`);
+  }
+
+  function bindAnimSegmentsToSelection(
+    modelId?: string | null,
+    nodeId?: string | null | undefined,
+    chapterId?: string | null | undefined
+  ) {
+    animSegmentsOwnerKey = selectionOwnerKey(modelId, nodeId, chapterId);
   }
 
   function clearLiveAnimEditorState() {
@@ -2925,11 +3490,27 @@ export function useMovieEditor() {
     }));
   }
 
+  /** 待机时间/时长/曲线/轴心是否相对默认有改动（不含位姿） */
+  function animSegmentHasNonDefaultMeta(seg: any): boolean {
+    if (!seg) return false;
+    if ((seg.pauseTime ?? 0) !== 0) return true;
+    if (Math.abs((seg.animTime ?? 3) - 3) > 1e-3) return true;
+    if ((seg.easing ?? "easeInOut") !== "easeInOut") return true;
+    if ((seg.pivot ?? "center") !== "center") return true;
+    return false;
+  }
+
+  function animSegmentsHaveRealEdits(segments: any[], model: Model, nodeId: string | null): boolean {
+    return segments.some(
+      seg => animSegmentDiffersFromDefault(seg, model, nodeId) || animSegmentHasNonDefaultMeta(seg)
+    );
+  }
+
   function draftHasEdits(draft: SelectionEditDraft, model: Model, nodeId: string | null): boolean {
-    if (draft.animDirty) return true;
     if (formSnapshotHasVisualEdits(draft.form)) return true;
     if (draft.animSegments.length === 0) return false;
-    return draft.animSegments.some(seg => animSegmentDiffersFromDefault(seg, model, nodeId));
+    // 不以裸 animDirty 判定：章节切换时易误标 dirty，导致未编辑节点显示「已改」
+    return animSegmentsHaveRealEdits(draft.animSegments, model, nodeId);
   }
 
   function hasSelectionEditDraft(chapterId: string, modelId: string, nodeId: string | null): boolean {
@@ -2963,8 +3544,10 @@ export function useMovieEditor() {
     if (!model) return;
 
     const key = selectionDraftKey(chapterId, modelId, nodeId);
-    const ownerKey = selectionOwnerKey(modelId, nodeId);
+    const ownerKey = selectionOwnerKey(modelId, nodeId, chapterId);
+    // live 段落必须同时匹配「章节 + 模型 + 子节点」，否则会把动画 A 的编辑落到动画 B
     if (selectionOwnerKey() !== ownerKey) return;
+    if (animSegments.length > 0 && animSegmentsOwnerKey !== ownerKey) return;
 
     const snapshot = getModelFormSnapshot();
     const segments =
@@ -2973,10 +3556,7 @@ export function useMovieEditor() {
         : [];
 
     const hasVisualEdits = formSnapshotHasVisualEdits(snapshot);
-    const hasAnimEdits =
-      segments.length > 0 &&
-      (animDirty.value ||
-        segments.some(seg => animSegmentDiffersFromDefault(seg, model, nodeId)));
+    const hasAnimEdits = segments.length > 0 && animSegmentsHaveRealEdits(segments, model, nodeId);
 
     if (!hasAnimEdits && !hasVisualEdits) {
       selectionEditDrafts.delete(key);
@@ -2987,7 +3567,7 @@ export function useMovieEditor() {
       animSegments: segments,
       animDuration: animDuration.value,
       animEasing: animEasing.value,
-      animDirty: animDirty.value,
+      animDirty: animDirty.value && hasAnimEdits,
       form: { ...snapshot }
     });
   }
@@ -3013,8 +3593,7 @@ export function useMovieEditor() {
     cfg.posOffset = [s.posOffsetX, s.posOffsetY, s.posOffsetZ];
 
     const hasAnimEdits =
-      draft.animSegments.length > 0 &&
-      draft.animSegments.some(seg => animSegmentDiffersFromDefault(seg, model, nodeId));
+      draft.animSegments.length > 0 && animSegmentsHaveRealEdits(draft.animSegments, model, nodeId);
     if (hasAnimEdits) {
       cfg.animation = true;
       const obj = getTransformTarget(model.id, nodeId);
@@ -3073,11 +3652,12 @@ export function useMovieEditor() {
       // 草稿来自 live 编辑器，已是相对值，勿再做绝对→相对转换
       invalidateSegPivotCache(animSegments[0]);
     }
-    bindAnimSegmentsToSelection();
+    bindAnimSegmentsToSelection(undefined, undefined, selectedChapterId.value);
     animDirty.value = draft.animDirty;
     if (animSegments[0]) {
       editingSeg.value = animSegments[0];
-      editingSegMode.value = animSegmentHasTransformEdits(animSegments[0]) ? "end" : "start";
+      // 默认起始帧预览；「已改」段也不自动切到 end，否则切选中会把 mesh 打到结束位移
+      editingSegMode.value = "start";
     }
     bumpAnimSegmentRevision();
   }
@@ -3087,8 +3667,7 @@ export function useMovieEditor() {
     if (!model) return;
 
     const hasAnimEdits =
-      draft.animSegments.length > 0 &&
-      draft.animSegments.some(seg => animSegmentDiffersFromDefault(seg, model, nodeId));
+      draft.animSegments.length > 0 && animSegmentsHaveRealEdits(draft.animSegments, model, nodeId);
     const hasVisualEdits = formSnapshotHasVisualEdits(draft.form);
 
     if (!hasAnimEdits && !hasVisualEdits) {
@@ -3133,7 +3712,12 @@ export function useMovieEditor() {
   /** 切换节点 / 保存场景 / 预览播放：会话落盘到 chapter.modelConfigs */
   function flushChapterSessionsToConfigs(ch: Chapter) {
     if (viewOnly.value || isPreviewMode.value) return;
-    if (selModel.value && getActiveChapter()?.id === ch.id) {
+    // 仅当 live 段落明确属于该章节时才捕获，避免把其它动画的编辑写入本节点
+    if (
+      selModel.value &&
+      selectedChapterId.value === ch.id &&
+      animSegmentsBelongToChapter(ch.id)
+    ) {
       captureSelectionSession(ch.id, selModel.value.id, selModelNodeId.value);
     }
     flushChapterDraftsToModelConfigs(ch);
@@ -3145,8 +3729,9 @@ export function useMovieEditor() {
 
   function persistAllChapterDrafts() {
     if (viewOnly.value || isPreviewMode.value) return;
-    if (selModel.value && getActiveChapter()) {
-      captureSelectionSession(getActiveChapter()!.id, selModel.value.id, selModelNodeId.value);
+    const active = selectedChapter.value;
+    if (selModel.value && active && animSegmentsBelongToChapter(active.id)) {
+      captureSelectionSession(active.id, selModel.value.id, selModelNodeId.value);
     }
     for (const ch of chapters.value) {
       flushChapterDraftsToModelConfigs(ch);
@@ -3180,8 +3765,7 @@ export function useMovieEditor() {
     }
   }
 
-  function resetObject3DToDefaultState(m: Model, obj: THREE.Object3D, isRoot: boolean) {
-    const def = createDefaultModelConfig();
+  function resetObject3DTransformToDefault(m: Model, obj: THREE.Object3D, isRoot: boolean) {
     if (isRoot) {
       const bp = obj.userData.basePos || m.basePosition || DEFAULT_MODEL_BASE_POSITION;
       obj.position.set(bp[0], bp[1], bp[2]);
@@ -3197,7 +3781,37 @@ export function useMovieEditor() {
       obj.quaternion.setFromEuler(new THREE.Euler(br[0], br[1], br[2], "XYZ"));
       obj.scale.setScalar(bs);
     }
-    rebuildOutlineForObject(m, obj, def);
+  }
+
+  function resetObject3DToDefaultState(
+    m: Model,
+    obj: THREE.Object3D,
+    isRoot: boolean,
+    options?: { preserveVisibility?: boolean }
+  ) {
+    resetObject3DTransformToDefault(m, obj, isRoot);
+    rebuildOutlineForObject(m, obj, createDefaultModelConfig(), {
+      touchVisibility: !options?.preserveVisibility
+    });
+  }
+
+  function resetModelTreeTransformsOnly(m: Model) {
+    const root = meshes.get(m.id);
+    if (!root) return;
+    resetObject3DTransformToDefault(m, root, true);
+    traverseObject3DSafely(root, child => {
+      if (child === root) return;
+      if (
+        child.userData?.isEdgeLine ||
+        child.userData?.isSelectionHelper ||
+        child.userData?.isOutlineShell ||
+        child.userData?.isBodyHighlightOverlay
+      ) {
+        return;
+      }
+      if (!child.userData?.nodeId) return;
+      resetObject3DTransformToDefault(m, child, false);
+    });
   }
 
   function resetModelTreeToDefault(m: Model) {
@@ -3243,9 +3857,30 @@ export function useMovieEditor() {
   }
 
   function applyModelVisualOnly(m: Model, obj: THREE.Object3D, cfg: ModelConfig, skipOutlineRebuild = false) {
-    obj.visible = cfg.visible !== false;
+    const modelRoot = meshes.get(m.id);
+    const ownerKey = (obj.userData?.nodeId as string | undefined) || `root:${m.id}`;
+    if (!cfg.visible) {
+      obj.visible = false;
+      // 隐藏时务必清掉描边/线框 overlay；否则 skipOutline 路径会残留轮廓闪一下
+      if (modelRoot) {
+        removeVisualOverlaysForOwner(modelRoot, ownerKey);
+      }
+      if (!skipOutlineRebuild) {
+        syncModelConfigOutlinePass();
+        invalidatePickMeshCache();
+      }
+      return;
+    }
+    obj.visible = true;
     if (!skipOutlineRebuild) {
       rebuildOutlineForObject(m, obj, cfg);
+      return;
+    }
+    // skip 重建时仍须处理：线框/描边必须套上；非线框则恢复上一章 colorWrite=false 残留（否则变黑）
+    if (cfg.wireframe || cfg.outline || cfg.highlight) {
+      rebuildOutlineForObject(m, obj, cfg);
+    } else if (modelRoot) {
+      removeVisualOverlaysForOwner(modelRoot, ownerKey);
     }
   }
 
@@ -3278,6 +3913,7 @@ export function useMovieEditor() {
     if (_chAnimLock) return false;
     if (selectedChapterId.value && lastSyncedModelFormChapterId !== selectedChapterId.value) return false;
     if (!animSegmentsBelongToCurrentSelection()) return false;
+    if (!animSegmentsBelongToChapter(selectedChapterId.value)) return false;
     if (selModel.value?.id !== modelId) return false;
     if (nodeId) {
       return resolveDisplayNodeId(getModelHierarchy(modelId), selModelNodeId.value ?? "") === nodeId;
@@ -3289,6 +3925,8 @@ export function useMovieEditor() {
     skipOutlineRebuild?: boolean;
     skipOverlaySync?: boolean;
     forceElapsed?: number;
+    /** 切章隐藏后立刻出画，避免等下一拍 RAF */
+    immediatePresent?: boolean;
   };
 
   function isChapterPlaybackActive() {
@@ -3302,8 +3940,8 @@ export function useMovieEditor() {
   function resolveChapterModelElapsed(_ch: Chapter, elapsedSec: number, options?: ApplyChapterModelStateOptions) {
     if (options?.forceElapsed !== undefined) return options.forceElapsed;
     if (isChapterPlaybackActive()) return elapsedSec;
-    // 编辑态展示动画目标位（结束帧）；只有播放时才按 elapsed 从起始插值到结束
-    return Number.POSITIVE_INFINITY;
+    // 编辑态暂停时展示起始帧，与播放按钮一致，避免结束位移在切换动画后残留
+    return 0;
   }
 
   function animSegmentHasTransformEdits(seg: any): boolean {
@@ -3337,8 +3975,7 @@ export function useMovieEditor() {
     const cfg = readModelConfigForTarget(ch, model.id, nodeId);
     const hasStoredAnim = !!(cfg.animation && cfg.animConfig?.segments?.length);
     const draftHasAnimEdits =
-      !!draftSeg &&
-      draft!.animSegments.some(seg => animSegmentDiffersFromDefault(seg, model, nodeId));
+      !!draftSeg && animSegmentsHaveRealEdits(draft!.animSegments, model, nodeId);
 
     if (draftHasAnimEdits && !(hasStoredAnim && draft && !draft.animDirty)) {
       return {
@@ -3387,51 +4024,104 @@ export function useMovieEditor() {
     const cfg = readModelConfigForTarget(ch, model.id, nodeId);
     const { seg, mode, hasAnim } = resolveAnimSegmentForTarget(ch, model, nodeId);
 
-    const hasVisual = draft
-      ? formSnapshotHasVisualEdits(draft.form)
-      : cfg.visible !== def.visible ||
-        cfg.outline !== def.outline ||
-        cfg.highlight !== def.highlight ||
-        cfg.wireframe !== def.wireframe ||
-        !!cfg.intro ||
-        cfg.scale !== def.scale ||
-        !!(cfg.posOffset && (cfg.posOffset[0] || cfg.posOffset[1] || cfg.posOffset[2]));
+    // 当前选中目标优先用 live 表单，避免草稿滞后导致开关无效。
+    const isLiveSelection =
+      !viewOnly.value &&
+      !isPreviewMode.value &&
+      selectedChapterId.value === ch.id &&
+      selModelId.value === model.id &&
+      (selModelNodeId.value ?? null) === (nodeId ?? null);
+
+    const liveForm = isLiveSelection ? getModelFormSnapshot() : null;
+
+    const hasVisual = liveForm
+      ? formSnapshotHasVisualEdits(liveForm)
+      : draft
+        ? formSnapshotHasVisualEdits(draft.form)
+        : cfg.visible !== def.visible ||
+          cfg.outline !== def.outline ||
+          cfg.highlight !== def.highlight ||
+          cfg.wireframe !== def.wireframe ||
+          !!cfg.intro ||
+          cfg.scale !== def.scale ||
+          !!(cfg.posOffset && (cfg.posOffset[0] || cfg.posOffset[1] || cfg.posOffset[2]));
 
     if (!hasAnim && !hasVisual) {
       for (const obj of objs) {
-        resetObject3DToDefaultState(model, obj, isRoot);
-        rebuildOutlineForObject(model, obj, def);
+        // 仅恢复可见性与描边默认，不重置位姿（避免显隐开关把动画起点打飞）
+        rebuildOutlineForObject(model, obj, def, { touchVisibility: true });
       }
       return;
     }
 
-    const visualCfg = draft
+    const visualCfg = liveForm
       ? ({
           ...def,
-          visible: draft.form.visible,
-          outline: draft.form.outline,
-          wireframe: draft.form.wireframe,
-          highlight: draft.form.highlight,
-          outlineColor: draft.form.outlineColor,
-          wireframeColor: draft.form.wireframeColor,
-          modelHighlightColor: draft.form.modelHighlightColor,
-          animation: draft.form.animation,
-          intro: draft.form.intro,
-          scale: draft.form.scale,
-          posOffset: [draft.form.posOffsetX, draft.form.posOffsetY, draft.form.posOffsetZ] as [
+          visible: liveForm.visible,
+          outline: liveForm.outline,
+          wireframe: liveForm.wireframe,
+          highlight: liveForm.highlight,
+          outlineColor: liveForm.outlineColor,
+          wireframeColor: liveForm.wireframeColor,
+          modelHighlightColor: liveForm.modelHighlightColor,
+          animation: liveForm.animation,
+          intro: liveForm.intro,
+          scale: liveForm.scale,
+          posOffset: [liveForm.posOffsetX, liveForm.posOffsetY, liveForm.posOffsetZ] as [
             number,
             number,
             number
           ]
         } as ModelConfig)
-      : cfg;
+      : draft
+        ? ({
+            ...def,
+            visible: draft.form.visible,
+            outline: draft.form.outline,
+            wireframe: draft.form.wireframe,
+            highlight: draft.form.highlight,
+            outlineColor: draft.form.outlineColor,
+            wireframeColor: draft.form.wireframeColor,
+            modelHighlightColor: draft.form.modelHighlightColor,
+            animation: draft.form.animation,
+            intro: draft.form.intro,
+            scale: draft.form.scale,
+            posOffset: [draft.form.posOffsetX, draft.form.posOffsetY, draft.form.posOffsetZ] as [
+              number,
+              number,
+              number
+            ]
+          } as ModelConfig)
+        : cfg;
 
     for (const obj of objs) {
       applyModelVisualOnly(model, obj, visualCfg, false);
     }
 
     if (hasAnim) {
-      applyAnimSegmentTransformToMesh(model, nodeId, seg, mode);
+      // 与视频播放同一套 elapsed 插值，避免 applyAnimSegmentTransformToMesh 相对坐标偏差
+      const displayMode = resolveMeshAnimDisplayMode(model, nodeId, seg, mode);
+      const elapsed = displayMode === "end" ? Number.POSITIVE_INFINITY : 0;
+      const fromLiveOrDraft = !!(liveForm || draft);
+      if (fromLiveOrDraft) {
+        const animCfg: ModelConfig = {
+          ...visualCfg,
+          animation: true,
+          animConfig: {
+            duration: seg.animTime || 3,
+            easing: seg.easing || "easeInOut",
+            segments: [seg]
+          } as any
+        };
+        for (const obj of objs) {
+          applyElapsedAnimToObject(obj, animCfg, elapsed, [seg]);
+        }
+      } else {
+        const storedCfg: ModelConfig = { ...cfg, animation: true };
+        for (const obj of objs) {
+          applyElapsedAnimToObject(obj, storedCfg, elapsed);
+        }
+      }
     } else {
       for (const obj of objs) {
         applyStaticModelTransform(model, obj, visualCfg, isRoot);
@@ -3441,7 +4131,13 @@ export function useMovieEditor() {
 
   /** 同模型内所有子节点按章节配置/草稿各自同步 mesh（已编辑→应用动画，未编辑→恢复默认） */
   function applyAllEditedTargetsForModel(ch: Chapter, model: Model) {
-    if (!chapterModelHasEdits(ch, model.id)) return;
+    if (!chapterModelHasEdits(ch, model.id)) {
+      resetModelTreeToDefault(model);
+      return;
+    }
+
+    // 只重置变换，保留当前可见性；随后由本章配置一次写到位，避免「先显示再隐藏」闪一下
+    resetModelTreeTransformsOnly(model);
 
     const applied = new Set<string>();
     const tree = getModelHierarchy(model.id);
@@ -3506,11 +4202,17 @@ export function useMovieEditor() {
       return;
     }
 
+    // 只重置位姿，不改 visible/描边；可见性由下方本章 cfg 一次写入，避免切章闪一下
+    resetModelTreeTransformsOnly(m);
+
     if (hasRootEdits && raw) {
       const cfg = getModelConfig(raw);
       applyModelVisualOnly(m, root, cfg, skipOutline);
       if (cfg.animation && cfg.animConfig?.segments?.length) {
-        const liveSegs = shouldUseLiveAnimSegments(m.id, null) ? animSegments : undefined;
+        const liveSegs =
+          !(_chAnimLock && !chAnimWallclock) && shouldUseLiveAnimSegments(m.id, null)
+            ? animSegments
+            : undefined;
         applyElapsedAnimToObject(root, cfg, effectiveElapsed, liveSegs);
       } else {
         applyStaticModelTransform(m, root, cfg, true);
@@ -3538,7 +4240,12 @@ export function useMovieEditor() {
         nodeCfg &&
         modelHasEditsForConfig(getModelConfig(nodeCfg as ModelConfig), def, m, displayId);
       if (!nodeEdited) {
-        resetObject3DToDefaultState(m, child, false);
+        // 未编辑子节点：只回默认变换。可见性已由 applyChapterVisibilityOnly 写好，
+        // 切勿在此强制 visible=true（skipOutline 路径曾因此把「本章隐藏」冲掉一帧）。
+        resetObject3DTransformToDefault(m, child, false);
+        if (!skipOutline) {
+          rebuildOutlineForObject(m, child, def, { touchVisibility: false });
+        }
       }
     });
 
@@ -3551,12 +4258,15 @@ export function useMovieEditor() {
         seenDisplayIds.add(displayId);
         const merged = { ...def, ...nodeCfg } as ModelConfig;
         if (!modelHasEditsForConfig(merged, def, m, displayId)) continue;
-        const liveSegs = shouldUseLiveAnimSegments(m.id, displayId) ? animSegments : undefined;
+        const liveSegs =
+          !(_chAnimLock && !chAnimWallclock) && shouldUseLiveAnimSegments(m.id, displayId)
+            ? animSegments
+            : undefined;
         for (const obj of collectObjectsForNodeId(root, displayId)) {
           applyModelVisualOnly(m, obj, merged, skipOutline);
-            if (merged.animation && merged.animConfig?.segments?.length) {
-              applyElapsedAnimToObject(obj, merged, effectiveElapsed, liveSegs);
-            } else {
+          if (merged.animation && merged.animConfig?.segments?.length) {
+            applyElapsedAnimToObject(obj, merged, effectiveElapsed, liveSegs);
+          } else {
             applyStaticModelTransform(m, obj, merged, false);
           }
         }
@@ -3564,18 +4274,97 @@ export function useMovieEditor() {
     }
   }
 
+  /** 先统一写入本章可见性（不碰位姿），再算变换/描边，避免切章时「先显示再隐藏」闪一下 */
+  function applyChapterVisibilityOnly(ch: Chapter) {
+    const def = createDefaultModelConfig();
+    let anyHidden = false;
+    for (const m of models.value) {
+      const root = meshes.get(m.id);
+      if (!root) continue;
+      const raw = ch.modelConfigs?.[m.id] as ModelConfig | undefined;
+      const hasRootEdits = chapterRootModelHasEdits(ch, m.id);
+      const hasNodeEdits = chapterNodeConfigsHaveEdits(ch, m.id);
+
+      if (!hasRootEdits && !hasNodeEdits) {
+        root.visible = true;
+        traverseObject3DSafely(root, child => {
+          if (child === root || !child.userData?.nodeId) return;
+          if (
+            child.userData?.isEdgeLine ||
+            child.userData?.isSelectionHelper ||
+            child.userData?.isOutlineShell ||
+            child.userData?.isBodyHighlightOverlay
+          ) {
+            return;
+          }
+          child.visible = true;
+        });
+        continue;
+      }
+
+      if (hasRootEdits && raw) {
+        root.visible = getModelConfig(raw).visible !== false;
+      } else {
+        root.visible = true;
+      }
+      if (!root.visible) {
+        anyHidden = true;
+        removeVisualOverlaysForOwner(root, `root:${m.id}`);
+      }
+
+      const tree = getModelHierarchy(m.id);
+      traverseObject3DSafely(root, child => {
+        if (child === root || !child.userData?.nodeId) return;
+        if (
+          child.userData?.isEdgeLine ||
+          child.userData?.isSelectionHelper ||
+          child.userData?.isOutlineShell ||
+          child.userData?.isBodyHighlightOverlay
+        ) {
+          return;
+        }
+        const nodeId = child.userData.nodeId as string;
+        const displayId = resolveDisplayNodeId(tree, nodeId);
+        const nodeCfg = raw?.nodeConfigs?.[displayId] ?? raw?.nodeConfigs?.[nodeId];
+        if (
+          nodeCfg &&
+          modelHasEditsForConfig(getModelConfig(nodeCfg as ModelConfig), def, m, displayId)
+        ) {
+          child.visible = getModelConfig(nodeCfg as ModelConfig).visible !== false;
+        } else {
+          child.visible = true;
+        }
+        if (!child.visible) {
+          anyHidden = true;
+          removeVisualOverlaysForOwner(root, (child.userData?.nodeId as string) || displayId);
+        }
+      });
+    }
+    if (anyHidden) {
+      syncModelConfigOutlinePass();
+      invalidatePickMeshCache();
+    }
+  }
+
   /** 统一应用节点下的模型可见性、材质效果与变换（含动画进度）；仅在切换节点/播放时调用 */
   function applyChapterModelState(ch: Chapter, elapsedSec = 0, options?: ApplyChapterModelStateOptions) {
+    // 可见性必须先于位姿/描边写完，保证同一帧内不会出现错误的显示态
+    applyChapterVisibilityOnly(ch);
     models.value.forEach(m => applySingleModelChapterState(ch, m, elapsedSec, options));
+    // 位姿/描边回默认时会短暂把 visible 写回 true，收尾再盖一次本章可见性
+    applyChapterVisibilityOnly(ch);
     if (!options?.skipOverlaySync) {
       invalidatePickMeshCache();
       syncTransformVisualOverlays();
     }
     invalidateSceneModelCenterCache();
+    if (options?.immediatePresent) {
+      renderViewportFrame();
+    }
   }
 
   function applyChapterModelVisibility(ch: Chapter) {
-    applyChapterModelState(ch, 0);
+    applyChapterVisibilityOnly(ch);
   }
 
   function getChapterCameraTransitionSec(ch: Chapter) {
@@ -3586,6 +4375,12 @@ export function useMovieEditor() {
   type ChapterCameraSwitchMode = "edit" | "playback" | "auto";
 
   function getChapterCameraSwitchDuration(ch: Chapter, _mode?: ChapterCameraSwitchMode) {
+    if (_mode === "playback" && (viewOnly.value || isPreviewMode.value)) {
+      // 展示页播放中切章：几乎瞬切运镜，避免「停约 1 秒」体感。
+      if (presentationPlaybackSession.intent === "play" && !presentationUserWantsPaused) {
+        return Math.min(0.08, CHAPTER_CAMERA_SWITCH_MIN_SEC);
+      }
+    }
     if (_mode === "playback" && !viewOnly.value && !isPreviewMode.value) {
       return 0.5;
     }
@@ -3615,7 +4410,9 @@ export function useMovieEditor() {
     if (children.length > 0) {
       const video = videoEl.value;
       if (video) {
-        const atTime = children.find(child => isChapterInPlaybackRange(child, video.currentTime));
+        const atTime = children.find(child =>
+          isChapterInPlaybackRange(child, resolvePresentationPlaybackTime(video))
+        );
         if (atTime) return atTime;
       }
       return children[0];
@@ -3653,68 +4450,82 @@ export function useMovieEditor() {
 
   function shouldSyncProgressFromVideo(v: HTMLVideoElement, seekLocked: boolean): boolean {
     if (v.seeking) return false;
-    if (!seekLocked) return true;
-    // seek 锁定期：video 已在走时必须跟 currentTime，否则会一直停在点击位置。
-    if (!(viewOnly.value || isPreviewMode.value)) return false;
-    return !v.paused && !v.ended;
+    if (viewOnly.value || isPreviewMode.value) {
+      if (
+        presentationPlaybackSession.phase === "seeking" ||
+        presentationSeekTargetTime != null
+      ) {
+        const target = presentationSeekTargetTime ?? presentationPlaybackSession.targetTime;
+        if (!canAdoptPresentationVideoTime(v, target)) return false;
+        presentationSeekTargetTime = null;
+      }
+      // Pause intent must never follow a free-running media clock (stale play race).
+      if (presentationPlaybackSession.intent === "pause" && !v.paused) return false;
+      // 无锚点时也拒绝「突然掉回片头」覆盖当前进度
+      if (isPresentationSeekRollback(v.currentTime, currentTime.value)) return false;
+      // 已在播：不要被 transition 锁挡住进度条（await seek 常卡 2~5 秒）
+      if (seekLocked && v.paused) return false;
+      return true;
+    }
+    if (seekLocked) return false;
+    return true;
+  }
+
+  function commitPresentationSeekTarget(
+    target: number,
+    video?: HTMLVideoElement | null
+  ): number {
+    const v = video ?? videoEl.value;
+    presentationSeekTargetTime = target;
+    currentTime.value = target;
+    if (v && isSeekNearTarget(v, target)) {
+      presentationSeekTargetTime = null;
+      currentTime.value = v.currentTime;
+      return v.currentTime;
+    }
+    return target;
   }
 
   function getPresentationChapterAtVideoTime(t: number): Chapter | null {
-    if (viewOnly.value || isPreviewMode.value) {
-      const nav = getPresentationNavChapters();
-      const idx = findPresentationNavIndexByTime(t);
-      return idx >= 0 ? nav[idx] : null;
-    }
-    return getPlaybackChapterAtTime(t);
+    // 编辑/预览/展示统一：按导航时间轴取章节，再 resolvePlayable，避免两边套不同 modelConfigs
+    const nav = getPresentationNavChapters();
+    const idx = findPresentationNavIndexByTime(t);
+    return idx >= 0 ? nav[idx] : null;
   }
 
   function getActivePresentationNavIndex(): number {
     const nav = getPresentationNavChapters();
     if (nav.length === 0) return -1;
 
-    if (isPresentationSeekLocked()) {
-      if (presentationNavIndex.value >= 0 && presentationNavIndex.value < nav.length) {
-        return presentationNavIndex.value;
-      }
-      if (presentationUiChapterId.value) {
-        const idx = nav.findIndex(ch => ch.id === presentationUiChapterId.value);
-        if (idx >= 0) return idx;
-      }
-    }
-
-    const video = videoEl.value;
-    const t = video?.currentTime ?? currentTime.value;
-    const timeIdx = findPresentationNavIndexByTime(t);
-
-    if (presentationNavIndex.value >= 0 && presentationNavIndex.value < nav.length) {
-      const uiChapter = nav[presentationNavIndex.value];
-      if (isPresentationNavChapterAtTime(uiChapter, t)) {
-        return presentationNavIndex.value;
-      }
-      // seek 失败或 ended 后 currentTime 回到 0 时，仍以 UI 当前节点为准
-      if (timeIdx >= 0 && timeIdx !== presentationNavIndex.value) {
-        const timeChapter = nav[timeIdx];
-        if (
-          t <= CHAPTER_TIME_EPS &&
-          uiChapter.startTime > CHAPTER_TIME_EPS &&
-          !isPresentationNavChapterAtTime(timeChapter, t)
-        ) {
-          return presentationNavIndex.value;
+    // Session is the sole source of truth for L/R stepping. Chapter changes while playing
+    // come from commandPresentationPlayback / maybeAutoAdvance — never from lagged media.
+    if (presentationPlaybackSession.navChapterId) {
+      let sessionIdx = nav.findIndex(
+        ch => ch.id === presentationPlaybackSession.navChapterId
+      );
+      // Session may hold a playable child id; map back to its nav parent.
+      if (sessionIdx < 0) {
+        const raw = chapters.value.find(
+          ch => ch.id === presentationPlaybackSession.navChapterId
+        );
+        if (raw) {
+          const navChapter = resolvePresentationNavChapter(raw);
+          sessionIdx = nav.findIndex(ch => ch.id === navChapter.id);
         }
       }
+      if (sessionIdx >= 0) return sessionIdx;
     }
-
-    if (timeIdx >= 0) return timeIdx;
 
     if (presentationNavIndex.value >= 0 && presentationNavIndex.value < nav.length) {
       return presentationNavIndex.value;
     }
-
     if (presentationUiChapterId.value) {
       const idx = nav.findIndex(ch => ch.id === presentationUiChapterId.value);
       if (idx >= 0) return idx;
     }
-
+    const timelineT = resolvePresentationPlaybackTime();
+    const timeIdx = findPresentationNavIndexByTime(timelineT);
+    if (timeIdx >= 0) return timeIdx;
     return 0;
   }
 
@@ -3723,56 +4534,238 @@ export function useMovieEditor() {
     return getPresentationNavChapters().findIndex(item => item.id === navChapter.id);
   }
 
-  /** 展示/预览：播放中跟视频时间；仅在 seek/切换过程中锁定目标节点 */
-  function resolvePresentationPlaybackChapter(video?: HTMLVideoElement | null): Chapter | null {
+  /** 展示/预览/编辑播放：统一解析「此刻该套哪一章」（可播放节点） */
+  function resolveVideoPlaybackChapter(video?: HTMLVideoElement | null): Chapter | null {
     const v = video ?? videoEl.value;
-    if (!v) return chapterPlayTarget.value;
+    if (!v) {
+      return chapterBelongsToActiveVideo(chapterPlayTarget.value) ? chapterPlayTarget.value : null;
+    }
+    const timelineT = resolvePresentationPlaybackTime(v);
 
+    // 切章/seek 锁定期：编辑态也必须钉住 playTarget（且必须属于当前视频）。
     if (isPresentationSeekLocked()) {
-      return (
-        chapterPlayTarget.value ??
-        (() => {
-          const nav = getPresentationChapterAtVideoTime(v.currentTime);
-          return nav ? resolvePlayableChapterForPresentation(nav) : null;
-        })()
-      );
+      if (chapterBelongsToActiveVideo(chapterPlayTarget.value)) {
+        return chapterPlayTarget.value;
+      }
+      const nav = getPresentationChapterAtVideoTime(timelineT);
+      return nav ? resolvePlayableChapterForPresentation(nav) : null;
     }
 
-    if (viewOnly.value || isPreviewMode.value) {
-      const navChapter =
-        getPresentationChapterAtVideoTime(v.currentTime) ??
-        (presentationUiChapterId.value
-          ? (() => {
-              const uiChapter = chapters.value.find(ch => ch.id === presentationUiChapterId.value);
-              return uiChapter ? resolvePresentationNavChapter(uiChapter) : null;
-            })()
-          : null);
-      if (navChapter) return resolvePlayableChapterForPresentation(navChapter);
-      return chapterPlayTarget.value;
+    const pinned = chapterBelongsToActiveVideo(chapterPlayTarget.value)
+      ? chapterPlayTarget.value
+      : null;
+    // 仅当时间仍早于目标章（seek 未到位）时钉住；已落入或已越过则跟视频走
+    if (
+      pinned &&
+      !isChapterInPlaybackRange(pinned, timelineT) &&
+      timelineT < pinned.startTime - CHAPTER_TIME_EPS
+    ) {
+      return pinned;
     }
 
-    if (chapterPlayTarget.value) return chapterPlayTarget.value;
-    return getPresentationChapterAtVideoTime(v.currentTime);
+    const navChapter =
+      getPresentationChapterAtVideoTime(timelineT) ??
+      ((viewOnly.value || isPreviewMode.value) && presentationUiChapterId.value
+        ? (() => {
+            const uiChapter = chapters.value.find(ch => ch.id === presentationUiChapterId.value);
+            return uiChapter ? resolvePresentationNavChapter(uiChapter) : null;
+          })()
+        : null);
+
+    if (navChapter) {
+      const playable = resolvePlayableChapterForPresentation(navChapter);
+      if (chapterBelongsToActiveVideo(playable)) return playable;
+    }
+
+    if (pinned && isChapterInPlaybackRange(pinned, timelineT)) {
+      return pinned;
+    }
+    // 编辑态超出区间不残留 playTarget（避免间隙套结束位移）
+    if (!viewOnly.value && !isPreviewMode.value) return null;
+    return pinned;
+  }
+
+  function chapterBelongsToActiveVideo(ch: Chapter | null | undefined): ch is Chapter {
+    if (!ch) return false;
+    const activeVid = activeVideoId.value;
+    if (!activeVid) return true;
+    return !ch.parentId || ch.parentId === activeVid;
+  }
+
+  function resolvePresentationPlaybackChapter(video?: HTMLVideoElement | null): Chapter | null {
+    return resolveVideoPlaybackChapter(video);
   }
 
   function getPresentationAnimElapsed(video: HTMLVideoElement, ch?: Chapter | null): number {
     const chapter = ch ?? resolvePresentationPlaybackChapter(video);
     if (!chapter) return 0;
-    return getChapterAnimElapsed(chapter, video.currentTime);
+    return getChapterAnimElapsed(chapter, resolvePresentationPlaybackTime(video));
   }
 
   function canAutoAdvancePresentationChapter(navChapter: Chapter, v: HTMLVideoElement): boolean {
     if (presentationChapterTransition || videoChapterSyncPaused || v.seeking) return false;
     if (performance.now() < presentationChapterCooldownUntil) return false;
-    if (v.currentTime > navChapter.endTime + CHAPTER_END_EPS) return false;
-    if (!isPresentationNavChapterAtTime(navChapter, v.currentTime) && v.currentTime < navChapter.endTime - CHAPTER_END_EPS) {
+    const t = resolvePresentationPlaybackTime(v);
+    if (t > navChapter.endTime + CHAPTER_END_EPS) return false;
+    if (!isPresentationNavChapterAtTime(navChapter, t) && t < navChapter.endTime - CHAPTER_END_EPS) {
       return false;
     }
     const span = navChapter.endTime - navChapter.startTime;
     if (span < MIN_CHAPTER_DURATION - CHAPTER_TIME_EPS) return false;
     const minPlayed = Math.min(0.8, span * 0.3);
-    if (v.currentTime < navChapter.startTime + minPlayed) return false;
-    return v.currentTime >= navChapter.endTime - CHAPTER_END_EPS;
+    if (t < navChapter.startTime + minPlayed) return false;
+    return t >= navChapter.endTime - CHAPTER_END_EPS;
+  }
+
+  /**
+   * 播放意图未手动暂停时：片尾/末章结束后回到第一导航章继续播（展示页循环）。
+   */
+  function loopPresentationPlaybackFromStart(): boolean {
+    if (!viewOnly.value && !isPreviewMode.value) return false;
+    if (presentationPlaybackSession.intent !== "play" || presentationUserWantsPaused) {
+      return false;
+    }
+    // 切章 seek 尚未落地时禁止片尾循环，否则会从旧时钟误跳回第一章。
+    if (presentationSeekTargetTime != null) {
+      const dur =
+        (videoEl.value && Number.isFinite(videoEl.value.duration) && videoEl.value.duration > 0
+          ? videoEl.value.duration
+          : duration.value) || 0;
+      if (dur > 0 && presentationSeekTargetTime < dur - Math.max(0.5, CHAPTER_END_EPS * 4)) {
+        return true;
+      }
+    }
+    const nav = getPresentationNavChapters();
+    const first = nav[0] ?? getPresentationStartChapter();
+    if (!first) return false;
+    const navChapter = resolvePresentationNavChapter(first);
+    const start = navChapter.startTime;
+    const now = performance.now();
+    // 已有指向片头的 seek：短时间内不重复发；超时则重发，防止 seeking 永久卡住。
+    if (
+      presentationPlaybackSession.phase === "seeking" &&
+      Math.abs(presentationPlaybackSession.targetTime - start) < 0.55 &&
+      now - presentationLoopCommandAt < 2200
+    ) {
+      return true;
+    }
+    presentationLoopCommandAt = now;
+    commandPresentationPlayback({
+      targetTime: start,
+      intent: "play",
+      navChapter,
+      autoAdvance: true
+    });
+    return true;
+  }
+
+  /** 播放意图仍在，但媒体意外 pause/blocked：节流后续播，避免多轮循环后卡死。 */
+  async function recoverPresentationPlaybackAfterUnexpectedPause() {
+    if (!viewOnly.value && !isPreviewMode.value) return;
+    if (presentationPlaybackSession.intent !== "play" || presentationUserWantsPaused) return;
+    const video = videoEl.value;
+    if (!video) return;
+    const now = performance.now();
+    if (now - presentationBlockedResumeAt < 450) return;
+    presentationBlockedResumeAt = now;
+
+    if (video.ended || isPresentationAtMediaEnd(video)) {
+      if (!isStalePresentationMediaEnd(video)) {
+        loopPresentationPlaybackFromStart();
+      }
+      return;
+    }
+    if (!video.paused) {
+      presentationPlaybackSession.phase = "playing";
+      return;
+    }
+
+    const target = presentationPlaybackSession.targetTime;
+    // 先确保离开 ended / 落到目标点，再 play（移动端片尾后最稳）。
+    if (!isSeekNearTarget(video, target)) {
+      try {
+        video.currentTime = target;
+      } catch {
+        /* ignore */
+      }
+    }
+
+    try {
+      video.muted = true;
+      await video.play();
+    } catch {
+      /* fall through */
+    }
+    if (!isCurrentPresentationPlayIntent()) return;
+    if (!video.paused && !video.ended) {
+      presentationPlaybackSession.phase = "playing";
+      presentationExpectPlaying = true;
+      isPlaying.value = true;
+      if (canAdoptPresentationVideoTime(video, target)) {
+        presentationSeekTargetTime = null;
+        presentationPlaybackSession.committedTime = video.currentTime;
+      }
+      return;
+    }
+    // play() 仍失败：用当前目标重发命令（含 seek），比永久 blocked 更可恢复。
+    const navChapter = presentationPlaybackSession.navChapterId
+      ? getPresentationNavChapters().find(ch => ch.id === presentationPlaybackSession.navChapterId) ??
+        null
+      : getPresentationChapterAtVideoTime(presentationPlaybackSession.targetTime);
+    commandPresentationPlayback({
+      targetTime: presentationPlaybackSession.targetTime,
+      intent: "play",
+      navChapter,
+      autoAdvance: true
+    });
+  }
+
+  function isCurrentPresentationPlayIntent() {
+    return (
+      presentationPlaybackSession.intent === "play" &&
+      !presentationUserWantsPaused
+    );
+  }
+
+  function maybeAutoAdvancePresentation(v: HTMLVideoElement): boolean {
+    if (!viewOnly.value && !isPreviewMode.value) return false;
+    if (
+      presentationPlaybackSession.intent !== "play" ||
+      !presentationPlaybackSession.autoAdvance ||
+      presentationPlaybackSession.phase === "seeking" ||
+      presentationSeekTargetTime != null ||
+      v.paused ||
+      v.ended
+    ) {
+      return false;
+    }
+    const nav = getPresentationNavChapters();
+    if (nav.length === 0) return false;
+    const currentIdx = presentationPlaybackSession.navChapterId
+      ? nav.findIndex(ch => ch.id === presentationPlaybackSession.navChapterId)
+      : findPresentationNavIndexByTime(presentationPlaybackSession.committedTime);
+    if (currentIdx < 0) return false;
+    const current = nav[currentIdx];
+    // 末章结束 → 回到第一章，保持循环直到用户手动暂停。
+    const next = nav[currentIdx + 1] ?? nav[0];
+    if (!next) return false;
+    const t = Math.max(presentationPlaybackSession.committedTime, v.currentTime);
+    // Require a real end-of-chapter window. A stale committedTime from before the latest
+    // seek (e.g. still at 12s after jumping to chapter start) must not skip ahead.
+    if (t < current.endTime - CHAPTER_END_EPS) return false;
+    if (t > current.endTime + Math.max(CHAPTER_END_EPS, 0.35)) return false;
+    if (t < current.startTime - CHAPTER_TIME_EPS) return false;
+    // 单章场景：末尾窗口内回到起点，避免与紧接着的 seek 目标相同而空转。
+    if (next.id === current.id && Math.abs(t - next.startTime) < CHAPTER_TIME_EPS) {
+      return false;
+    }
+    commandPresentationPlayback({
+      targetTime: next.startTime,
+      intent: "play",
+      navChapter: next,
+      autoAdvance: true
+    });
+    return true;
   }
 
   function canPresentationPrevChapter(): boolean {
@@ -3790,38 +4783,77 @@ export function useMovieEditor() {
     return idx >= 0 && idx < nav.length - 1;
   }
 
+  function resolvePresentationPlaybackTime(v?: HTMLVideoElement | null): number {
+    if (viewOnly.value || isPreviewMode.value) {
+      return presentationDisplayTime.value;
+    }
+    const video = v ?? videoEl.value;
+    if (isPresentationSeekLocked()) {
+      return presentationSeekTargetTime ?? currentTime.value;
+    }
+    if (presentationSeekTargetTime != null) {
+      if (
+        video &&
+        isSeekNearTarget(video, presentationSeekTargetTime) &&
+        !isPresentationSeekRollback(video.currentTime, presentationSeekTargetTime)
+      ) {
+        presentationSeekTargetTime = null;
+        return video.currentTime;
+      }
+      return presentationSeekTargetTime;
+    }
+    if (video && Number.isFinite(video.currentTime)) {
+      // 与底部进度条同源：优先 currentTime（seek 锁/续播时可能比 video.currentTime 更准）
+      if (viewOnly.value || isPreviewMode.value) {
+        if (isPresentationSeekRollback(video.currentTime, currentTime.value)) {
+          return currentTime.value;
+        }
+        return currentTime.value;
+      }
+      return video.currentTime;
+    }
+    return currentTime.value;
+  }
+
   function getActiveChapterIdForUi(): string | null {
     if (viewOnly.value || isPreviewMode.value) {
-      if (isPresentationSeekLocked()) {
-        if (presentationUiChapterId.value) return presentationUiChapterId.value;
-        if (chapterPlayTarget.value) {
-          const nav = resolvePresentationNavChapter(chapterPlayTarget.value);
-          return nav.id;
-        }
+      if (presentationCurrentNavChapterId.value) {
+        return presentationCurrentNavChapterId.value;
       }
+      const nav = getPresentationNavChapters();
       const video = videoEl.value;
-      if (video) {
-        const playback = getPresentationChapterAtVideoTime(video.currentTime);
-        if (playback && isPresentationNavChapterAtTime(playback, video.currentTime)) {
-          return playback.id;
-        }
+      const paused = !video || video.paused || video.ended;
+      // 暂停或 seek 锁 / 手动导航：导航索引优先，避免 video 落点滞后把列表拉回旧章
+      if (
+        (paused ||
+          isPresentationSeekLocked() ||
+          performance.now() < presentationManualNavUntil) &&
+        presentationNavIndex.value >= 0 &&
+        presentationNavIndex.value < nav.length
+      ) {
+        return nav[presentationNavIndex.value].id;
       }
       if (presentationUiChapterId.value) return presentationUiChapterId.value;
-      if (chapterPlayTarget.value) {
-        return resolvePresentationNavChapter(chapterPlayTarget.value).id;
-      }
-    } else {
-      // 编辑态播放中：以视频时间对应的动画节点为准
-      const video = videoEl.value;
-      if ((video && !video.paused) || isPlaying.value) {
-        const ci = findChIdx(currentTime.value);
-        if (ci >= 0) return timelineChapters.value[ci]?.id ?? null;
-      }
-      if (selectedChapterId.value) return selectedChapterId.value;
+
+      const timelineT = resolvePresentationPlaybackTime();
+      const playback = getPresentationChapterAtVideoTime(timelineT);
+      if (playback) return playback.id;
       if (selectedNodeId.value) {
         const node = getNodeById(nodes.value, selectedNodeId.value);
         if (node && isAnimationNode(node)) return node.id;
       }
+      if (selectedChapterId.value) return selectedChapterId.value;
+      if (chapterPlayTarget.value) {
+        return resolvePresentationNavChapter(chapterPlayTarget.value).id;
+      }
+    } else {
+      // 编辑态：树高亮只跟用户选中，不因 currentTime=0 默认点亮第一章
+      if (selectedNodeId.value) {
+        const node = getNodeById(nodes.value, selectedNodeId.value);
+        if (node && isAnimationNode(node)) return node.id;
+      }
+      if (selectedChapterId.value) return selectedChapterId.value;
+      return null;
     }
     if (selectedChapterId.value) return selectedChapterId.value;
     const ci = currentChapterIdx.value;
@@ -3829,22 +4861,400 @@ export function useMovieEditor() {
     return null;
   }
 
-  function syncPresentationPlaybackFromVideo(v: HTMLVideoElement) {
+  /** 展示/预览：按统一时间轴同步列表/进度条/左右按钮高亮 */
+  function syncPresentationUiFromTimeline(atTime?: number) {
     if (!viewOnly.value && !isPreviewMode.value) return;
-    if (isPresentationSeekLocked()) return;
+    const nav = getPresentationNavChapters();
+    const timelineT = atTime ?? resolvePresentationPlaybackTime();
 
-    const navChapter = getPresentationChapterAtVideoTime(v.currentTime);
+    // Session is the source of truth while seeking / after manual nav.
+    if (presentationPlaybackSession.navChapterId) {
+      const sessionChapter = nav.find(ch => ch.id === presentationPlaybackSession.navChapterId);
+      if (sessionChapter) {
+        if (
+          presentationPlaybackSession.phase === "seeking" ||
+          presentationPlaybackSession.intent === "pause" ||
+          performance.now() < presentationManualNavUntil ||
+          isPresentationSeekLocked()
+        ) {
+          syncPresentationUiFromChapter(sessionChapter, timelineT);
+          return;
+        }
+      }
+    }
+
+    const navChapter = getPresentationChapterAtVideoTime(timelineT);
+    if (!navChapter) return;
+    syncPresentationUiFromChapter(navChapter, timelineT);
+  }
+
+  /** 展示/预览：同步应用目标章（不等待视频 seek），保证左右键/进度条点击立即有反馈 */
+  function applyPresentationChapterAtTime(target: number, navChapter?: Chapter | null) {
+    if (!viewOnly.value && !isPreviewMode.value) return;
+    const navForTarget = navChapter ?? getPresentationChapterAtVideoTime(target);
+    if (!navForTarget) return;
+
+    commitPresentationSeekTarget(target);
+    const playableForTarget = resolvePlayableChapterForPresentationAtTime(navForTarget, target);
+    chapterPlayTarget.value = playableForTarget;
+    lastPresentationAutoSwitchChapterId = playableForTarget.id;
+    syncPresentationUiFromChapter(navForTarget, target);
+    applyChapterCameraForNav(navForTarget, "playback");
+    const keepPlaying =
+      presentationPlaybackSession.intent === "play" && !presentationUserWantsPaused;
+    // 播放中切章：跳过昂贵描边重建，优先立刻出画面与续播。
+    syncChapterVisualState(playableForTarget, Math.max(0, target - playableForTarget.startTime), {
+      skipOutlineRebuild: keepPlaying,
+      skipOverlaySync: false,
+      immediatePresent: true
+    });
+    if (!keepPlaying && chapterNeedsOutlineRebuild(playableForTarget)) {
+      refreshChapterOutlines(playableForTarget);
+    }
+    renderViewportFrame();
+  }
+
+  type PresentationPlaybackCommand = {
+    targetTime: number;
+    intent: PresentationPlaybackIntent;
+    navChapter?: Chapter | null;
+    autoAdvance?: boolean;
+  };
+
+  function resetPresentationPlaybackSession(time = 0) {
+    const requestId = presentationPlaybackSession.requestId + 1;
+    Object.assign(presentationPlaybackSession, {
+      phase: "paused" as PresentationPlaybackPhase,
+      intent: "pause" as PresentationPlaybackIntent,
+      committedTime: time,
+      targetTime: time,
+      navChapterId: null,
+      playableChapterId: null,
+      requestId,
+      autoAdvance: false
+    });
+    presentationSeekTargetTime = null;
+    presentationExpectPlaying = false;
+    presentationUserWantsPaused = true;
+    presentationChapterTransition = false;
+    videoChapterSyncPaused = false;
+    presentationEndedUiSynced = false;
+    clearPresentationResumeTimer();
+  }
+
+  /**
+   * 展示态唯一媒体副作用入口。命令先原子提交 target/intent，再执行 seek/play/pause；
+   * requestId 令后发命令取消所有较早的异步收尾。
+   */
+  function commandPresentationPlayback(command: PresentationPlaybackCommand) {
+    if (!viewOnly.value && !isPreviewMode.value) return;
+    const video = videoEl.value;
+    if (!video) return;
+
+    const targetTime = clampVideoTime(command.targetTime, video);
+    const navChapter =
+      command.navChapter ??
+      getPresentationChapterAtVideoTime(targetTime) ??
+      (presentationPlaybackSession.navChapterId
+        ? getPresentationNavChapters().find(
+            ch => ch.id === presentationPlaybackSession.navChapterId
+          ) ?? null
+        : null);
+    const playableChapter = navChapter
+      ? resolvePlayableChapterForPresentationAtTime(navChapter, targetTime)
+      : null;
+    const requestId = presentationPlaybackSession.requestId + 1;
+
+    Object.assign(presentationPlaybackSession, {
+      phase: "seeking" as PresentationPlaybackPhase,
+      intent: command.intent,
+      targetTime,
+      committedTime: targetTime,
+      navChapterId: navChapter?.id ?? null,
+      playableChapterId: playableChapter?.id ?? null,
+      requestId,
+      autoAdvance: command.autoAdvance ?? command.intent === "play"
+    });
+
+    presentationSeekTargetTime = targetTime;
+    presentationExpectPlaying = command.intent === "play";
+    presentationUserWantsPaused = command.intent === "pause";
+    chapterAutoNext.value = presentationPlaybackSession.autoAdvance;
+    clearPresentationResumeTimer();
+    // 覆盖常见移动端 seek 耗时，防止切章过程中旧时钟触发片尾循环。
+    presentationManualNavUntil = performance.now() + 900;
+    presentationChapterCooldownUntil = performance.now() + 220;
+
+    if (navChapter) applyPresentationChapterAtTime(targetTime, navChapter);
+    void runPresentationPlaybackEffect(requestId, video, targetTime, command.intent);
+  }
+
+  async function runPresentationPlaybackEffect(
+    requestId: number,
+    video: HTMLVideoElement,
+    targetTime: number,
+    intent: PresentationPlaybackIntent
+  ) {
+    presentationChapterTransition = true;
+    videoChapterSyncPaused = true;
+
+    const isCurrentRequest = () => requestId === presentationPlaybackSession.requestId;
+    const abandonIfStale = () => {
+      if (isCurrentRequest()) return false;
+      if (presentationPlaybackSession.intent === "pause" && !video.paused) {
+        video.pause();
+      }
+      return true;
+    };
+    const releaseMediaLocks = () => {
+      if (!isCurrentRequest()) return;
+      presentationChapterTransition = false;
+      videoChapterSyncPaused = false;
+    };
+
+    const finishPlayState = () => {
+      if (!isCurrentRequest()) return;
+      const mediaIsUsable =
+        canAdoptPresentationVideoTime(video, targetTime) || isSeekNearTarget(video, targetTime);
+      presentationPlaybackSession.committedTime = mediaIsUsable ? video.currentTime : targetTime;
+      if (intent === "pause") {
+        presentationPlaybackSession.phase = "paused";
+        presentationSeekTargetTime = mediaIsUsable ? null : targetTime;
+        syncPresentationUiFromTimeline(targetTime);
+        return;
+      }
+      if (!video.paused && !video.ended) {
+        presentationPlaybackSession.phase = "playing";
+        if (mediaIsUsable) {
+          presentationSeekTargetTime = null;
+          presentationPlaybackSession.committedTime = video.currentTime;
+        } else {
+          presentationSeekTargetTime = targetTime;
+        }
+        stopChapterAnimation();
+        ensureVideoSyncedChapterAnimation();
+        syncCurrentChapterAnimationFromVideo();
+        return;
+      }
+      presentationPlaybackSession.phase = "blocked";
+      presentationSeekTargetTime = targetTime;
+      void recoverPresentationPlaybackAfterUnexpectedPause();
+    };
+
+    try {
+      const atEofForPlay =
+        intent === "play" && (video.ended || isPresentationAtMediaEnd(video));
+      const needsSeek = !isSeekNearTarget(video, targetTime);
+
+      if (intent === "pause") {
+        video.pause();
+      } else if (viewOnly.value || isPreviewMode.value) {
+        video.muted = true;
+      }
+
+      // 同源视频通常已有 metadata；不要为切章干等最多 800ms。
+      if (video.readyState < HTMLMediaElement.HAVE_METADATA) {
+        await waitForVideoReady(400);
+        if (abandonIfStale()) return;
+      }
+
+      if (intent === "play") {
+        // 关键点：手势栈内立刻 play + seek，不 await seeked（那会造出约 1 秒停顿）。
+        let playPromise: Promise<void> | null = null;
+        try {
+          if (!atEofForPlay) {
+            playPromise = video.play();
+            void playPromise.catch(() => undefined);
+          }
+        } catch {
+          playPromise = null;
+        }
+        if (needsSeek) {
+          try {
+            video.currentTime = targetTime;
+          } catch {
+            /* keep optimistic target */
+          }
+        }
+        // 立刻放锁 + 乐观 playing，列表/左右键切换立即有反馈。
+        presentationPlaybackSession.phase = "playing";
+        presentationPlaybackSession.committedTime = targetTime;
+        presentationExpectPlaying = true;
+        isPlaying.value = true;
+        releaseMediaLocks();
+
+        // 后台补齐：seek 落点后再确认 play，绝不挡住交互。
+        void (async () => {
+          if (abandonIfStale()) return;
+          if (needsSeek) {
+            await waitForPresentationSeekSettle(video, targetTime, requestId, 280);
+            if (abandonIfStale()) return;
+          }
+          try {
+            if (playPromise) await playPromise.catch(() => undefined);
+            if (abandonIfStale()) return;
+            if (viewOnly.value || isPreviewMode.value) video.muted = true;
+            if (video.paused || video.ended) await video.play();
+          } catch {
+            if (!isCurrentRequest()) return;
+            presentationPlaybackSession.phase = "blocked";
+            showPresentationPlaybackHint();
+            void recoverPresentationPlaybackAfterUnexpectedPause();
+            return;
+          }
+          finishPlayState();
+        })();
+        return;
+      }
+
+      if (needsSeek) {
+        try {
+          video.currentTime = targetTime;
+        } catch {
+          /* ignore */
+        }
+      }
+      releaseMediaLocks();
+      if (needsSeek) {
+        await waitForPresentationSeekSettle(video, targetTime, requestId, 280);
+        if (abandonIfStale()) return;
+      }
+      video.pause();
+      finishPlayState();
+    } finally {
+      releaseMediaLocks();
+    }
+  }
+
+  function waitForPresentationSeekSettle(
+    video: HTMLVideoElement,
+    targetTime: number,
+    requestId: number,
+    timeoutMs = 700
+  ): Promise<void> {
+    if (isSeekNearTarget(video, targetTime)) return Promise.resolve();
+    return new Promise(resolve => {
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        video.removeEventListener("seeked", onSeeked);
+        resolve();
+      };
+      const onSeeked = () => {
+        if (requestId !== presentationPlaybackSession.requestId) {
+          finish();
+          return;
+        }
+        finish();
+      };
+      video.addEventListener("seeked", onSeeked);
+      window.setTimeout(finish, timeoutMs);
+    });
+  }
+
+  function isPresentationUserPaused(): boolean {
+    // 用户点过暂停才算暂停；播放意图在时，seek 造成的短暂 paused 不得改成暂停导航
+    if (presentationUserWantsPaused) return true;
+    if (presentationExpectPlaying) return false;
+    const video = videoEl.value;
+    if (!video) return true;
+    if (video.ended) return true;
+    if (presentationChapterTransition || videoChapterSyncPaused || video.seeking) {
+      return false;
+    }
+    return video.paused;
+  }
+
+  function navigatePresentationChapter(delta: -1 | 1) {
+    const video = videoEl.value;
+    if (!video || !hasChapters.value) return;
+    if (!viewOnly.value && !isPreviewMode.value) return;
+
+    const nav = getPresentationNavChapters();
+    if (nav.length <= 1) return;
+
+    // Strict session stepping: Next/Prev = sessionIndex ± 1. Never soft-sync from
+    // lagged video.currentTime (that skipped chapters on mobile seek lag).
+    const ci = getActivePresentationNavIndex();
+    const targetIdx = ci + delta;
+    if (targetIdx < 0 || targetIdx >= nav.length) return;
+
+    const targetChapter = nav[targetIdx];
+    const targetTime = targetChapter.startTime;
+    commandPresentationPlayback({
+      targetTime,
+      intent: presentationPlaybackSession.intent,
+      navChapter: targetChapter,
+      autoAdvance: presentationPlaybackSession.autoAdvance
+    });
+  }
+
+  function syncPresentationPlayStateFromVideo(v: HTMLVideoElement) {
+    if (!viewOnly.value && !isPreviewMode.value) return;
+    if (v.ended) {
+      // 片尾循环由 loopPresentationPlaybackFromStart / onVideoEnd 处理，勿在此强制 pause。
+      if (presentationPlaybackSession.intent === "play" && !presentationUserWantsPaused) {
+        return;
+      }
+      presentationPlaybackSession.phase = "ended";
+      presentationPlaybackSession.intent = "pause";
+    } else if (!v.paused && presentationPlaybackSession.intent === "play") {
+      if (
+        presentationPlaybackSession.phase !== "seeking" ||
+        canAdoptPresentationVideoTime(v, presentationPlaybackSession.targetTime)
+      ) {
+        presentationPlaybackSession.phase = "playing";
+      }
+    } else if (
+      v.paused &&
+      presentationPlaybackSession.intent === "play" &&
+      presentationPlaybackSession.phase === "playing"
+    ) {
+      presentationPlaybackSession.phase = "blocked";
+    }
+  }
+
+  function syncPresentationPlaybackFromVideo(v: HTMLVideoElement) {
+    if (!viewOnly.value && !isPreviewMode.value && v.paused) return;
+    if (isPresentationSeekLocked()) return;
+    // Pause / seeking: never follow a free-running media clock for chapter visuals.
+    if (
+      (viewOnly.value || isPreviewMode.value) &&
+      (presentationPlaybackSession.intent === "pause" ||
+        presentationPlaybackSession.phase === "seeking")
+    ) {
+      return;
+    }
+
+    const playbackTime = resolvePresentationPlaybackTime(v);
+    const navChapter = getPresentationChapterAtVideoTime(playbackTime);
     if (!navChapter) return;
 
     const playable = resolvePlayableChapterForPresentation(navChapter);
-    syncPresentationUiFromChapter(navChapter);
+    const isPresentation = viewOnly.value || isPreviewMode.value;
+    // Do not write session here — chapter identity changes only via commandPresentationPlayback.
+    const elapsed = getChapterAnimElapsed(playable, playbackTime);
+
+    if (isPresentation) {
+      // 播放中只在切章时刷列表，避免每帧 resolvePlayable 刷屏/耗 CPU
+      if (playable.id !== lastPresentationAutoSwitchChapterId) {
+        syncPresentationUiFromTimeline(playbackTime);
+      }
+    }
     if (chapterPlayTarget.value?.id !== playable.id) {
       chapterPlayTarget.value = playable;
     }
 
     if (playable.id === lastPresentationAutoSwitchChapterId) {
-      if (!v.paused && chapterHasAnimation(playable)) {
-        ensureVideoSyncedChapterAnimation();
+      if (!v.paused) {
+        if (chapterHasAnimation(playable)) {
+          ensureVideoSyncedChapterAnimation();
+        }
+      }
+      // 展示/预览：同章内也要跟视频时间刷 mesh（可见性/位姿/线框）
+      if (isPresentation && chapterHasAnyModelEdits(playable)) {
+        applyChapterAnimOnly(playable, elapsed);
       }
       return;
     }
@@ -3854,10 +5264,24 @@ export function useMovieEditor() {
     if (!resolved) return;
     playingIdx.value = resolved.idx;
     applyChapterCameraForNav(navChapter, "playback");
-    const elapsed = getChapterAnimElapsed(playable, v.currentTime);
+    if (!isPresentation) {
+      editPlaybackCameraChapterId = playable.id;
+      // 编辑态自动切章：只先写可见性，mesh 由 syncVideoDrivenChapterMesh 统一写入
+      editPlaybackSyncChapterId = null;
+      chAnimChapterId = null;
+      applyChapterVisibilityOnly(playable);
+      if (chapterNeedsOutlineRebuild(playable)) {
+        refreshChapterOutlines(playable);
+      }
+      renderViewportFrame();
+      return;
+    }
+
+    // 展示/预览切章：必须整章 visual + 描边，否则进度条播放不触发模型动画
     syncChapterVisualState(playable, elapsed, {
-      skipOutlineRebuild: true,
-      skipOverlaySync: true
+      skipOutlineRebuild: false,
+      skipOverlaySync: false,
+      immediatePresent: true
     });
     if (chapterNeedsOutlineRebuild(playable)) {
       refreshChapterOutlines(playable);
@@ -3869,8 +5293,11 @@ export function useMovieEditor() {
 
   function isPresentationTimelineSegmentCurrent(segmentIdx: number): boolean {
     if (!viewOnly.value && !isPreviewMode.value) {
-      const ci = findChIdx(currentTime.value);
-      return ci === segmentIdx;
+      const segs = timelineChapters.value;
+      if (segmentIdx < 0 || segmentIdx >= segs.length) return false;
+      const activeId = getActiveChapterIdForUi();
+      if (activeId) return segs[segmentIdx]?.id === activeId;
+      return findChIdx(currentTime.value) === segmentIdx;
     }
     const nav = getPresentationNavChapters();
     const activeId = getActiveChapterIdForUi();
@@ -3878,28 +5305,58 @@ export function useMovieEditor() {
     return nav[segmentIdx].id === activeId;
   }
 
+  /** UI-only: list / nav highlight. Must never write PlaybackSession (command owns that). */
   function syncPresentationUiFromChapter(chapter: Chapter, atTime?: number) {
     if (!viewOnly.value && !isPreviewMode.value) return;
     const navChapter = resolvePresentationNavChapter(chapter);
+    const nav = getPresentationNavChapters();
+    const idx = nav.findIndex(ch => ch.id === navChapter.id);
+
+    // 先做轻量判断：无章切换时不要走 resolvePlayable（否则每帧刷 debug / 扫 chapters）
+    if (
+      presentationUiChapterId.value === navChapter.id &&
+      selectedNodeId.value === navChapter.id &&
+      (idx < 0 || presentationNavIndex.value === idx)
+    ) {
+      return;
+    }
+
     // seek 锁定期视频尚未落到目标点：用显式时间 / 乐观 currentTime，避免仍按旧时间解析动画节点。
     const syncTime =
       atTime ??
       (isPresentationSeekLocked() ? currentTime.value : undefined) ??
-      videoEl.value?.currentTime ??
+      resolvePresentationPlaybackTime() ??
       chapter.startTime;
     const playableChapter = resolvePlayableChapterForPresentationAtTime(navChapter, syncTime);
-    presentationUiChapterId.value = navChapter.id;
-    const nav = getPresentationNavChapters();
-    const idx = nav.findIndex(ch => ch.id === navChapter.id);
-    if (idx >= 0) presentationNavIndex.value = idx;
-    if (selectedChapterId.value !== playableChapter.id) {
-      selectedChapterId.value = playableChapter.id;
+
+    const chapterChanged = presentationUiChapterId.value !== navChapter.id;
+    const indexChanged = idx >= 0 && presentationNavIndex.value !== idx;
+    const selectedChanged = selectedNodeId.value !== navChapter.id;
+    const playableChanged = selectedChapterId.value !== playableChapter.id;
+    const videoChanged =
+      !!playableChapter.parentId && activeVideoId.value !== playableChapter.parentId;
+
+    if (!chapterChanged && !indexChanged && !selectedChanged && !playableChanged && !videoChanged) {
+      return;
     }
-    if (selectedNodeId.value !== playableChapter.id) {
-      selectedNodeId.value = playableChapter.id;
+
+    if (chapterChanged) {
+      presentationUiChapterId.value = navChapter.id;
+      presentationUiRevision.value += 1;
     }
-    if (playableChapter.parentId && activeVideoId.value !== playableChapter.parentId) {
+    if (idx >= 0 && indexChanged) presentationNavIndex.value = idx;
+    if (chapterChanged && (viewOnly.value || isPreviewMode.value)) {
+      sceneNodeApi.revealSceneNodeInTree(navChapter.id, { accordion: true });
+    }
+    if (playableChanged) selectedChapterId.value = playableChapter.id;
+    if (selectedChanged) selectedNodeId.value = navChapter.id;
+    if (videoChanged && playableChapter.parentId) {
       activeVideoId.value = playableChapter.parentId;
+      const parentVideo = getNodeById(nodes.value, playableChapter.parentId);
+      // 同源只绑定一次：syncVideoElementSrc 内部对相同 url 直接跳过 load。
+      if (parentVideo && isVideoNode(parentVideo) && parentVideo.videoSrc) {
+        syncVideoElementSrc(parentVideo.videoSrc);
+      }
     }
   }
 
@@ -3911,20 +5368,22 @@ export function useMovieEditor() {
   function isChapterBeforeSelected(ch: Chapter): boolean {
     const selectedId = selectedChapterId.value;
     if (!selectedId || ch.id === selectedId) return false;
+    // 不同视频的时间轴相互独立，不能拿全局时间比较
+    if (ch.parentId && activeVideoId.value && ch.parentId !== activeVideoId.value) return false;
     const selected = chapters.value.find(c => c.id === selectedId);
     if (!selected) return false;
+    if (ch.parentId && selected.parentId && ch.parentId !== selected.parentId) return false;
     return ch.endTime <= selected.startTime + CHAPTER_TIME_EPS;
   }
 
   function chapterListFillPct(ch: Chapter) {
-    if (isChapterBeforeSelected(ch)) return 100;
-    if (!isChapterListActive(ch)) return 0;
-    if (isPlaying.value || chapterPlayTarget.value) {
-      return chapterFillPct(ch);
-    }
-    const v = videoEl.value;
-    if (v && v.currentTime >= ch.endTime - CHAPTER_END_EPS) return 100;
-    return 0;
+    // 只展示当前活动视频内动画的进度，避免多视频同时间轴重叠误亮
+    if (ch.parentId && activeVideoId.value && ch.parentId !== activeVideoId.value) return 0;
+    const t = currentTime.value;
+    if (!Number.isFinite(t) || ch.endTime <= ch.startTime) return 0;
+    if (t >= ch.endTime - CHAPTER_END_EPS) return 100;
+    if (t <= ch.startTime + CHAPTER_TIME_EPS) return 0;
+    return Math.max(0, Math.min(100, ((t - ch.startTime) / (ch.endTime - ch.startTime)) * 100));
   }
 
   function resolveNavChapterElapsed(chapter: Chapter, previewAnimation: boolean) {
@@ -3943,6 +5402,9 @@ export function useMovieEditor() {
   }
 
   function resolveChapterForAnimSync(chapter: Chapter) {
+    // 展示/预览：调用方已给出目标章；禁止用滞后的 video.currentTime 回退到旧章，
+    // 否则暂停切章时模型仍套上一章配置。
+    if (viewOnly.value || isPreviewMode.value) return chapter;
     const video = videoEl.value;
     if (prefersVideoSyncedChapterAnim() && video) {
       return getPlaybackChapterAtTime(video.currentTime) ?? chapter;
@@ -3955,24 +5417,29 @@ export function useMovieEditor() {
     return Object.keys(ch.modelConfigs).some(id => chapterModelHasEdits(ch, id));
   }
 
-  /** 编辑态：按统一路径刷新当前章节下所有模型的 mesh 状态 */
+  /** 编辑态：按与「节点播放按钮」相同的路径刷 mesh（elapsed=0 起始帧） */
   function applyChapterEditorVisualState(ch: Chapter) {
-    sanitizeChapterModelConfigs(ch);
-    for (const m of models.value) {
-      if (!chapterModelHasEdits(ch, m.id)) {
-        resetModelTreeToDefault(m);
-      } else {
-        applyAllEditedTargetsForModel(ch, m);
-      }
+    if (!viewOnly.value && !isPreviewMode.value) {
+      flushChapterSessionsToConfigs(ch);
     }
-    invalidatePickMeshCache();
-    syncTransformVisualOverlays();
+    sanitizeChapterModelConfigs(ch);
+    // 关键：必须与 prepareChapterForPreviewPlayback / 进度条播放 同一套
+    // applyChapterModelState(0)。applyAllEditedTargetsForModel → applyAnimSegmentTransformToMesh
+    // 对子节点相对坐标/pivot 会与播放路径不一致，表现为停播切章后门板等停在错误起点。
+    applyChapterModelState(ch, 0, {
+      skipOutlineRebuild: false,
+      skipOverlaySync: false,
+      forceElapsed: 0,
+      immediatePresent: true
+    });
   }
 
   /** 切换节点时立即刷新 3D 场景（不等待 RAF，避免短暂显示上一节点状态） */
   function applyChapterVisualStateForNav(ch: Chapter, previewAnimation = false, visualElapsed?: number) {
+    const videoPlaying = !!(videoEl.value && !videoEl.value.paused);
+    // 编辑态暂停时一律走起始帧预览；勿因残留 chapterPlayTarget 误入播放路径（会 skip 线框且停在结束位移）
     const inEditMode =
-      !previewAnimation && !viewOnly.value && !isPreviewMode.value && !chapterPlayTarget.value;
+      !previewAnimation && !viewOnly.value && !isPreviewMode.value && !videoPlaying;
     if (inEditMode) {
       applyChapterEditorVisualState(ch);
       return;
@@ -3991,7 +5458,7 @@ export function useMovieEditor() {
           : playingVideo
             ? resolveChapterAnimElapsed(ch, video!.currentTime)
             : hasEdits
-              ? Number.POSITIVE_INFINITY
+              ? 0
               : 0;
     if (!previewAnimation && !hasEdits) {
       for (const m of models.value) {
@@ -4000,11 +5467,13 @@ export function useMovieEditor() {
     } else {
       const isPresentation = viewOnly.value || isPreviewMode.value;
       applyChapterModelState(ch, elapsed, {
-        skipOutlineRebuild: !isPresentation,
+        // 编辑播放路径也需在含线框章节重建，否则隐藏→线框切章只见实体
+        skipOutlineRebuild: isPresentation ? false : !chapterNeedsOutlineRebuild(ch),
         skipOverlaySync: false,
-        forceElapsed: previewAnimation ? 0 : playingVideo || visualElapsed !== undefined ? elapsed : hasEdits ? undefined : 0
+        forceElapsed: previewAnimation ? 0 : playingVideo || visualElapsed !== undefined ? elapsed : hasEdits ? undefined : 0,
+        immediatePresent: true
       });
-      if (isPresentation && chapterNeedsOutlineRebuild(ch)) {
+      if (chapterNeedsOutlineRebuild(ch)) {
         refreshChapterOutlines(ch);
       }
     }
@@ -4079,89 +5548,87 @@ export function useMovieEditor() {
 
   function isTreeNodeHighlighted(node: SceneNode): boolean {
     if (viewOnly.value || isPreviewMode.value) {
+      if (isAnimationNode(node)) {
+        const navNode = resolvePresentationNavChapter(node);
+        const activeId = getActiveChapterIdForUi();
+        if (activeId && (activeId === node.id || activeId === navNode.id)) return true;
+        if (presentationUiChapterId.value === node.id || presentationUiChapterId.value === navNode.id) {
+          return true;
+        }
+        return selectedNodeId.value === node.id || selectedNodeId.value === navNode.id;
+      }
       return selectedNodeId.value === node.id;
     }
     if (videoOnlyMode.value) {
       return node.type === "video" && node.id === selectedNodeId.value;
     }
-    // 依赖响应式 currentTime / isPlaying，保证 timeupdate 时树高亮会刷新
-    if (isPlaying.value) {
-      const ci = findChIdx(currentTime.value);
-      if (ci >= 0) return timelineChapters.value[ci]?.id === node.id;
+    if (isAnimationNode(node)) {
+      const activeId = getActiveChapterIdForUi();
+      if (!activeId || activeId !== node.id) return false;
+      // 编辑态再保险：动画高亮不得跨出当前活动视频
+      if (node.parentId && activeVideoId.value && node.parentId !== activeVideoId.value) {
+        return false;
+      }
+      return true;
     }
-    return selectedNodeId.value === node.id || selectedChapterId.value === node.id;
+    return selectedNodeId.value === node.id;
   }
 
-  /** 编辑态：跟视频时间同步 3D 动画与树高亮，避免 navigateToChapter 全量切换 */
+  /** 编辑态：树 / 进度条 / 表单共用同一选中目标（不在此处换片源，避免播放中未上锁就 load） */
+  function setEditModeActiveChapter(ch: Chapter) {
+    selectedNodeId.value = ch.id;
+    selectedChapterId.value = ch.id;
+    videoOnlyMode.value = false;
+    if (ch.parentId) {
+      const switched = activeVideoId.value !== ch.parentId;
+      activeVideoId.value = ch.parentId;
+      const parentVideo = getNodeById(nodes.value, ch.parentId);
+      if (parentVideo && isVideoNode(parentVideo)) {
+        const storedDur = parentVideo.videoDuration;
+        if (Number.isFinite(storedDur) && storedDur > 0) duration.value = storedDur;
+        if (parentVideo.videoSrc) showVideoPip.value = true;
+      }
+      // 切到其它视频时立刻丢掉旧视频的 playTarget，避免 mesh 仍套用视频1 动画
+      if (
+        switched &&
+        chapterPlayTarget.value &&
+        chapterPlayTarget.value.parentId &&
+        chapterPlayTarget.value.parentId !== ch.parentId
+      ) {
+        chapterPlayTarget.value = null;
+        stopChapterAnimation();
+        editPlaybackSyncChapterId = null;
+        editPlaybackSyncElapsed = -1;
+        chAnimChapterId = null;
+      }
+    }
+  }
+
+  /** 编辑态：timeupdate 同步 UI + 运镜；mesh 由 syncVideoDrivenChapterMesh 负责 */
   function syncEditModePlaybackFromVideo(v: HTMLVideoElement) {
-    const t = v.currentTime;
+    const t = currentTime.value;
     const ci = findChIdx(t);
     playingIdx.value = ci;
 
-    if (!v.paused) {
-      if (ci >= 0) {
-        const ch = timelineChapters.value[ci];
-        if (selectedNodeId.value !== ch.id || selectedChapterId.value !== ch.id) {
-          selectedNodeId.value = ch.id;
-          selectedChapterId.value = ch.id;
-          videoOnlyMode.value = false;
-          syncChapterMetaForm(ch);
-        }
+    // 仅在真正播放时跟时间轴切换高亮；暂停后固定在用户选中的动画
+    const followTimeline = !v.paused && !v.ended && (isPlaying.value || !!chapterPlayTarget.value);
+    if (ci >= 0 && followTimeline) {
+      const ch = timelineChapters.value[ci];
+      if (selectedNodeId.value !== ch.id || selectedChapterId.value !== ch.id) {
+        selectedNodeId.value = ch.id;
+        selectedChapterId.value = ch.id;
+        videoOnlyMode.value = false;
+        syncChapterMetaForm(ch);
       }
     }
 
-    if (ci < 0) {
-      if (editPlaybackSyncChapterId !== null) {
-        editPlaybackSyncChapterId = null;
-        editPlaybackSyncElapsed = -1;
-        if (_chAnimLock || chAnimChapterId) stopChapterAnimation();
-        resetAllModelsToDefault();
-      }
-      return;
-    }
+    if (v.paused || ci < 0) return;
 
     const ch = timelineChapters.value[ci];
-    const elapsed = getChapterAnimElapsed(ch, t);
-    const chapterChanged = editPlaybackSyncChapterId !== ch.id;
-    const hasModelEdits = chapterHasAnyModelEdits(ch);
-    if (!hasModelEdits) {
-      if (chapterChanged) {
-        editPlaybackSyncChapterId = ch.id;
-        editPlaybackSyncElapsed = elapsed;
-        applyChapterCameraForNav(ch, "playback");
-        if (_chAnimLock || chAnimChapterId) stopChapterAnimation();
-        resetAllModelsToDefault();
-      }
-      return;
-    }
-
-    const elapsedChanged = Math.abs(elapsed - editPlaybackSyncElapsed) >= 1 / 30;
-    if (!chapterChanged && !elapsedChanged) return;
-
-    editPlaybackSyncChapterId = ch.id;
-    editPlaybackSyncElapsed = elapsed;
-
-    if (chapterChanged) {
+    if (editPlaybackCameraChapterId !== ch.id) {
+      editPlaybackCameraChapterId = ch.id;
       applyChapterCameraForNav(ch, "playback");
-      syncChapterVisualState(ch, elapsed, {
-        skipOutlineRebuild: false,
-        skipOverlaySync: false
-      });
-      if (chapterNeedsOutlineRebuild(ch)) {
-        refreshChapterOutlines(ch);
-      }
     }
-
-    if (!v.paused) {
-      if (!_chAnimLock || chAnimChapterId !== ch.id) {
-        startVideoSyncedChapterAnimation(ch);
-      }
-      applyChapterAnimOnly(ch, elapsed);
-      return;
-    }
-
-    stopChapterAnimation();
-    applyChapterAnimOnly(ch, elapsed);
   }
 
   function applyChapterCameraForNav(chapter: Chapter, mode?: ChapterCameraSwitchMode) {
@@ -4232,29 +5699,49 @@ export function useMovieEditor() {
         syncVideoElementSrc(parentVideo.videoSrc);
       }
     }
-    selectedNodeId.value = ch.id;
-    selectedChapterId.value = ch.id;
 
     const video = videoEl.value;
-    // 编辑态未打开视频窗时，只切换模型/相机，不强制 seek 视频
-    if (video && showVideoPip.value) {
-      const shouldKeepPlaying = isPlaying.value || !video.paused;
+    // 仅在视频正在播时走播放管线；编辑态暂停切换只刷编辑预览，避免位移叠加上一动画残留
+    const shouldKeepPlaying = !!(video && showVideoPip.value && (isPlaying.value || !video.paused));
+    if (shouldKeepPlaying) {
+      selectedNodeId.value = ch.id;
       void startChapterPlayback(ch, {
         syncVideo: true,
-        autoplay: shouldKeepPlaying,
-        keepPlaying: shouldKeepPlaying,
+        autoplay: true,
+        keepPlaying: true,
         userGesture: true,
         seekTime: ch.startTime
       });
       return;
     }
 
+    chapterPlayTarget.value = null;
+    stopChapterAnimation();
+    // 不在此处提前改 selectedChapterId：交给 navigateToChapter，先落盘上一章再切 id
+    selectedNodeId.value = ch.id;
     navigateToChapter(resolved.chapter, resolved.idx, {
       seek: false,
       cameraMode: "playback",
       visualElapsed: 0,
       holdCurrentTime: true
     });
+    if (video && showVideoPip.value) {
+      videoChapterSyncPaused = true;
+      try {
+        if (Math.abs(video.currentTime - ch.startTime) >= CHAPTER_TIME_EPS) {
+          video.currentTime = ch.startTime;
+        }
+        currentTime.value = ch.startTime;
+      } catch {
+        /* ignore */
+      } finally {
+        videoChapterSyncPaused = false;
+      }
+    }
+    // 暂停切章：与节点播放按钮同一套起始帧
+    if (!viewOnly.value && !isPreviewMode.value) {
+      applyChapterEditorVisualState(resolved.chapter);
+    }
   }
 
   // ── Model helpers ──
@@ -4303,7 +5790,10 @@ export function useMovieEditor() {
       attachModelMixer(m.id, root, gltf.animations);
     }
     if (selModel.value?.id === m.id) syncMaterialUiFromModel();
-    if (selModelId.value === m.id) updateSelectionHighlight();
+    if (selModelId.value === m.id) {
+      updateSelectionHighlight();
+      syncModelForm(getActiveChapter());
+    }
     invalidatePickMeshCache();
     if (shadowEnabled.value) {
       root.traverse(function (c) {
@@ -4417,10 +5907,24 @@ export function useMovieEditor() {
     const defaultCfg = createDefaultModelConfig();
     if (!ch) return defaultCfg;
     const rootCfg = ch.modelConfigs?.[modelId] as ModelConfig | undefined;
-    if (!nodeId) return rootCfg ? { ...defaultCfg, ...rootCfg } : defaultCfg;
+    if (!nodeId) {
+      if (!rootCfg) return defaultCfg;
+      // deep clone animConfig，避免编辑器误改到其它章节的共享引用
+      return {
+        ...defaultCfg,
+        ...rootCfg,
+        animConfig: rootCfg.animConfig ? JSON.parse(JSON.stringify(rootCfg.animConfig)) : undefined,
+        nodeConfigs: rootCfg.nodeConfigs
+      };
+    }
     const displayNodeId = resolveDisplayNodeId(getModelHierarchy(modelId), nodeId);
     const nodeCfg = rootCfg?.nodeConfigs?.[displayNodeId] ?? rootCfg?.nodeConfigs?.[nodeId];
-    return nodeCfg ? { ...defaultCfg, ...nodeCfg } : defaultCfg;
+    if (!nodeCfg) return defaultCfg;
+    return {
+      ...defaultCfg,
+      ...nodeCfg,
+      animConfig: nodeCfg.animConfig ? JSON.parse(JSON.stringify(nodeCfg.animConfig)) : undefined
+    };
   }
 
   function getWritableModelConfigForTarget(ch: Chapter, modelId: string, nodeId: string | null): ModelConfig {
@@ -4594,16 +6098,24 @@ export function useMovieEditor() {
 
   function resolvePlaybackChapterAtTime(t: number): Chapter | null {
     const video = videoEl.value;
-    const followVideoTime = viewOnly.value || isPreviewMode.value || !!(video && !video.paused) || !!chapterPlayTarget.value;
+    const followVideoTime =
+      viewOnly.value || isPreviewMode.value || !!(video && !video.paused) || !!chapterPlayTarget.value;
     if (!followVideoTime) {
       const selected = chapters.value.find(c => c.id === selectedChapterId.value);
-      if (selected && t >= selected.startTime - CHAPTER_TIME_EPS && t < selected.endTime) {
+      if (
+        selected &&
+        chapterBelongsToActiveVideo(selected) &&
+        t >= selected.startTime - CHAPTER_TIME_EPS &&
+        t < selected.endTime
+      ) {
         return selected;
       }
     }
-    return activeVideoId.value
-      ? resolveActiveAnimationAtTime(nodes.value, activeVideoId.value, t)
-      : resolveActiveChapterAtTime(chapters.value, t);
+    // 有活动视频时绝不扫全场景章节，避免视频2时间点命中视频1动画
+    if (activeVideoId.value) {
+      return resolveActiveAnimationAtTime(nodes.value, activeVideoId.value, t);
+    }
+    return null;
   }
 
   function collectChapterAnimTargets(ch: Chapter): Array<{ objs: THREE.Object3D[]; cfg: ModelConfig; liveSegs?: any[] }> {
@@ -4626,7 +6138,12 @@ export function useMovieEditor() {
         targets.push({
           objs: [root],
           cfg: rootCfgTyped,
-          liveSegs: shouldUseLiveAnimSegments(cmid, null) && animSegments.length > 0 ? animSegments : undefined
+          liveSegs:
+            !isEditVideoMeshSyncActive() &&
+            shouldUseLiveAnimSegments(cmid, null) &&
+            animSegments.length > 0
+              ? animSegments
+              : undefined
         });
       }
 
@@ -4646,7 +6163,13 @@ export function useMovieEditor() {
         targets.push({
           objs: nodeObjs,
           cfg: nodeCfgTyped,
-          liveSegs: shouldUseLiveAnimSegments(cmid, displayId) && animSegments.length > 0 ? animSegments : undefined
+          // 播放跟视频时禁止挂 live 段，避免缓存里残留编辑相对坐标与存储绝对坐标混用
+          liveSegs:
+            !isEditVideoMeshSyncActive() &&
+            shouldUseLiveAnimSegments(cmid, displayId) &&
+            animSegments.length > 0
+              ? animSegments
+              : undefined
         });
       }
     }
@@ -4671,9 +6194,12 @@ export function useMovieEditor() {
   /** 播放循环中仅更新动画变换，避免每帧全量重置模型树 */
   function applyChapterAnimOnly(ch: Chapter, elapsedSec: number) {
     const targets = getChapterAnimTargetsCached(ch);
+    // 视频驱动时禁止 live 段：缓存里可能残留编辑态相对坐标，与存储绝对坐标混用会飞位
+    const allowLive = !(_chAnimLock && !chAnimWallclock);
     for (const { objs, cfg, liveSegs } of targets) {
+      const segs = allowLive ? liveSegs : undefined;
       for (const obj of objs) {
-        applyElapsedAnimToObject(obj, cfg, elapsedSec, liveSegs);
+        applyElapsedAnimToObject(obj, cfg, elapsedSec, segs);
       }
     }
     syncVisualOverlayTransforms();
@@ -4690,7 +6216,9 @@ export function useMovieEditor() {
 
     const rawSegs = liveSegs?.length ? liveSegs : cac.segments;
     const csegs = resolvePlaybackSegments(rawSegs).map(seg =>
-      liveSegs?.length ? cloneAnimSegmentForApply(obj, seg) : cloneStoredAnimSegmentForApply(seg)
+      liveSegs?.length
+        ? cloneAnimSegmentForApply(obj, seg)
+        : cloneStoredAnimSegmentForPlayback(obj, seg, cac as any)
     );
     let ctotal = 0;
     for (let cs = 0; cs < csegs.length; cs++) ctotal += (csegs[cs].pauseTime || 0) + (csegs[cs].animTime || 3);
@@ -4967,7 +6495,11 @@ export function useMovieEditor() {
       syncEditorComposerPasses();
       return;
     }
-    outlinePass.selectedObjects = collectOutlineMeshes(getNodeObjects());
+    const roots = getNodeObjects();
+    // 整模：根节点一次写入蒙版，外轮廓更干净；子部件：再落到可见 Mesh
+    outlinePass.selectedObjects = selModelNodeId.value
+      ? collectOutlineMeshes(roots)
+      : roots.filter(o => !!o);
     syncEditorComposerPasses();
   }
 
@@ -5112,39 +6644,11 @@ export function useMovieEditor() {
 
   type PickTargetResult = { modelId: string; nodeId: string | null; hitObject: THREE.Object3D; hitPoint: THREE.Vector3 };
 
-  const _previewHitBox = new THREE.Box3();
-  const _previewHitCenter = new THREE.Vector3();
-  const _previewHitSize = new THREE.Vector3();
-  const _previewHitLocal = new THREE.Vector3();
-
-  function isPreviewModelCenterHit(clientX: number, clientY: number) {
-    const result = raycastAt(clientX, clientY);
-    if (!result) return false;
-    const root = meshes.get(result.modelId);
-    if (!root) return false;
-    _previewHitBox.setFromObject(root);
-    if (_previewHitBox.isEmpty()) return false;
-    _previewHitBox.getCenter(_previewHitCenter);
-    _previewHitBox.getSize(_previewHitSize);
-    _previewHitLocal.copy(result.hitPoint).sub(_previewHitCenter);
-    const rx = _previewHitSize.x > 1e-6 ? Math.abs(_previewHitLocal.x) / (_previewHitSize.x * 0.5) : 0;
-    const ry = _previewHitSize.y > 1e-6 ? Math.abs(_previewHitLocal.y) / (_previewHitSize.y * 0.5) : 0;
-    const rz = _previewHitSize.z > 1e-6 ? Math.abs(_previewHitLocal.z) / (_previewHitSize.z * 0.5) : 0;
-    return Math.max(rx, ry, rz) <= 0.7;
-  }
-
   function isPresentationUiTarget(target: EventTarget | null) {
     if (!(target instanceof Element)) return false;
     return !!target.closest(
       ".viewport-preview-nav, .viewport-preview-nav-btn, .viewport-play-hint, .pip-group, .progress-area, .editor-topbar, .chapter-list-panel, .chapter-preview-backdrop"
     );
-  }
-
-  function tryTogglePlayOnPreviewTap(clientX: number, clientY: number) {
-    if (!isPreviewMode.value || !hasVideo.value || viewOnly.value || isCoarsePointerDevice()) return;
-    if (isPresentationUiTarget(document.elementFromPoint(clientX, clientY))) return;
-    if (!isPreviewModelCenterHit(clientX, clientY)) return;
-    togglePlay();
   }
 
   function raycastAt(clientX: number, clientY: number): PickTargetResult | null {
@@ -5257,7 +6761,8 @@ export function useMovieEditor() {
     const hasAnim = !!(cfg.animation && (cfg.animConfig?.segments?.length ?? 0) > 0);
     if (hasAnim) {
       const rawSeg = cfg.animConfig!.segments![0];
-      const seg = cloneAnimSegmentForApply(obj, mapStoredAnimSegment(rawSeg));
+      // chapter 内已是绝对坐标，禁止再用 cloneAnimSegmentForApply（会对子节点再加一次 baseLocalPos）
+      const seg = cloneStoredAnimSegmentForPlayback(obj, mapStoredAnimSegment(rawSeg), cfg.animConfig as any);
       invalidateSegPivotCache(seg);
       getSegPivotCache(seg, obj);
       applyPivotPathFrame(
@@ -5286,9 +6791,16 @@ export function useMovieEditor() {
   function resolveChapter(ch: Chapter) {
     const chapter = chapters.value.find(c => c.id === ch.id);
     if (!chapter) return null;
-    const timelineIdx = chapter.parentId
-      ? timelineChapters.value.findIndex(c => c.id === chapter.parentId)
-      : timelineChapters.value.findIndex(c => c.id === chapter.id);
+    // 若动画属于其它视频，先切到其父视频时间轴再算索引（否则会命中旧视频的 timeline[0]）
+    if (chapter.parentId && activeVideoId.value !== chapter.parentId) {
+      activeVideoId.value = chapter.parentId;
+      const parentVideo = getNodeById(nodes.value, chapter.parentId);
+      if (parentVideo && isVideoNode(parentVideo)) {
+        const storedDur = parentVideo.videoDuration;
+        if (Number.isFinite(storedDur) && storedDur > 0) duration.value = storedDur;
+      }
+    }
+    const timelineIdx = timelineChapters.value.findIndex(c => c.id === chapter.id);
     return { chapter, idx: timelineIdx >= 0 ? timelineIdx : 0 };
   }
 
@@ -5333,27 +6845,75 @@ export function useMovieEditor() {
     return Math.abs(video.currentTime - target) < eps;
   }
 
+  /** seek 失败时浏览器常把 currentTime 打回 0；禁止用这种回落覆盖展示进度 */
+  function isPresentationSeekRollback(mediaTime: number, uiTarget: number): boolean {
+    if (!Number.isFinite(mediaTime) || !Number.isFinite(uiTarget)) return false;
+    if (uiTarget <= 0.45) return false;
+    return mediaTime < 0.4 && Math.abs(mediaTime - uiTarget) > 0.5;
+  }
+
+  function canAdoptPresentationVideoTime(video: HTMLVideoElement, uiTarget?: number | null): boolean {
+    const target = uiTarget ?? presentationSeekTargetTime;
+    if (target == null) return true;
+    if (isPresentationSeekRollback(video.currentTime, target)) return false;
+    if (isSeekNearTarget(video, target)) return true;
+    // While a seek is outstanding, the pre-seek media clock is not "progress past target".
+    if (
+      presentationPlaybackSession.phase === "seeking" ||
+      presentationSeekTargetTime != null
+    ) {
+      return false;
+    }
+    // Cached EOF must not count as "already past" an early target (refresh boot race).
+    if (isPresentationAtMediaEnd(video) || video.ended) {
+      const dur =
+        Number.isFinite(video.duration) && video.duration > 0 ? video.duration : duration.value;
+      if (dur > 0 && target < dur - Math.max(0.5, CHAPTER_END_EPS * 4)) {
+        return false;
+      }
+    }
+    // Seek cleared: follow media only once it has actually advanced past the target while playing.
+    return !video.paused && video.currentTime > target + CHAPTER_TIME_EPS;
+  }
+
   async function forceResumeVideoPlayback(
     video: HTMLVideoElement,
     options?: { requestSeq?: number }
   ): Promise<boolean> {
-    if (!video.ended && !video.paused) {
+    if (video.ended || isPresentationAtMediaEnd(video)) {
+      if (
+        (viewOnly.value || isPreviewMode.value) &&
+        presentationPlaybackSession.intent === "play" &&
+        !presentationUserWantsPaused
+      ) {
+        return loopPresentationPlaybackFromStart();
+      }
+      presentationExpectPlaying = false;
+      isPlaying.value = false;
+      return false;
+    }
+    if (!video.paused) {
       isPlaying.value = true;
       return true;
     }
     const req = options?.requestSeq;
-    // 移动端 seek 后常需多次重试才能拿回播放权。
-    const delays = [0, 30, 80, 160, 280, 450, 700, 1100, 1600];
+    // 短重试：过长会叠到「停几秒才播」，并和主循环补播打架
+    const delays = [0, 40, 120, 280, 560];
     for (const delay of delays) {
       if (req !== undefined && req !== chapterPlaybackRequestSeq) return false;
       if (delay > 0) await new Promise(resolve => window.setTimeout(resolve, delay));
       if (req !== undefined && req !== chapterPlaybackRequestSeq) return false;
-      if ((viewOnly.value || isPreviewMode.value) && !presentationExpectPlaying) {
+      if ((viewOnly.value || isPreviewMode.value) && (!presentationExpectPlaying || presentationUserWantsPaused)) {
+        return false;
+      }
+      if (video.ended || isPresentationAtMediaEnd(video)) {
+        presentationExpectPlaying = false;
+        isPlaying.value = false;
         return false;
       }
       try {
         if (video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
-          await waitForVideoReady(2500);
+          await waitForVideoReady(1200);
           if (req !== undefined && req !== chapterPlaybackRequestSeq) return false;
         }
         await video.play();
@@ -5375,45 +6935,9 @@ export function useMovieEditor() {
     }
   }
 
-  /** 解锁 seek 后再补几次 play，避免 pause 事件在 finally 之后把播放掐死。 */
-  function schedulePresentationPlaybackResume(requestSeq: number) {
-    if (!presentationExpectPlaying) return;
-    if (!videoEl.value) return;
+  /** Legacy call sites are inert; only commandPresentationPlayback may issue presentation media work. */
+  function schedulePresentationPlaybackResume(_requestSeq: number) {
     clearPresentationResumeTimer();
-    const delays = [0, 60, 150, 320, 600, 1000, 1800, 2800];
-    let idx = 0;
-    const runNext = () => {
-      if (idx >= delays.length) {
-        if (presentationExpectPlaying && videoEl.value?.paused) {
-          showPresentationPlaybackHint();
-        }
-        return;
-      }
-      const delay = delays[idx++];
-      presentationResumeTimer = setTimeout(() => {
-        presentationResumeTimer = null;
-        if (requestSeq !== chapterPlaybackRequestSeq) return;
-        if (!presentationExpectPlaying) return;
-        const v = videoEl.value;
-        if (!v || v.ended) return;
-        if (!v.paused) {
-          isPlaying.value = true;
-          stopChapterAnimation();
-          ensureVideoSyncedChapterAnimation();
-          return;
-        }
-        void forceResumeVideoPlayback(v, { requestSeq }).then(ok => {
-          if (ok) {
-            stopChapterAnimation();
-            ensureVideoSyncedChapterAnimation();
-            syncCurrentChapterAnimationFromVideo();
-            return;
-          }
-          runNext();
-        });
-      }, delay);
-    };
-    runNext();
   }
 
   /** 在点击同步栈内先触发 play，给后续 await seek 后的续播保留媒体授权。 */
@@ -5454,8 +6978,8 @@ export function useMovieEditor() {
       isPlaying.value = true;
     }
 
-    // 展示续播路径：永远不断播 seek，最大限度保留手势授权。禁止 pause:true。
-    let seekOk = await seekVideoTo(target, { pause: false });
+    // 展示续播：优先不断播 seek，保留播放权；落点由锚点保护，禁止把失败回落的 0 写成进度
+    let seekOk = await seekVideoTo(target, { pause: !shouldPlay });
     if (req !== undefined && req !== chapterPlaybackRequestSeq) return false;
 
     if (!seekOk && !isPresentationSeekAcceptable(video, target)) {
@@ -5484,9 +7008,17 @@ export function useMovieEditor() {
     seekOk = seekOk || isPresentationSeekAcceptable(video, target);
 
     if (seekOk) {
-      currentTime.value = video.currentTime;
-    } else if (shouldPlay) {
-      // 校验未过也不中止续播：进度条保持目标点，后续 resume 仍可从附近继续。
+      if (canAdoptPresentationVideoTime(video, target)) {
+        presentationSeekTargetTime = null;
+        currentTime.value = video.currentTime;
+      } else {
+        presentationSeekTargetTime = target;
+        currentTime.value = target;
+      }
+    } else if (shouldPlay || (viewOnly.value || isPreviewMode.value)) {
+      // 校验未过也保持目标点：暂停 seek 仍更新 UI，续播则由 resume 继续补。
+      // 若媒体已错误回落片头，绝不能用 0 覆盖乐观进度。
+      presentationSeekTargetTime = target;
       currentTime.value = target;
       seekOk = true;
     } else {
@@ -5502,16 +7034,14 @@ export function useMovieEditor() {
       }
       await forceResumeVideoPlayback(video, { requestSeq: req });
       if (req !== undefined && req !== chapterPlaybackRequestSeq) return false;
-      // 若播着被机型弹回远处：不断播修正，禁止 pause。
-      if (!isPresentationSeekAcceptable(video, target)) {
-        const repaired = await seekVideoTo(target, { pause: false });
-        if (req !== undefined && req !== chapterPlaybackRequestSeq) return false;
-        if (repaired || isPresentationSeekAcceptable(video, target)) {
-          currentTime.value = video.currentTime;
-          await forceResumeVideoPlayback(video, { requestSeq: req });
-        }
+      if (canAdoptPresentationVideoTime(video, target)) {
+        presentationSeekTargetTime = null;
+        currentTime.value = video.currentTime;
+      } else {
+        // 仍未到点或回落片头：钉住目标，交由 scheduleResume 温和重试（最多一次 reseek）
+        presentationSeekTargetTime = target;
+        currentTime.value = target;
       }
-      // play 成败都视为跳转流程成功，避免调用方清掉 presentationExpectPlaying。
       return true;
     }
     return seekOk;
@@ -5549,7 +7079,15 @@ export function useMovieEditor() {
     const commitSeekUi = (ok: boolean) => {
       if (gen !== seekGeneration) return;
       // 失败时不要用错误的 currentTime（常为 0）覆盖乐观进度。
-      if (ok) currentTime.value = video.currentTime;
+      // 展示态：即便 ok，若实际是回落片头也禁止覆盖。
+      if (!ok) return;
+      if (
+        (viewOnly.value || isPreviewMode.value) &&
+        isPresentationSeekRollback(video.currentTime, target)
+      ) {
+        return;
+      }
+      currentTime.value = video.currentTime;
     };
 
     const tryAssignCurrentTime = () => {
@@ -5656,13 +7194,21 @@ export function useMovieEditor() {
 
   // ── Ticker ──
   function findChIdx(t: number) {
-    return timelineChapters.value.findIndex(c => t >= c.startTime - CHAPTER_TIME_EPS && t < c.endTime);
+    const list = timelineChapters.value;
+    if (!list.length) return -1;
+    const exact = list.findIndex(c => t >= c.startTime - CHAPTER_TIME_EPS && t < c.endTime);
+    if (exact >= 0) return exact;
+    // 循环瞬间 video.currentTime 常卡在 duration（= 末章 endTime），按末章处理
+    const last = list[list.length - 1];
+    if (t >= last.endTime - CHAPTER_END_EPS && t <= last.endTime + CHAPTER_END_EPS) {
+      return list.length - 1;
+    }
+    return -1;
   }
 
   function chapterAtTime(t: number): Chapter | null {
-    return activeVideoId.value
-      ? resolveActiveAnimationAtTime(nodes.value, activeVideoId.value, t)
-      : resolveActiveChapterAtTime(chapters.value, t);
+    if (!activeVideoId.value) return null;
+    return resolveActiveAnimationAtTime(nodes.value, activeVideoId.value, t);
   }
 
   function getPlaybackChapterAtTime(t: number): Chapter | null {
@@ -5685,15 +7231,44 @@ export function useMovieEditor() {
   function getChapterScope(parentVideoId?: string) {
     const video =
       parentVideoId ? getNodeById(nodes.value, parentVideoId) : activeVideoNode.value;
-    const videoDur =
-      video && isVideoNode(video)
+    const nodeDur =
+      video && isVideoNode(video) && Number.isFinite(video.videoDuration) && video.videoDuration > 0
         ? video.videoDuration
-        : currProj.value?.videoDuration || duration.value;
+        : 0;
+    const projectDur =
+      currProj.value?.videoDuration && currProj.value.videoDuration > 0
+        ? currProj.value.videoDuration
+        : 0;
+    const mediaDur =
+      videoEl.value && Number.isFinite(videoEl.value.duration) && videoEl.value.duration > 0
+        ? videoEl.value.duration
+        : 0;
+    const uiDur = duration.value > 0 ? duration.value : 0;
+    // 只读取最大有效时长：不可在此处写回响应式字段（会被 selectedChapterTimeBounds 等 computed 调用）。
+    const videoDur = Math.max(nodeDur, projectDur, mediaDur, uiDur);
     return {
       parent: video && isVideoNode(video) ? video : null,
       startTime: 0,
       endTime: videoDur
     };
+  }
+
+  /** 在用户操作路径上纠正过期的视频时长（不可在 computed 中调用） */
+  function syncVideoDurationFromScope(parentVideoId?: string) {
+    const scope = getChapterScope(parentVideoId);
+    const videoDur = scope.endTime;
+    if (videoDur <= 0) return videoDur;
+    const video = scope.parent;
+    if (video && video.videoDuration + CHAPTER_TIME_EPS < videoDur) {
+      video.videoDuration = videoDur;
+    }
+    if (currProj.value && (currProj.value.videoDuration || 0) + CHAPTER_TIME_EPS < videoDur) {
+      currProj.value.videoDuration = videoDur;
+    }
+    if (duration.value + CHAPTER_TIME_EPS < videoDur) {
+      duration.value = videoDur;
+    }
+    return videoDur;
   }
 
   function getSiblingChapters(parentId?: string, excludeId?: string) {
@@ -5706,7 +7281,21 @@ export function useMovieEditor() {
     return getVideoAnimations(nodes.value, videoId);
   }
 
-  function getDefaultChapterSegmentDuration(rangeDuration: number) {
+  function isVideoAnimationScope(parentId?: string) {
+    if (!parentId) return false;
+    const node = getNodeById(nodes.value, parentId);
+    return !!node && isVideoNode(node);
+  }
+
+  function getMinChapterDurationForParent(parentId?: string) {
+    return isVideoAnimationScope(parentId) ? MIN_ANIMATION_NODE_DURATION : MIN_CHAPTER_DURATION;
+  }
+
+  function getDefaultChapterSegmentDuration(rangeDuration: number, parentId?: string) {
+    if (isVideoAnimationScope(parentId)) {
+      if (rangeDuration <= MIN_ANIMATION_NODE_DURATION + CHAPTER_TIME_EPS) return rangeDuration;
+      return Math.min(rangeDuration, DEFAULT_ANIMATION_NODE_DURATION);
+    }
     if (rangeDuration < MIN_CHAPTER_DURATION * 2 - CHAPTER_TIME_EPS) return 0;
     if (rangeDuration <= CHAPTER_SPLIT_INTERVAL + CHAPTER_TIME_EPS) return rangeDuration / 2;
     return CHAPTER_SPLIT_INTERVAL;
@@ -5717,13 +7306,21 @@ export function useMovieEditor() {
   }
 
   function getNextChapterRange(parentId?: string): { startTime: number; endTime: number; splitChapter?: Chapter } | null {
+    syncVideoDurationFromScope(parentId);
     const scope = getChapterScope(parentId);
     const scopeDuration = scope.endTime - scope.startTime;
-    if (scopeDuration < MIN_CHAPTER_DURATION * 2 - CHAPTER_TIME_EPS) return null;
+    const minDur = getMinChapterDurationForParent(parentId);
+    const animationScope = isVideoAnimationScope(parentId);
+
+    if (animationScope) {
+      if (scopeDuration < minDur - CHAPTER_TIME_EPS) return null;
+    } else if (scopeDuration < MIN_CHAPTER_DURATION * 2 - CHAPTER_TIME_EPS) {
+      return null;
+    }
 
     const siblings = getSiblingChapters(parentId);
     if (siblings.length === 0) {
-      const segmentDuration = getDefaultChapterSegmentDuration(scopeDuration);
+      const segmentDuration = getDefaultChapterSegmentDuration(scopeDuration, parentId);
       if (segmentDuration <= 0) return null;
       return {
         startTime: scope.startTime,
@@ -5734,32 +7331,34 @@ export function useMovieEditor() {
     let cursor = scope.startTime;
     for (const sibling of siblings) {
       const siblingStart = clampNumber(sibling.startTime, scope.startTime, scope.endTime);
-      if (siblingStart - cursor >= MIN_CHAPTER_DURATION - CHAPTER_TIME_EPS) {
+      if (siblingStart - cursor >= minDur - CHAPTER_TIME_EPS) {
         const gapDuration = siblingStart - cursor;
-        const segmentDuration = Math.min(gapDuration, CHAPTER_SPLIT_INTERVAL);
+        const segmentDuration = getDefaultChapterSegmentDuration(gapDuration, parentId);
         return {
           startTime: cursor,
-          endTime: cursor + segmentDuration
+          endTime: Math.min(scope.endTime, cursor + segmentDuration)
         };
       }
       cursor = Math.max(cursor, clampNumber(sibling.endTime, scope.startTime, scope.endTime));
     }
 
-    if (scope.endTime - cursor >= MIN_CHAPTER_DURATION - CHAPTER_TIME_EPS) {
+    if (scope.endTime - cursor >= minDur - CHAPTER_TIME_EPS) {
       const gapDuration = scope.endTime - cursor;
-      const segmentDuration = Math.min(gapDuration, CHAPTER_SPLIT_INTERVAL);
+      const segmentDuration = getDefaultChapterSegmentDuration(gapDuration, parentId);
       return {
         startTime: cursor,
-        endTime: cursor + segmentDuration
+        endTime: Math.min(scope.endTime, cursor + segmentDuration)
       };
     }
+
+    if (animationScope) return null;
 
     const splitTarget = [...siblings].sort((a, b) => b.endTime - a.endTime)[0];
     if (!splitTarget) return null;
 
     const protectedEnd = getProtectedChildEnd(splitTarget);
     const targetDuration = splitTarget.endTime - splitTarget.startTime;
-    const preferredDuration = getDefaultChapterSegmentDuration(targetDuration);
+    const preferredDuration = getDefaultChapterSegmentDuration(targetDuration, parentId);
     if (preferredDuration <= 0) return null;
     if (protectedEnd > splitTarget.endTime - MIN_CHAPTER_DURATION + CHAPTER_TIME_EPS) return null;
 
@@ -5789,26 +7388,32 @@ export function useMovieEditor() {
     const children = getSortedChapterChildren(ch.id);
     const firstChildStart = children.length > 0 ? children[0].startTime : Number.POSITIVE_INFINITY;
     const lastChildEnd = children.length > 0 ? Math.max(...children.map(child => child.endTime)) : Number.NEGATIVE_INFINITY;
+    const minDur = getMinChapterDurationForParent(ch.parentId);
 
     const startMin = prev?.endTime ?? scope.startTime;
     const endMax = next?.startTime ?? scope.endTime;
     const startMax = Math.max(
       startMin,
-      Math.min(ch.endTime - MIN_CHAPTER_DURATION, endMax - MIN_CHAPTER_DURATION, firstChildStart)
+      Math.min(ch.endTime - minDur, endMax - minDur, firstChildStart)
     );
-    const endMin = Math.min(endMax, Math.max(ch.startTime + MIN_CHAPTER_DURATION, startMin + MIN_CHAPTER_DURATION, lastChildEnd));
+    const endMin = Math.min(endMax, Math.max(ch.startTime + minDur, startMin + minDur, lastChildEnd));
 
     return { startMin, startMax, endMin, endMax };
   }
 
   function normalizeChapterFormRange(ch: Chapter) {
+    syncVideoDurationFromScope(ch.parentId);
     const bounds = getChapterTimeInputBounds(ch);
+    const minDur = getMinChapterDurationForParent(ch.parentId);
     let startTime = clampNumber(chForm.startTime, bounds.startMin, bounds.startMax);
-    let endTime = clampNumber(chForm.endTime, Math.max(bounds.endMin, startTime + MIN_CHAPTER_DURATION), bounds.endMax);
+    let endTime = clampNumber(chForm.endTime, Math.max(bounds.endMin, startTime + minDur), bounds.endMax);
 
-    if (endTime - startTime < MIN_CHAPTER_DURATION) {
-      startTime = clampNumber(endTime - MIN_CHAPTER_DURATION, bounds.startMin, bounds.startMax);
-      endTime = clampNumber(startTime + MIN_CHAPTER_DURATION, bounds.endMin, bounds.endMax);
+    if (endTime - startTime < minDur) {
+      endTime = clampNumber(startTime + minDur, bounds.endMin, bounds.endMax);
+      if (endTime - startTime < minDur) {
+        startTime = clampNumber(endTime - minDur, bounds.startMin, bounds.startMax);
+        endTime = clampNumber(startTime + minDur, bounds.endMin, bounds.endMax);
+      }
     }
 
     return { startTime, endTime };
@@ -5818,28 +7423,29 @@ export function useMovieEditor() {
     const siblings = getSiblingChapters(parentId);
     if (siblings.length === 0) return;
 
+    const minDur = getMinChapterDurationForParent(parentId);
     const availableDuration = scopeEnd - scopeStart;
-    if (availableDuration < MIN_CHAPTER_DURATION - CHAPTER_TIME_EPS) return;
+    if (availableDuration < minDur - CHAPTER_TIME_EPS) return;
 
     let cursor = scopeStart;
     siblings.forEach((sibling, index) => {
       const remainingSlots = siblings.length - index - 1;
-      const latestEnd = scopeEnd - remainingSlots * MIN_CHAPTER_DURATION;
-      if (latestEnd - cursor < MIN_CHAPTER_DURATION - CHAPTER_TIME_EPS) return;
+      const latestEnd = scopeEnd - remainingSlots * minDur;
+      if (latestEnd - cursor < minDur - CHAPTER_TIME_EPS) return;
 
-      let desiredDuration = Math.max(sibling.endTime - sibling.startTime, MIN_CHAPTER_DURATION);
+      let desiredDuration = Math.max(sibling.endTime - sibling.startTime, minDur);
       const isSingleFullRangeChild =
         !!parentId &&
         siblings.length === 1 &&
         sibling.startTime <= scopeStart + CHAPTER_TIME_EPS &&
         sibling.endTime >= scopeEnd - CHAPTER_TIME_EPS &&
-        availableDuration >= MIN_CHAPTER_DURATION * 2 - CHAPTER_TIME_EPS;
+        availableDuration >= minDur * 2 - CHAPTER_TIME_EPS;
 
       if (isSingleFullRangeChild) {
-        desiredDuration = getDefaultChapterSegmentDuration(availableDuration) || desiredDuration;
+        desiredDuration = getDefaultChapterSegmentDuration(availableDuration, parentId) || desiredDuration;
       }
 
-      const endTime = clampNumber(cursor + desiredDuration, cursor + MIN_CHAPTER_DURATION, latestEnd);
+      const endTime = clampNumber(cursor + desiredDuration, cursor + minDur, latestEnd);
       if (Math.abs(sibling.startTime - cursor) > CHAPTER_TIME_EPS || Math.abs(sibling.endTime - endTime) > CHAPTER_TIME_EPS) {
         chStore.updateChapter(sibling, { startTime: cursor, endTime });
       }
@@ -5883,22 +7489,24 @@ export function useMovieEditor() {
 
   function onTick(e: Event) {
     const v = e.target as HTMLVideoElement;
-    const actualPlaying = !v.paused && !v.ended;
-    if (isPlaying.value !== actualPlaying) {
-      // seek/跳转期间 video 会短暂 paused；若期望续播，不要把 UI 打成“播放按钮”。
-      if (!(presentationExpectPlaying && !actualPlaying && (viewOnly.value || isPreviewMode.value))) {
-        isPlaying.value = actualPlaying;
-      } else {
-        isPlaying.value = true;
-      }
-    }
+    syncPresentationPlayStateFromVideo(v);
     const seekLocked =
       videoChapterSyncPaused || chapterNavLock.value || presentationChapterTransition;
     // seek/章节切换锁定期内不要用 video.currentTime 覆盖进度条。
     // 移动端 seek 失败时常停在 0，否则绿色条会被立刻拉回起点。
     // 但若 video 已在播放，必须跟 video 时间，否则会一直停在点击位置。
     if (shouldSyncProgressFromVideo(v, seekLocked)) {
-      currentTime.value = v.currentTime;
+      if (viewOnly.value || isPreviewMode.value) {
+        if (canAdoptPresentationVideoTime(v, presentationPlaybackSession.targetTime)) {
+          presentationPlaybackSession.committedTime = v.currentTime;
+          if (!v.paused && presentationPlaybackSession.intent === "play") {
+            presentationPlaybackSession.phase = "playing";
+          }
+          currentTime.value = v.currentTime;
+        }
+      } else {
+        currentTime.value = v.currentTime;
+      }
     }
 
     if (sceneBootstrapBusy.value || editorInitializing.value) {
@@ -5906,13 +7514,16 @@ export function useMovieEditor() {
       return;
     }
 
-    if ((viewOnly.value || isPreviewMode.value) && !presentationChapterTransition && !seekLocked) {
+    if ((viewOnly.value || isPreviewMode.value || !v.paused) && !presentationChapterTransition && !seekLocked) {
       syncPresentationPlaybackFromVideo(v);
+    } else if ((viewOnly.value || isPreviewMode.value) && seekLocked) {
+      syncPresentationUiFromTimeline();
     }
 
     if (viewOnly.value || isPreviewMode.value) {
+      const timelineT = resolvePresentationPlaybackTime(v);
       const navChapter =
-        getPresentationChapterAtVideoTime(v.currentTime) ??
+        getPresentationChapterAtVideoTime(timelineT) ??
         (presentationUiChapterId.value
           ? (() => {
               const uiChapter = chapters.value.find(ch => ch.id === presentationUiChapterId.value);
@@ -5925,16 +7536,28 @@ export function useMovieEditor() {
         const navIdx = getPresentationNavIndex(navChapter);
         const next = navIdx >= 0 ? nav[navIdx + 1] : null;
 
-        if (chapterAutoNext.value && next) {
-          presentationChapterTransition = true;
-          const wasPlaying = !v.paused;
-          void startChapterPlayback(next, {
-            syncVideo: true,
-            autoplay: wasPlaying,
-            keepPlaying: wasPlaying,
-            seekTime: next.startTime,
-            userGesture: false
-          });
+        if (presentationPlaybackSession.autoAdvance) {
+          // Same end-window guard as maybeAutoAdvancePresentation: ignore stale clocks.
+          const t = resolvePresentationPlaybackTime(v);
+          const nearEnd =
+            t >= navChapter.endTime - CHAPTER_END_EPS &&
+            t <= navChapter.endTime + Math.max(CHAPTER_END_EPS, 0.35);
+          const wrapTarget = next ?? (nav.length > 0 ? nav[0] : null);
+          if (nearEnd && wrapTarget) {
+            if (
+              wrapTarget.id === navChapter.id &&
+              Math.abs(t - wrapTarget.startTime) < CHAPTER_TIME_EPS
+            ) {
+              // single-chapter at start after wrap — fall through
+            } else {
+              commandPresentationPlayback({
+                targetTime: wrapTarget.startTime,
+                intent: "play",
+                navChapter: wrapTarget,
+                autoAdvance: true
+              });
+            }
+          }
         } else if (next) {
           chapterAutoNext.value = false;
         }
@@ -5946,9 +7569,7 @@ export function useMovieEditor() {
     const ci = findChIdx(v.currentTime);
 
     if (seekLocked) {
-      if (!v.paused) {
-        ensureVideoSyncedChapterAnimation();
-      } else if (!videoChapterSyncPaused && !chapterNavLock.value) {
+      if (!videoChapterSyncPaused && !chapterNavLock.value && v.paused) {
         syncPausedChapterAnimation(v, ci);
       }
       syncChapterSubtitle(v);
@@ -5956,11 +7577,8 @@ export function useMovieEditor() {
     }
 
     if (chapterPlayTarget.value && !viewOnly.value && !isPreviewMode.value) {
-      // 编辑态：即使有 playTarget，也要按视频时间同步树选中与进度
       syncEditModePlaybackFromVideo(v);
-      if (!v.paused) {
-        ensureVideoSyncedChapterAnimation();
-      } else {
+      if (v.paused) {
         syncPausedChapterAnimation(v, ci);
       }
       syncChapterSubtitle(v);
@@ -5980,14 +7598,113 @@ export function useMovieEditor() {
   }
 
   function onVideoEnd() {
-    isPlaying.value = false;
+    if (viewOnly.value || isPreviewMode.value) {
+      const v = videoEl.value;
+      if (v && isStalePresentationMediaEnd(v)) {
+        // Cached EOF during start/seek — keep optimistic target; effect will re-seek.
+        syncPresentationUiFromTimeline(presentationDisplayTime.value);
+        return;
+      }
+      // 展示页：未手动暂停则循环续播，不因 ended 自动暂停。
+      if (loopPresentationPlaybackFromStart()) return;
+      const endTime = v?.currentTime ?? presentationDisplayTime.value;
+      presentationPlaybackSession.phase = "ended";
+      presentationPlaybackSession.intent = "pause";
+      presentationPlaybackSession.committedTime = endTime;
+      presentationPlaybackSession.targetTime = endTime;
+      presentationPlaybackSession.autoAdvance = false;
+      presentationExpectPlaying = false;
+      presentationUserWantsPaused = true;
+      chapterAutoNext.value = false;
+      clearPresentationResumeTimer();
+      if (!presentationEndedUiSynced) {
+        presentationEndedUiSynced = true;
+        syncPresentationUiFromTimeline(endTime);
+      }
+      stopChapterAnimation();
+      syncCurrentChapterAnimationFromVideo();
+      syncIntroPresentation();
+      return;
+    }
     presentationExpectPlaying = false;
     clearPresentationResumeTimer();
     chapterPlayTarget.value = null;
     chapterAutoNext.value = false;
+
+    // 编辑态循环：只循环「当前活动视频」，从该视频动画1播到末尾再重来
+    if (!viewOnly.value && !isPreviewMode.value && isLooping.value) {
+      const v = videoEl.value;
+      if (v) {
+        lastPresentationAutoSwitchChapterId = null;
+        lastVideoPlaybackSyncTime = Number.POSITIVE_INFINITY;
+        editPlaybackSyncElapsed = Number.POSITIVE_INFINITY;
+        editPlaybackSyncChapterId = null;
+        chAnimChapterId = null;
+        // 严格取当前视频时间轴第一章，绝不回落到其它视频
+        const headCh = timelineChapters.value[0] ?? null;
+        if (headCh) {
+          setEditModeActiveChapter(headCh);
+          chapterPlayTarget.value = headCh;
+        } else {
+          chapterPlayTarget.value = null;
+        }
+        try {
+          v.currentTime = 0;
+        } catch {
+          /* ignore */
+        }
+        currentTime.value = 0;
+        isPlaying.value = true;
+        if (headCh) {
+          _chAnimLock = true;
+          chAnimWallclock = false;
+          chAnimChapterId = headCh.id;
+          resyncChapterMeshFromVideo(v, headCh, 0);
+        }
+        void v.play().catch(() => undefined);
+      }
+      syncIntroPresentation();
+      return;
+    }
+
+    isPlaying.value = false;
+    editPlaybackSyncChapterId = null;
+    editPlaybackSyncElapsed = -1;
+    lastVideoPlaybackSyncTime = -1;
     stopChapterAnimation();
     syncCurrentChapterAnimationFromVideo();
     syncIntroPresentation();
+  }
+
+  function onVideoSeeked() {
+    const v = videoEl.value;
+    if (!v) return;
+    if (viewOnly.value || isPreviewMode.value) {
+      const requestTarget = presentationPlaybackSession.targetTime;
+      if (canAdoptPresentationVideoTime(v, requestTarget)) {
+        presentationPlaybackSession.committedTime = v.currentTime;
+        presentationSeekTargetTime = null;
+        if (presentationPlaybackSession.intent === "play" && !v.paused) {
+          presentationPlaybackSession.phase = "playing";
+        } else if (presentationPlaybackSession.intent === "pause") {
+          presentationPlaybackSession.phase = "paused";
+        }
+      }
+    }
+    // 循环 seek 到 0 时可能仍 paused 一帧；只要 UI 认为在播就按真实时间重刷
+    if (v.paused && !isPlaying.value && !presentationExpectPlaying) return;
+    lastVideoPlaybackSyncTime = Number.POSITIVE_INFINITY;
+    if (!v.paused) {
+      syncVideoDrivenChapterMesh();
+    } else {
+      const ch = getPlaybackChapterAtTime(v.currentTime);
+      if (ch) {
+        chapterPlayTarget.value = ch;
+        _chAnimLock = true;
+        chAnimWallclock = false;
+        resyncChapterMeshFromVideo(v, ch, getChapterAnimElapsed(ch, v.currentTime));
+      }
+    }
   }
 
   let ignoreVideoErrorUntil = 0;
@@ -6086,14 +7803,14 @@ export function useMovieEditor() {
   function syncVideoAudioState() {
     const video = videoEl.value;
     if (!video) return;
-    video.muted = false;
+    // 展示页保持静音，避免移动端/自动化环境丢失手势后无法 play。
+    video.muted = viewOnly.value || isPreviewMode.value;
     video.volume = 1;
   }
 
   function resolveEffectiveVideoLoop() {
-    // 展示/预览避免浏览器循环导致进度条突然回到起点，交给章节逻辑控制。
-    if (viewOnly.value || isPreviewMode.value) return false;
-    return isLooping.value;
+    // 与预览一致：不用原生 loop。编辑开启循环时由 onVideoEnd 回到 0 续播，位移跟 currentTime。
+    return false;
   }
 
   function clearVideoElementSrc(options?: { silent?: boolean }) {
@@ -6110,60 +7827,109 @@ export function useMovieEditor() {
     try {
       video.removeAttribute("src");
       delete video.dataset.editorSrc;
+      delete video.dataset.editorSrcKey;
+      delete video.dataset.editorReloading;
       video.load();
     } catch {
       /* ignore */
     }
   }
 
-  function syncVideoElementSrc(src?: string) {
+  function normalizePresentationVideoSrcKey(raw: string): string {
+    const resolved = resolveAssetUrl(raw) || raw;
+    try {
+      const abs = new URL(resolved, window.location.href);
+      abs.hash = "";
+      return abs.href;
+    } catch {
+      return resolved;
+    }
+  }
+
+  /** @returns true 表示重新绑定了媒体源并触发 load；false 表示同源复用，未重新加载 */
+  function syncVideoElementSrc(src?: string): boolean {
     const raw = src || videoSrc.value;
-    if (!raw) return;
+    if (!raw) return false;
 
     // 已失效的 blob（刷新后或被存成 /blob:...）无法播放，提示重新上传
     if (isTransientMediaUrl(raw)) {
       const live = unwrapTransientMediaUrl(raw);
       if (!live || live.startsWith("data:")) {
         toastShow("视频地址已失效，请重新上传视频文件", "error");
-        return;
+        return false;
       }
       // blob: 仅当前页会话有效；若页面已刷新则 fetch 会失败，交给 error 处理
-      const applyBlob = () => {
-        if (!videoEl.value) return false;
+      const applyBlob = (): "missing" | "reused" | "rebound" => {
+        if (!videoEl.value) return "missing";
         const video = videoEl.value;
+        const key = normalizePresentationVideoSrcKey(live);
+        if (
+          video.dataset.editorSrcKey === key &&
+          video.src &&
+          !video.error &&
+          video.readyState >= HTMLMediaElement.HAVE_METADATA
+        ) {
+          video.loop = resolveEffectiveVideoLoop();
+          video.playbackRate = playbackRate.value;
+          syncVideoAudioState();
+          return "reused";
+        }
         ignoreVideoErrorUntil = 0;
         video.dataset.editorSrc = live;
+        video.dataset.editorSrcKey = key;
         video.preload = "metadata";
         video.removeAttribute("crossorigin");
         video.src = live;
         video.loop = resolveEffectiveVideoLoop();
         video.playbackRate = playbackRate.value;
         syncVideoAudioState();
+        video.dataset.editorReloading = "1";
         video.load();
-        return true;
+        return "rebound";
       };
-      if (!applyBlob()) nextTick(() => applyBlob());
-      return;
+      const blobResult = applyBlob();
+      if (blobResult === "missing") {
+        nextTick(() => applyBlob());
+        return true;
+      }
+      return blobResult === "rebound";
     }
 
     const url = resolveAssetUrl(raw);
-    if (!url) return;
+    if (!url) return false;
     const presentation = viewOnly.value || isPreviewMode.value;
     const resolvedUrl =
       presentation && isCoarsePointerDevice() ? url : isCoarsePointerDevice() ? withVideoPosterFragment(url) : url;
-    const apply = () => {
-      if (!videoEl.value) return false;
+    const key = normalizePresentationVideoSrcKey(url);
+    const apply = (): "missing" | "reused" | "rebound" => {
+      if (!videoEl.value) return "missing";
       const video = videoEl.value;
-      const currentSrc = video.dataset.editorSrc || "";
-      if (currentSrc === url && video.src && !video.error) {
+      const currentKey =
+        video.dataset.editorSrcKey ||
+        (video.dataset.editorSrc ? normalizePresentationVideoSrcKey(video.dataset.editorSrc) : "");
+      const currentSrcKey = video.currentSrc
+        ? normalizePresentationVideoSrcKey(video.currentSrc)
+        : video.src
+          ? normalizePresentationVideoSrcKey(video.src)
+          : "";
+      // 同源（含不同视频节点但 url 相同）：只要已绑定成功就绝不改 src / load()。
+      // 注意：重复赋值相同 src 在部分浏览器仍会触发重新加载，表现为切章/拖进度条闪刷新。
+      if (
+        !video.error &&
+        video.getAttribute("src") &&
+        (currentKey === key || currentSrcKey === key)
+      ) {
+        if (!video.dataset.editorSrcKey) video.dataset.editorSrcKey = key;
+        if (!video.dataset.editorSrc) video.dataset.editorSrc = url;
         video.loop = resolveEffectiveVideoLoop();
         video.playbackRate = playbackRate.value;
         syncVideoAudioState();
-        return true;
+        return "reused";
       }
       // 换源瞬间可能触发 error，短暂忽略
       ignoreVideoErrorUntil = performance.now() + 400;
       video.dataset.editorSrc = url;
+      video.dataset.editorSrcKey = key;
       video.preload = presentation && isCoarsePointerDevice() ? "auto" : "metadata";
       video.src = resolvedUrl;
       // 同源 /editor-api 代理不需要 crossorigin，避免部分浏览器误判 CORS
@@ -6180,11 +7946,16 @@ export function useMovieEditor() {
       video.loop = resolveEffectiveVideoLoop();
       video.playbackRate = playbackRate.value;
       syncVideoAudioState();
+      video.dataset.editorReloading = "1";
       if (!isCoarsePointerDevice() || presentation) video.load();
-      return true;
+      return "rebound";
     };
-    if (apply()) return;
-    nextTick(() => apply());
+    const result = apply();
+    if (result === "missing") {
+      nextTick(() => apply());
+      return true;
+    }
+    return result === "rebound";
   }
 
   function removeVideo() {
@@ -6381,84 +8152,72 @@ export function useMovieEditor() {
   function togglePlay() {
     const video = videoEl.value;
     if (!video) return;
+    if (viewOnly.value || isPreviewMode.value) {
+      const pauseRequested = presentationDisplayPlaying.value;
+      let targetTime = presentationDisplayTime.value;
+      let navChapter = presentationPlaybackSession.navChapterId
+        ? getPresentationNavChapters().find(
+            ch => ch.id === presentationPlaybackSession.navChapterId
+          ) ?? null
+        : getPresentationChapterAtVideoTime(targetTime);
+      const atMediaEnd =
+        presentationPlaybackSession.phase === "ended" ||
+        video.ended ||
+        isPresentationAtMediaEnd(video);
+      // 片尾再播：必须从第一导航章起点重来，不能用「最后一章 startTime」(常接近片尾)。
+      if (!pauseRequested && atMediaEnd) {
+        navChapter = getPresentationNavChapters()[0] ?? null;
+        targetTime = navChapter?.startTime ?? 0;
+      }
+      commandPresentationPlayback({
+        targetTime,
+        intent: pauseRequested ? "pause" : "play",
+        navChapter,
+        autoAdvance: !pauseRequested
+      });
+      return;
+    }
     if (video.paused) {
-      if (viewOnly.value || isPreviewMode.value) {
-        const navChapter =
-          getPresentationChapterAtVideoTime(video.currentTime) ??
-          (presentationUiChapterId.value
-            ? (() => {
-                const uiChapter = chapters.value.find(ch => ch.id === presentationUiChapterId.value);
-                return uiChapter ? resolvePresentationNavChapter(uiChapter) : null;
-              })()
-            : null) ??
-          resolvePresentationPlaybackChapter(video) ??
-          getPlaybackChapterAtTime(video.currentTime);
-        if (navChapter) {
-          const playable = resolvePlayableChapterForPresentation(navChapter);
-          chapterPlayTarget.value = playable;
-          syncPresentationUiFromChapter(navChapter);
-          chapterAutoNext.value = true;
-          presentationExpectPlaying = true;
-          // 不要把 currentTime 打回章节起点，否则进度条 seek 后再点播放会跳走。
-          if (!isPresentationNavChapterAtTime(navChapter, video.currentTime)) {
-            syncPresentationVideoTimeToChapter(video, navChapter);
-          }
-          syncChapterVisualState(playable, getPresentationAnimElapsed(video, playable), {
-            skipOutlineRebuild: false,
-            skipOverlaySync: false
-          });
-          if (chapterNeedsOutlineRebuild(playable)) {
-            refreshChapterOutlines(playable);
-          }
+      chapterPlayTarget.value = null;
+      if (video.ended || video.currentTime >= Math.max((duration.value || video.duration || 0) - CHAPTER_END_EPS, 0)) {
+        const ci = findChIdx(video.currentTime);
+        const resumeChapter = ci >= 0 ? timelineChapters.value[ci] : timelineChapters.value[0];
+        const resumeAt = resumeChapter?.startTime ?? 0;
+        try {
+          video.currentTime = Math.max(0, resumeAt);
+          currentTime.value = video.currentTime;
+        } catch {
+          /* ignore */
         }
-        primePresentationVideoElement(video);
-        presentationChapterCooldownUntil = performance.now() + 500;
-        claimPresentationPlaybackGesture(video);
-        void forceResumeVideoPlayback(video)
-          .then(ok => {
-            if (!ok) {
-              showPresentationPlaybackHint();
-              return;
-            }
-            stopChapterAnimation();
-            ensureVideoSyncedChapterAnimation();
-            syncCurrentChapterAnimationFromVideo();
-          })
-          .catch(() => showPresentationPlaybackHint());
-      } else {
-        chapterPlayTarget.value = null;
-        if (video.ended || video.currentTime >= Math.max((duration.value || video.duration || 0) - CHAPTER_END_EPS, 0)) {
-          const ci = findChIdx(video.currentTime);
-          const resumeChapter = ci >= 0 ? timelineChapters.value[ci] : timelineChapters.value[0];
-          const resumeAt = resumeChapter?.startTime ?? 0;
-          try {
-            video.currentTime = Math.max(0, resumeAt);
-            currentTime.value = video.currentTime;
-          } catch {
-            /* ignore */
-          }
-        }
-        void video.play().catch(() => {
-          void waitForVideoReady().then(ok => {
-            if (!ok || !videoEl.value) return;
-            void videoEl.value.play().catch(() => {});
-          });
+      }
+      void video.play().catch(() => {
+        void waitForVideoReady().then(ok => {
+          if (!ok || !videoEl.value) return;
+          void videoEl.value.play().catch(() => {});
         });
-      }
+      });
     } else {
-      presentationExpectPlaying = false;
-      clearPresentationResumeTimer();
-      chapterAutoNext.value = false;
       video.pause();
-      if (!viewOnly.value && !isPreviewMode.value) {
-        chapterPlayTarget.value = null;
-      }
+      chapterPlayTarget.value = null;
       syncCurrentChapterAnimationFromVideo();
     }
-    if (!viewOnly.value && !isPreviewMode.value) showPlaybackHint();
+    showPlaybackHint();
   }
 
   function onVideoPlay() {
+    if (viewOnly.value || isPreviewMode.value) {
+      // Observe only. A stale play event cannot change the latest pause intent.
+      if (presentationPlaybackSession.intent === "pause") return;
+      const video = videoEl.value;
+      if (
+        video &&
+        canAdoptPresentationVideoTime(video, presentationPlaybackSession.targetTime)
+      ) {
+        presentationPlaybackSession.committedTime = video.currentTime;
+        presentationSeekTargetTime = null;
+        presentationPlaybackSession.phase = "playing";
+      }
+    }
     isPlaying.value = true;
     playbackHintVisible.value = false;
     playbackHintFading.value = false;
@@ -6467,7 +8226,16 @@ export function useMovieEditor() {
     }
     const video = videoEl.value;
     const ch = video ? getPlaybackChapterAtTime(video.currentTime) : null;
-    if (ch && chapterHasAnimation(ch)) {
+    if (!viewOnly.value && !isPreviewMode.value) {
+      // 编辑态：开播即对齐当前动画运镜（不依赖下一次 timeupdate）
+      if (ch && editPlaybackCameraChapterId !== ch.id) {
+        editPlaybackCameraChapterId = ch.id;
+        applyChapterCameraForNav(ch, "playback");
+      }
+      if (ch && (chapterHasAnimation(ch) || chapterHasAnyModelEdits(ch))) {
+        ensureVideoSyncedChapterAnimation();
+      }
+    } else if (ch && chapterHasAnimation(ch)) {
       ensureVideoSyncedChapterAnimation();
     }
     syncIntroPresentation();
@@ -6475,32 +8243,78 @@ export function useMovieEditor() {
   }
 
   function onVideoPause() {
-    // seek / 章节跳转会主动 pause；若期望续播则立刻补 play（含锁定期），避免 UI 变回 ▶。
-    if (presentationExpectPlaying) {
-      isPlaying.value = true;
-      const video = videoEl.value;
-      if (video && video.paused && !video.ended) {
-        try {
-          const p = video.play();
-          if (p && typeof p.catch === "function") void p.catch(() => undefined);
-        } catch {
-          /* ignore */
-        }
-        void forceResumeVideoPlayback(video).then(ok => {
-          if (ok) {
-            stopChapterAnimation();
-            ensureVideoSyncedChapterAnimation();
-          }
-        });
+    if (viewOnly.value || isPreviewMode.value) {
+      // Seek/transition pauses are media noise, not user intent or a blocked autoplay.
+      if (
+        presentationChapterTransition ||
+        videoChapterSyncPaused ||
+        presentationPlaybackSession.phase === "seeking"
+      ) {
+        return;
       }
+      const video = videoEl.value;
+      if (video && (video.ended || isPresentationAtMediaEnd(video))) {
+        if (isStalePresentationMediaEnd(video)) {
+          syncPresentationUiFromTimeline(presentationDisplayTime.value);
+          return;
+        }
+        // 片尾 pause：若仍是播放意图则循环，禁止把 intent 改成 pause（会导致轮播几次后卡死）。
+        if (
+          presentationPlaybackSession.intent === "play" &&
+          !presentationUserWantsPaused
+        ) {
+          loopPresentationPlaybackFromStart();
+          return;
+        }
+        presentationPlaybackSession.phase = "ended";
+        presentationPlaybackSession.intent = "pause";
+        presentationPlaybackSession.committedTime = video.currentTime;
+        presentationPlaybackSession.targetTime = video.currentTime;
+      } else if (
+        presentationPlaybackSession.intent === "play" &&
+        !presentationUserWantsPaused &&
+        video?.paused
+      ) {
+        presentationPlaybackSession.phase = "blocked";
+        void recoverPresentationPlaybackAfterUnexpectedPause();
+      } else if (presentationPlaybackSession.intent === "pause") {
+        presentationPlaybackSession.phase = "paused";
+        if (video && canAdoptPresentationVideoTime(video, presentationPlaybackSession.targetTime)) {
+          presentationPlaybackSession.committedTime = video.currentTime;
+        }
+      }
+      syncPresentationUiFromTimeline(presentationDisplayTime.value);
       return;
     }
     if (presentationChapterTransition || videoChapterSyncPaused) {
       return;
     }
+    // 循环开启时，播到片尾会先触发 pause 再 ended；勿清锁
+    if (!viewOnly.value && !isPreviewMode.value && isLooping.value) {
+      const v = videoEl.value;
+      const dur = v?.duration || 0;
+      if (v && (v.ended || (dur > 0 && v.currentTime >= dur - 0.08))) {
+        return;
+      }
+    }
     isPlaying.value = false;
     stopChapterAnimation();
-    syncCurrentChapterAnimationFromVideo();
+    // 编辑态停播：清 playTarget，并回到当前章起始帧预览。
+    // 若仍按 video.currentTime 套结束位移，再切动画/点选子模型会把错误姿态写进编辑态。
+    if (!viewOnly.value && !isPreviewMode.value) {
+      chapterPlayTarget.value = null;
+      const ch =
+        selectedChapter.value ??
+        (videoEl.value ? getPlaybackChapterAtTime(videoEl.value.currentTime) : null);
+      if (ch) {
+        applyChapterEditorVisualState(ch);
+      } else {
+        resetAllModelsToDefault();
+      }
+    } else {
+      syncCurrentChapterAnimationFromVideo();
+      syncPresentationUiFromTimeline(resolvePresentationPlaybackTime());
+    }
     syncIntroPresentation();
     syncComposerMsaaSamples();
   }
@@ -6606,6 +8420,16 @@ export function useMovieEditor() {
     seg.endRot = (seg.endRot || [0, 0, 0]).map((n: number) => roundAnimNum(n));
   }
 
+  /** chapter.modelConfigs 内动画段默认绝对坐标；仅旧数据 relativeTransform 时先转绝对 */
+  function cloneStoredAnimSegmentForPlayback(obj: THREE.Object3D, seg: any, animConfig?: { relativeTransform?: boolean }) {
+    const asRelative =
+      !!(animConfig as any)?.relativeTransform || !!(seg as any)._relativeTransform;
+    if (asRelative && usesRelativeAnimRotation(obj)) {
+      return cloneAnimSegmentForApply(obj, seg);
+    }
+    return cloneStoredAnimSegmentForApply(seg);
+  }
+
   function cloneAnimSegmentForApply(obj: THREE.Object3D, seg: any) {
     let startPos = [...(seg.startPos || [0, 0, 0])];
     let endPos = [...(seg.endPos || [0, 0, 0])];
@@ -6617,8 +8441,15 @@ export function useMovieEditor() {
       startRot = animRotToAbsolute(obj, startRot);
       endRot = animRotToAbsolute(obj, endRot);
     }
+    const {
+      _animPivotCache: _dropPivot,
+      _playing: _dropPlaying,
+      _progress: _dropProgress,
+      _expandedPanels: _dropPanels,
+      ...rest
+    } = seg;
     return {
-      ...seg,
+      ...rest,
       startPos,
       endPos,
       startRot,
@@ -6629,8 +8460,15 @@ export function useMovieEditor() {
 
   /** chapter.modelConfigs 内动画段已是绝对坐标，勿再做相对→绝对转换 */
   function cloneStoredAnimSegmentForApply(seg: any) {
+    const {
+      _animPivotCache: _dropPivot,
+      _playing: _dropPlaying,
+      _progress: _dropProgress,
+      _expandedPanels: _dropPanels,
+      ...rest
+    } = seg;
     return {
-      ...seg,
+      ...rest,
       startPos: [...(seg.startPos || [0, 0, 0])],
       endPos: [...(seg.endPos || [0, 0, 0])],
       startRot: [...(seg.startRot || [0, 0, 0])],
@@ -6647,6 +8485,25 @@ export function useMovieEditor() {
 
   function resolveAnimPreviewMode(seg: any, model: Model, nodeId: string | null): "start" | "end" {
     return animSegmentDiffersFromDefault(seg, model, nodeId) ? "end" : "start";
+  }
+
+  /** 编辑态暂停时默认展示起始帧；仅当前选中且正在编辑结束帧时才用 end。
+   *  绝不能在 isChapterPlaybackActive 时套 end —— 播放锁/切选中会把子模型打到结束位移。 */
+  function resolveMeshAnimDisplayMode(
+    model: Model,
+    nodeId: string | null,
+    seg: any,
+    _resolvedMode: "start" | "end"
+  ): "start" | "end" {
+    const isLiveEndEdit =
+      !viewOnly.value &&
+      !isPreviewMode.value &&
+      !isEditVideoMeshSyncActive() &&
+      selModelId.value === model.id &&
+      (selModelNodeId.value ?? null) === (nodeId ?? null) &&
+      editingSeg.value === seg &&
+      editingSegMode.value === "end";
+    return isLiveEndEdit ? "end" : "start";
   }
 
   /** 读取 mesh 当前绝对变换作为动画段默认值 */
@@ -6807,7 +8664,7 @@ export function useMovieEditor() {
     if (seg) {
       if (!seg._expandedPanels) seg._expandedPanels = ["start", "end"];
     }
-    bindAnimSegmentsToSelection(model?.id ?? selModelId.value, selModelNodeId.value);
+    bindAnimSegmentsToSelection(model?.id ?? selModelId.value, selModelNodeId.value, selectedChapterId.value);
     recalcAnimDuration();
   }
 
@@ -6817,7 +8674,7 @@ export function useMovieEditor() {
 
   function markAnimDirty() {
     animDirty.value = true;
-    bindAnimSegmentsToSelection();
+    bindAnimSegmentsToSelection(undefined, undefined, selectedChapterId.value);
   }
 
   function resetAnimConfig() {
@@ -6858,6 +8715,7 @@ export function useMovieEditor() {
     cfg.animConfig = {
       duration,
       easing,
+      relativeTransform: false,
       segments: segs.map(s => {
         const startPos = [...(s.startPos || [0, 0, 0])];
         const endPos = [...(s.endPos || [0, 0, 0])];
@@ -6913,6 +8771,12 @@ export function useMovieEditor() {
     const mid = selModel.value.id;
     const nid = selModelNodeId.value;
 
+    // live 段不属于当前章节时拒绝写入，防止串到其它动画节点
+    if (animSegments.length > 0 && !animSegmentsBelongToChapter(ch.id)) {
+      toastShow("当前动画段不属于该节点，请重新选中子物体后再保存", "warning");
+      return;
+    }
+    bindAnimSegmentsToSelection(mid, nid, ch.id);
     persistAnimConfigToChapterFor(ch, mid, nid, animSegments);
     animDirty.value = false;
 
@@ -6942,10 +8806,23 @@ export function useMovieEditor() {
     const m = selModel.value;
     const ch = getActiveChapter();
     if (!m || !ch) return;
-    const cfg = getActiveModelConfig(ch);
-    if (!cfg.highlight && !cfg.outline && !cfg.wireframe) return;
+    const cfg = readActiveModelConfig(ch);
+    if (!cfg.highlight && !cfg.outline && !cfg.wireframe) {
+      // live 开关也可能刚打开但尚未写入章节
+      if (!mHL.value && !mOut.value && !mWire.value) return;
+    }
+    const liveCfg = {
+      ...createDefaultModelConfig(),
+      ...cfg,
+      highlight: mHL.value,
+      outline: mOut.value,
+      wireframe: mWire.value,
+      outlineColor: mOutlineColor.value,
+      wireframeColor: mWireColor.value,
+      modelHighlightColor: mHLColor.value
+    };
     for (const target of getNodeObjects(m.id, selModelNodeId.value, true)) {
-      rebuildOutlineForObject(m, target, cfg);
+      rebuildOutlineForObject(m, target, liveCfg);
     }
   }
 
@@ -7593,15 +9470,23 @@ export function useMovieEditor() {
   }
 
   function meshBelongsToVisualOwner(mesh: THREE.Mesh, ownerObj: THREE.Object3D): boolean {
-    const ownerNodeId = ownerObj.userData?.nodeId as string | undefined;
-    if (!ownerNodeId) return true;
-    const meshNodeId = mesh.userData?.nodeId as string | undefined;
-    if (meshNodeId !== ownerNodeId) return false;
-    let cur: THREE.Object3D | null = mesh;
+    // 多材质合并节点：owner 常是 Group/host，子 mesh 的 nodeId 与 host 不同。
+    // 以祖先关系为准，否则轮廓/线框/高亮会收集到空列表（本柜子模型即此情况）。
+    if (mesh === ownerObj) return true;
+    let cur: THREE.Object3D | null = mesh.parent;
     while (cur) {
       if (cur === ownerObj) return true;
       cur = cur.parent;
     }
+
+    const ownerNodeId = ownerObj.userData?.nodeId as string | undefined;
+    if (!ownerNodeId) return false;
+    const ownerMerged = (ownerObj.userData?.mergedNodeIds as string[] | undefined) ?? [];
+    const meshNodeId = mesh.userData?.nodeId as string | undefined;
+    const meshMergedId = mesh.userData?.mergedNodeId as string | undefined;
+    if (meshNodeId === ownerNodeId || meshMergedId === ownerNodeId) return true;
+    if (meshNodeId && ownerMerged.includes(meshNodeId)) return true;
+    if (meshMergedId && ownerMerged.includes(meshMergedId)) return true;
     return false;
   }
 
@@ -7625,10 +9510,18 @@ export function useMovieEditor() {
     if (!modelConfigOutlinePass) return;
     modelConfigOutlinePass.visibleEdgeColor.set(new THREE.Color(color));
     modelConfigOutlinePass.hiddenEdgeColor.set(HIDDEN_EDGE_COLOR);
-    modelConfigOutlinePass.edgeStrength = 9.5;
-    modelConfigOutlinePass.edgeThickness = 3.4;
-    modelConfigOutlinePass.edgeGlow = 0.38;
     modelConfigOutlinePass.pulsePeriod = 0;
+    if (isPresentationMode()) {
+      // 展示页：全分辨率 + 稍细描边，配合 SMAA，红框锯齿会轻很多
+      modelConfigOutlinePass.downSampleRatio = 1;
+      modelConfigOutlinePass.edgeStrength = 5.5;
+      modelConfigOutlinePass.edgeThickness = 1.35;
+      modelConfigOutlinePass.edgeGlow = 0;
+    } else {
+      modelConfigOutlinePass.edgeStrength = 7;
+      modelConfigOutlinePass.edgeThickness = 2;
+      modelConfigOutlinePass.edgeGlow = 0.12;
+    }
   }
 
   function attachOutlineEdgeGlow(
@@ -7707,6 +9600,27 @@ export function useMovieEditor() {
     else material.dispose();
   }
 
+  /**
+   * GLB 常让多个零件共享同一 Material。线框/高亮若原地改 emissive/colorWrite，
+   * 会“选一个 PACK03001 却亮一整排”。对当前 mesh 克隆出独立材质再改。
+   */
+  function ensureUniqueMeshMaterials(mesh: THREE.Mesh) {
+    if (mesh.userData.__uniqueMaterials) return;
+    const src = mesh.material;
+    if (!src) return;
+    const list = Array.isArray(src) ? src : [src];
+    const cloned = list.map(mat => {
+      const next = mat.clone();
+      // Three r184 把 name 写进 #define SHADER_NAME；克隆后清空，避免 T_text_* 再炸着色器
+      next.name = "";
+      next.needsUpdate = true;
+      return next;
+    });
+    mesh.userData.__sharedMaterialsBeforeUnique = src;
+    mesh.material = Array.isArray(src) ? cloned : cloned[0];
+    mesh.userData.__uniqueMaterials = true;
+  }
+
   function attachOverlayToOwner(owner: THREE.Object3D, sourceMesh: THREE.Mesh, overlay: THREE.Object3D) {
     sourceMesh.updateWorldMatrix(true, false);
     owner.updateWorldMatrix(true, false);
@@ -7755,14 +9669,39 @@ export function useMovieEditor() {
   }
 
   function restoreWireframeSurface(mesh: THREE.Mesh) {
+    const snaps = mesh.userData.wireframeMaterialSnap as
+      | Array<{
+          mat: THREE.Material;
+          colorWrite: boolean;
+          depthWrite: boolean;
+          transparent: boolean;
+          opacity: number;
+          wireframe?: boolean;
+        }>
+      | undefined;
+    if (Array.isArray(snaps)) {
+      for (const snap of snaps) {
+        const mat = snap.mat;
+        if (!mat) continue;
+        mat.colorWrite = snap.colorWrite;
+        mat.depthWrite = snap.depthWrite;
+        mat.transparent = snap.transparent;
+        mat.opacity = snap.opacity;
+        if (typeof snap.wireframe === "boolean" && "wireframe" in mat) {
+          (mat as THREE.MeshBasicMaterial).wireframe = snap.wireframe;
+        }
+        mat.needsUpdate = true;
+      }
+      delete mesh.userData.wireframeMaterialSnap;
+    }
     if (mesh.userData.wireframeSavedMaterials !== undefined) {
       const temp = mesh.material;
       mesh.material = mesh.userData.wireframeSavedMaterials;
       delete mesh.userData.wireframeSavedMaterials;
       if (temp !== mesh.material) disposeOverlayMaterial(temp);
     }
-    if (mesh.userData.wireframeSurfaceHidden) {
-      mesh.visible = mesh.userData.wireframeSavedVisible ?? true;
+    if (mesh.userData.wireframeSavedVisible !== undefined) {
+      mesh.visible = mesh.userData.wireframeSavedVisible;
       delete mesh.userData.wireframeSavedVisible;
     }
     delete mesh.userData.wireframeSurfaceHidden;
@@ -7810,10 +9749,30 @@ export function useMovieEditor() {
   }
 
   function hideMeshSurfaceForWireframe(mesh: THREE.Mesh, ownerKey: string) {
+    // 保持 mesh.visible=true，否则 OutlinePass / 模型高亮在线框模式下会一起失效。
+    // 仅关闭 colorWrite，用边线 overlay 表达线框。
+    ensureUniqueMeshMaterials(mesh);
+    if (!mesh.userData.wireframeSurfaceHidden) {
+      const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+      mesh.userData.wireframeMaterialSnap = mats.map(mat => ({
+        mat,
+        colorWrite: mat.colorWrite !== false,
+        depthWrite: mat.depthWrite !== false,
+        transparent: !!mat.transparent,
+        opacity: typeof mat.opacity === "number" ? mat.opacity : 1,
+        wireframe: "wireframe" in mat ? !!(mat as THREE.MeshBasicMaterial).wireframe : false
+      }));
+      for (const mat of mats) {
+        mat.colorWrite = false;
+        mat.transparent = true;
+        mat.opacity = 0;
+        mat.needsUpdate = true;
+      }
+    }
     if (mesh.userData.wireframeSavedVisible === undefined) {
       mesh.userData.wireframeSavedVisible = mesh.visible;
     }
-    mesh.visible = false;
+    mesh.visible = true;
     mesh.userData.wireframeSurfaceHidden = true;
     mesh.userData.wireframeOwner = ownerKey;
     delete mesh.userData.pickHiddenForOutline;
@@ -7826,8 +9785,35 @@ export function useMovieEditor() {
     thresholdAngle: number,
     userData: Record<string, unknown>
   ): THREE.LineSegments | null {
-    const edges = new THREE.EdgesGeometry(sourceMesh.geometry, thresholdAngle);
-    if (edges.attributes.position.count > 200000) {
+    const srcGeo = sourceMesh.geometry;
+    if (!srcGeo?.attributes?.position) return null;
+
+    const posCount = srcGeo.attributes.position.count;
+    const triCount = srcGeo.index ? srcGeo.index.count / 3 : posCount / 3;
+    let edges: THREE.BufferGeometry | null = null;
+    try {
+      // CAD 高模用 EdgesGeometry 极慢且常超上限；改用 WireframeGeometry 兜底。
+      if (triCount > 60000 || posCount > 120000) {
+        edges = new THREE.WireframeGeometry(srcGeo);
+      } else {
+        edges = new THREE.EdgesGeometry(srcGeo, thresholdAngle);
+        if (edges.attributes.position.count > 250000) {
+          edges.dispose();
+          edges = new THREE.WireframeGeometry(srcGeo);
+        }
+      }
+    } catch {
+      try {
+        edges = new THREE.WireframeGeometry(srcGeo);
+      } catch {
+        return null;
+      }
+    }
+    if (!edges?.attributes?.position || edges.attributes.position.count < 2) {
+      edges?.dispose();
+      return null;
+    }
+    if (edges.attributes.position.count > 500000) {
       edges.dispose();
       return null;
     }
@@ -7839,7 +9825,9 @@ export function useMovieEditor() {
         transparent: opacity < 1,
         opacity,
         depthTest: true,
-        depthWrite: false
+        depthWrite: false,
+        // 展示页 SMAA 对 toneMapped 线条更友好；避免额外色调映射加粗锯齿感
+        toneMapped: false
       })
     );
     line.frustumCulled = false;
@@ -7855,43 +9843,75 @@ export function useMovieEditor() {
   }
 
   function applyBodyHighlightToMesh(mesh: THREE.Mesh, color: string, ownerKey: string) {
+    // 线框仅关掉 colorWrite，mesh 仍可见；允许与线框叠加时仍改 emissive（关掉 colorWrite 时效果弱，但非线框时正常）
+    if (mesh.visible === false) return;
+    ensureUniqueMeshMaterials(mesh);
+
     if (mesh.userData.bodyHighlightSaved === undefined) {
-      mesh.userData.bodyHighlightSaved = mesh.material;
+      const src = mesh.material;
+      const list = Array.isArray(src) ? src : [src];
+      mesh.userData.bodyHighlightSaved = list.map(mat => {
+        const snap: Record<string, any> = { mat };
+        if (
+          mat instanceof THREE.MeshStandardMaterial ||
+          mat instanceof THREE.MeshPhysicalMaterial ||
+          mat instanceof THREE.MeshLambertMaterial ||
+          mat instanceof THREE.MeshPhongMaterial
+        ) {
+          snap.emissive = mat.emissive.clone();
+          snap.emissiveIntensity = mat.emissiveIntensity;
+          snap.color = mat.color.clone();
+        } else if (mat instanceof THREE.MeshBasicMaterial) {
+          snap.color = mat.color.clone();
+        }
+        return snap;
+      });
     }
-    const src = mesh.userData.bodyHighlightSaved;
-    const list = Array.isArray(src) ? src : [src];
+
     const tint = new THREE.Color(color);
-    const next = list.map(mat => {
-      const cloned = mat.clone();
-      if (cloned instanceof THREE.MeshStandardMaterial || cloned instanceof THREE.MeshPhysicalMaterial) {
-        cloned.emissive.copy(tint);
-        cloned.emissiveIntensity = 1.15;
-        cloned.color.lerp(tint, 0.25);
-      } else if (cloned instanceof THREE.MeshLambertMaterial || cloned instanceof THREE.MeshPhongMaterial) {
-        cloned.emissive.copy(tint);
-        cloned.emissiveIntensity = 0.85;
-        cloned.color.lerp(tint, 0.3);
-      } else if (cloned instanceof THREE.MeshBasicMaterial) {
-        cloned.color.copy(tint);
+    const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+    for (const mat of mats) {
+      if (
+        mat instanceof THREE.MeshStandardMaterial ||
+        mat instanceof THREE.MeshPhysicalMaterial
+      ) {
+        mat.emissive.copy(tint);
+        mat.emissiveIntensity = 1.15;
+        mat.color.lerp(tint, 0.25);
+        mat.needsUpdate = true;
+      } else if (mat instanceof THREE.MeshLambertMaterial || mat instanceof THREE.MeshPhongMaterial) {
+        mat.emissive.copy(tint);
+        mat.emissiveIntensity = 0.85;
+        mat.color.lerp(tint, 0.3);
+        mat.needsUpdate = true;
+      } else if (mat instanceof THREE.MeshBasicMaterial) {
+        mat.color.copy(tint);
+        mat.needsUpdate = true;
       }
-      return cloned;
-    });
-    mesh.material = Array.isArray(src) ? next : next[0];
+    }
     mesh.userData.bodyHighlightOwner = ownerKey;
   }
 
   function restoreBodyHighlight(mesh: THREE.Mesh) {
     if (mesh.userData.bodyHighlightOwner === undefined) return;
-    const current = mesh.material;
-    if (mesh.userData.bodyHighlightSaved !== undefined) {
-      mesh.material = mesh.userData.bodyHighlightSaved;
-      delete mesh.userData.bodyHighlightSaved;
+    const snaps = mesh.userData.bodyHighlightSaved as Array<Record<string, any>> | undefined;
+    if (Array.isArray(snaps)) {
+      for (const snap of snaps) {
+        const mat = snap.mat as THREE.Material | undefined;
+        if (!mat) continue;
+        if (snap.emissive && (mat as any).emissive) {
+          (mat as any).emissive.copy(snap.emissive);
+        }
+        if (typeof snap.emissiveIntensity === "number" && "emissiveIntensity" in mat) {
+          (mat as any).emissiveIntensity = snap.emissiveIntensity;
+        }
+        if (snap.color && (mat as any).color) {
+          (mat as any).color.copy(snap.color);
+        }
+        mat.needsUpdate = true;
+      }
     }
-    const savedList = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
-    const currentList = Array.isArray(current) ? current : [current];
-    for (const mat of currentList) {
-      if (!savedList.includes(mat)) mat.dispose();
-    }
+    delete mesh.userData.bodyHighlightSaved;
     delete mesh.userData.bodyHighlightOwner;
   }
 
@@ -7909,19 +9929,25 @@ export function useMovieEditor() {
     return meshesToOutline;
   }
 
-  function rebuildOutlineForObject(m: Model, obj: THREE.Object3D, cfg: ModelConfig) {
+  function rebuildOutlineForObject(
+    m: Model,
+    obj: THREE.Object3D,
+    cfg: ModelConfig,
+    options?: { touchVisibility?: boolean }
+  ) {
     const modelRoot = meshes.get(m.id);
     if (!modelRoot) return;
 
+    const touchVisibility = options?.touchVisibility !== false;
     const ownerKey = (obj.userData?.nodeId as string | undefined) || `root:${m.id}`;
     removeVisualOverlaysForOwner(modelRoot, ownerKey);
 
     if (!cfg.visible) {
-      obj.visible = false;
+      if (touchVisibility) obj.visible = false;
       invalidatePickMeshCache();
       return;
     }
-    obj.visible = true;
+    if (touchVisibility) obj.visible = true;
     if (!cfg.outline && !cfg.highlight && !cfg.wireframe) {
       syncModelConfigOutlinePass();
       invalidatePickMeshCache();
@@ -7937,16 +9963,30 @@ export function useMovieEditor() {
     for (const c of meshesToOutline) {
       try {
         if (cfg.wireframe) {
-          hideMeshSurfaceForWireframe(c, ownerKey);
           const attachOwner = resolveOverlayAttachOwner(modelRoot, obj, c);
-
           const wireContour = createContourEdgeLines(c, wireframeColor, 1, 24, {
             isWireframeOnly: true,
             outlineOwner: ownerKey
           });
-          if (wireContour) attachOverlayToOwner(attachOwner, c, wireContour);
+          if (wireContour) {
+            hideMeshSurfaceForWireframe(c, ownerKey);
+            attachOverlayToOwner(attachOwner, c, wireContour);
+          } else {
+            // 边线生成失败（超大网格等）：退回原生 wireframe，避免“开关开了没变化”
+            ensureUniqueMeshMaterials(c);
+            hideMeshSurfaceForWireframe(c, ownerKey);
+            const mats = Array.isArray(c.material) ? c.material : [c.material];
+            for (const mat of mats) {
+              (mat as THREE.MeshBasicMaterial).wireframe = true;
+              mat.colorWrite = true;
+              mat.opacity = 1;
+              mat.transparent = false;
+              mat.needsUpdate = true;
+            }
+          }
 
           if (cfg.outline) {
+            applyOutlineHighlight(c, outlineColor, ownerKey);
             attachOutlineEdgeGlow(attachOwner, c, outlineColor, ownerKey);
           }
         } else if (cfg.outline) {
@@ -7955,11 +9995,11 @@ export function useMovieEditor() {
           attachOutlineEdgeGlow(attachOwner, c, outlineColor, ownerKey, 12);
         }
 
-        if (cfg.highlight && !cfg.wireframe) {
+        if (cfg.highlight) {
           applyBodyHighlightToMesh(c, modelHighlightColor, ownerKey);
         }
       } catch {
-        /* ignore */
+        /* ignore per-mesh failures so其他 mesh 仍可应用 */
       }
     }
     syncModelConfigOutlinePass();
@@ -7991,16 +10031,18 @@ export function useMovieEditor() {
     if (!video || !duration.value) return;
 
     const target = clampVideoTime(time, video);
-    const wasPlaying = !video.paused;
-    const shouldPlay = options?.autoplay ?? (viewOnly.value || isPreviewMode.value ? true : wasPlaying);
+    const wasPlaying =
+      viewOnly.value || isPreviewMode.value
+        ? presentationPlaybackSession.intent === "play"
+        : !video.paused && !video.ended;
+    const shouldPlay = options?.autoplay ?? wasPlaying;
 
     if (viewOnly.value || isPreviewMode.value) {
       await seekPresentationTimelineTime(target, shouldPlay);
       return;
     }
 
-    const chapterAtTarget =
-      chapterAtTime(target) ?? resolveActiveChapterAtTime(chapters.value, target);
+    const chapterAtTarget = chapterAtTime(target);
     if (chapterAtTarget) {
       const resolved = resolveChapter(chapterAtTarget);
       if (resolved) {
@@ -8045,100 +10087,12 @@ export function useMovieEditor() {
   async function seekPresentationTimelineTime(target: number, shouldPlay: boolean) {
     const video = videoEl.value;
     if (!video) return;
-    const req = ++chapterPlaybackRequestSeq;
-    presentationChapterTransition = true;
-    videoChapterSyncPaused = true;
-    chapterAutoNext.value = true;
-    if (shouldPlay) {
-      presentationExpectPlaying = true;
-      isPlaying.value = true;
-    }
-    // 手动点击进度条后，短时间内禁止自动切段，避免刚 seek 完就被切回其它节点。
-    presentationChapterCooldownUntil = performance.now() + 1200;
-    currentTime.value = target;
-
-    // 先按目标时间切模型/运镜，不依赖 seek 是否立刻成功——避免“进度到位但模型没反应”。
-    const navForTarget = getPresentationChapterAtVideoTime(target);
-    if (navForTarget) {
-      const playableForTarget = resolvePlayableChapterForPresentationAtTime(navForTarget, target);
-      chapterPlayTarget.value = playableForTarget;
-      lastPresentationAutoSwitchChapterId = playableForTarget.id;
-      syncPresentationUiFromChapter(navForTarget, target);
-      applyChapterCameraForNav(navForTarget, "playback");
-      syncChapterVisualState(playableForTarget, Math.max(0, target - playableForTarget.startTime), {
-        skipOutlineRebuild: false,
-        skipOverlaySync: false
-      });
-      if (chapterNeedsOutlineRebuild(playableForTarget)) {
-        refreshChapterOutlines(playableForTarget);
-      }
-      if (Math.max(0, target - playableForTarget.startTime) <= CHAPTER_TIME_EPS) {
-        prepareChapterForPreviewPlayback(playableForTarget);
-      } else {
-        invalidateChapterAnimTargetsCache(playableForTarget.id);
-      }
-    }
-
-    if (shouldPlay) claimPresentationPlaybackGesture(video);
-    try {
-      if (video.readyState < HTMLMediaElement.HAVE_METADATA) {
-        await waitForVideoReady();
-        if (req !== chapterPlaybackRequestSeq) return;
-      }
-      const seekOk = await seekPresentationMedia(target, shouldPlay, {
-        requestSeq: req,
-        preferContinuous: true
-      });
-      if (req !== chapterPlaybackRequestSeq) return;
-      // seekOk 在 shouldPlay 时基本恒为 true；即使媒体未完全到点也继续续播，禁止清掉 expectPlaying。
-      const actualTime = isPresentationSeekAcceptable(video, target)
-        ? video.currentTime
-        : isSeekNearTarget(video, target)
-          ? video.currentTime
-          : target;
-      currentTime.value = actualTime;
-      const navChapter = getPresentationChapterAtVideoTime(actualTime) ?? navForTarget;
-      if (navChapter) {
-        const playable = resolvePlayableChapterForPresentationAtTime(navChapter, actualTime);
-        chapterPlayTarget.value = playable;
-        lastPresentationAutoSwitchChapterId = playable.id;
-        syncPresentationUiFromChapter(navChapter, actualTime);
-        applyChapterCameraForNav(navChapter, "playback");
-        syncChapterVisualState(playable, Math.max(0, actualTime - playable.startTime), {
-          skipOutlineRebuild: false,
-          skipOverlaySync: false
-        });
-        if (chapterNeedsOutlineRebuild(playable)) {
-          refreshChapterOutlines(playable);
-        }
-      }
-      if (shouldPlay) {
-        presentationExpectPlaying = true;
-        isPlaying.value = true;
-        // 不能只看 !video.paused：seek 期间常“未暂停但也不在走”，会误判跳过续播。
-        await forceResumeVideoPlayback(video, { requestSeq: req });
-        if (req !== chapterPlaybackRequestSeq) return;
-        if (!video.paused && !video.ended) {
-          stopChapterAnimation();
-          ensureVideoSyncedChapterAnimation();
-          syncCurrentChapterAnimationFromVideo();
-        } else if (!seekOk) {
-          showPresentationPlaybackHint();
-        }
-      } else {
-        presentationExpectPlaying = false;
-        video.pause();
-      }
-    } finally {
-      if (req === chapterPlaybackRequestSeq) {
-        presentationChapterTransition = false;
-        videoChapterSyncPaused = false;
-        presentationChapterCooldownUntil = performance.now() + 800;
-        if (shouldPlay && presentationExpectPlaying) {
-          schedulePresentationPlaybackResume(req);
-        }
-      }
-    }
+    commandPresentationPlayback({
+      targetTime: target,
+      intent: shouldPlay ? "play" : "pause",
+      navChapter: getPresentationChapterAtVideoTime(target),
+      autoAdvance: shouldPlay
+    });
   }
 
   async function waitForVideoReady(timeoutMs = 12000): Promise<boolean> {
@@ -8191,6 +10145,13 @@ export function useMovieEditor() {
 
   function debugViewPlayback(label: string, payload?: Record<string, unknown>) {
     if (!isViewModeDebugEnabled()) return;
+    // 热路径每帧都会进：直接静默，需要时用其它一次性事件日志
+    if (
+      label.startsWith("resolvePlayableChapter:") ||
+      label.startsWith("ensureVideoSyncedChapterAnimation:")
+    ) {
+      return;
+    }
     if (payload) {
       console.log(`[view-debug] ${label}`, payload);
     } else {
@@ -8223,10 +10184,11 @@ export function useMovieEditor() {
       return descendantAnimated;
     }
 
-    // 兼容历史数据：某些场景“父节点按钮 + 同时间段兄弟节点承载动画”
+    // 兼容历史数据：仅在同一父视频内找同时间段兄弟节点，禁止跨视频互抢
     const overlapCandidates = chapters.value
       .filter(item => {
         if (item.id === chapter.id) return false;
+        if (chapter.parentId && item.parentId !== chapter.parentId) return false;
         const overlap =
           item.startTime <= chapter.endTime - CHAPTER_TIME_EPS &&
           item.endTime >= chapter.startTime + CHAPTER_TIME_EPS;
@@ -8275,95 +10237,63 @@ export function useMovieEditor() {
   function resetEditPlaybackBeforePresentation() {
     stopChapterAnimation();
     chapterPlayTarget.value = null;
+    resetPresentationPlaybackSession(0);
     presentationUiChapterId.value = null;
     presentationNavIndex.value = -1;
+    presentationUiRevision.value = 0;
     lastPresentationAutoSwitchChapterId = null;
     chapterAutoNext.value = false;
-    presentationExpectPlaying = false;
-    clearPresentationResumeTimer();
+    presentationManualNavUntil = 0;
     totalPlaying.value = false;
     if (videoEl.value) videoEl.value.pause();
   }
 
-  async function beginPresentationPlayback(
+  function beginPresentationPlayback(
     chapter?: Chapter | null,
     options?: { autoplay?: boolean }
   ) {
     const startChapter = chapter ?? getPresentationStartChapter();
     if (!startChapter) return;
-    // 展示/预览模式固定显示右上角视频窗（含移动端）
     showVideoPip.value = true;
+    const autoplay = options?.autoplay ?? true;
+    const navChapter = resolvePresentationNavChapter(startChapter);
+    const startTime = Math.max(0, navChapter.startTime);
+    presentationEndedUiSynced = false;
 
-    chapterAutoNext.value = true;
-    if (videoEl.value && videoSrc.value) {
-      await waitForVideoReady();
+    // Refresh / remount often leaves media at EOF (browser resume). Force the clock
+    // back to the presentation start before the unified command runs.
+    const video = videoEl.value;
+    if (video) {
+      try {
+        video.pause();
+      } catch {
+        /* ignore */
+      }
+      try {
+        if (
+          video.ended ||
+          isPresentationAtMediaEnd(video) ||
+          Math.abs(video.currentTime - startTime) > CHAPTER_TIME_EPS
+        ) {
+          video.currentTime = startTime;
+        }
+      } catch {
+        /* metadata may not be ready; effect will seek again */
+      }
     }
 
-    const resolved = resolveChapter(resolvePlayableChapterForPresentation(startChapter));
-    if (!resolved) return;
-
-    const { chapter: startResolvedChapter, idx } = resolved;
-    const autoplay = options?.autoplay ?? true;
-
-    presentationChapterTransition = true;
-    videoChapterSyncPaused = true;
-    try {
-      stopChapterAnimation();
-      navigateToChapter(startResolvedChapter, idx, {
-        seek: false,
-        cameraMode: "playback",
-        visualElapsed: 0,
-        holdCurrentTime: true
-      });
-      prepareChapterForPreviewPlayback(startResolvedChapter);
-      syncPresentationUiFromChapter(startResolvedChapter);
-      currentTime.value = startResolvedChapter.startTime;
-
-      const video = videoEl.value;
-      if (video) {
-        video.pause();
-        const seekOk = await seekVideoTo(startResolvedChapter.startTime, { pause: true });
-        if (seekOk) {
-          chapterPlayTarget.value = startResolvedChapter;
-          currentTime.value = video.currentTime;
-          syncChapterVisualState(startResolvedChapter, 0, { skipOutlineRebuild: false, skipOverlaySync: false });
-          if (chapterNeedsOutlineRebuild(startResolvedChapter)) {
-            refreshChapterOutlines(startResolvedChapter);
-          }
-        } else {
-          chapterPlayTarget.value = startResolvedChapter;
-          currentTime.value = startResolvedChapter.startTime;
-          debugViewPlayback("beginPresentation:seek-failed", {
-            chapterId: startResolvedChapter.id,
-            target: startResolvedChapter.startTime,
-            currentTime: video.currentTime
-          });
-        }
-      } else {
-        chapterPlayTarget.value = startResolvedChapter;
-        currentTime.value = startResolvedChapter.startTime;
-      }
-
-      if (!autoplay) {
-        showPresentationPlaybackHint();
-        return;
-      }
-
-      if (!video) return;
-      try {
-        await video.play();
-        if (!chapterPlayTarget.value) {
-          chapterPlayTarget.value = startResolvedChapter;
-        }
-        ensureVideoSyncedChapterAnimation();
-        syncCurrentChapterAnimationFromVideo();
-      } catch {
-        showPresentationPlaybackHint();
-      }
-    } finally {
-      presentationChapterTransition = false;
-      videoChapterSyncPaused = false;
-      presentationChapterCooldownUntil = performance.now() + 500;
+    commandPresentationPlayback({
+      targetTime: startTime,
+      intent: autoplay ? "play" : "pause",
+      navChapter,
+      autoAdvance: autoplay
+    });
+    // Give mobile seek more time before EOF observers can clobber the start target.
+    if (isCoarsePointerDevice()) {
+      presentationManualNavUntil = Math.max(
+        presentationManualNavUntil,
+        performance.now() + 2800
+      );
     }
   }
 
@@ -8390,10 +10320,21 @@ export function useMovieEditor() {
       keepPlaying?: boolean;
     }
   ): Promise<void> {
-    presentationChapterTransition = false;
-    videoChapterSyncPaused = false;
     const syncVideo = options?.syncVideo ?? false;
     const presentationSync = syncVideo && (viewOnly.value || isPreviewMode.value);
+    if (presentationSync) {
+      const navChapter = resolvePresentationNavChapter(ch);
+      const targetTime = options?.seekTime ?? navChapter.startTime;
+      const shouldPlay =
+        options?.autoplay ?? options?.keepPlaying ?? presentationPlaybackSession.intent === "play";
+      commandPresentationPlayback({
+        targetTime,
+        intent: shouldPlay ? "play" : "pause",
+        navChapter,
+        autoAdvance: shouldPlay
+      });
+      return;
+    }
     const navChapter = presentationSync ? resolvePresentationNavChapter(ch) : ch;
     const playableChapter = presentationSync
       ? resolvePlayableChapterForPresentationAtTime(navChapter, options?.seekTime ?? navChapter.startTime)
@@ -8408,18 +10349,35 @@ export function useMovieEditor() {
     const playbackReq = ++chapterPlaybackRequestSeq;
     let switchedVideoSource = false;
 
+    // 先上锁再换片源：防止 load/timeupdate 在锁外用旧时间套到其它视频的动画
+    presentationChapterTransition = true;
+    videoChapterSyncPaused = true;
+    stopChapterAnimation();
+    if (
+      playableCh.parentId &&
+      chapterPlayTarget.value?.parentId &&
+      chapterPlayTarget.value.parentId !== playableCh.parentId
+    ) {
+      chapterPlayTarget.value = null;
+      editPlaybackSyncChapterId = null;
+      editPlaybackSyncElapsed = -1;
+      chAnimChapterId = null;
+      lastVideoPlaybackSyncTime = Number.POSITIVE_INFINITY;
+      invalidateChapterAnimTargetsCache();
+    }
+
     if (syncVideo && playableCh.parentId) {
       const targetVideo = getNodeById(nodes.value, playableCh.parentId);
       if (targetVideo && isVideoNode(targetVideo) && targetVideo.videoSrc) {
         if (activeVideoId.value !== targetVideo.id) {
           activeVideoId.value = targetVideo.id;
-          switchedVideoSource = true;
+          const storedDur = targetVideo.videoDuration;
+          if (Number.isFinite(storedDur) && storedDur > 0) duration.value = storedDur;
+          showVideoPip.value = true;
         }
-        const beforeSrc = video?.dataset.editorSrc || "";
-        syncVideoElementSrc(targetVideo.videoSrc);
+        // 仅当真实换源时才算 switched；同源 url 不重新 load、不等待。
+        switchedVideoSource = syncVideoElementSrc(targetVideo.videoSrc);
         video = videoEl.value;
-        const afterSrc = video?.dataset.editorSrc || "";
-        if (beforeSrc !== afterSrc) switchedVideoSource = true;
       }
     }
 
@@ -8434,6 +10392,8 @@ export function useMovieEditor() {
     }
 
     if (!syncVideo) {
+      presentationChapterTransition = false;
+      videoChapterSyncPaused = false;
       if (selectedChapterId.value !== playableCh.id) {
         navigateToChapter(playableCh, navIdx, {
           seek: false,
@@ -8448,7 +10408,16 @@ export function useMovieEditor() {
     }
 
     if (!viewOnly.value && !isPreviewMode.value) {
-      persistActiveChapterDrafts(playableCh);
+      // 仅当目标就是当前正在编辑的节点且确有未落盘改动时再写入，
+      // 避免切到未编辑节点播放时把上一节点残留状态持久化进去。
+      if (
+        selectedChapterId.value === playableCh.id &&
+        selModel.value &&
+        animSegmentsBelongToChapter(playableCh.id) &&
+        hasUnstagedActiveModelEdits()
+      ) {
+        persistActiveChapterDrafts(playableCh);
+      }
     }
 
     const autoplay = options?.autoplay ?? true;
@@ -8481,19 +10450,16 @@ export function useMovieEditor() {
     const needsSeek = !!(video && Math.abs(video.currentTime - target) >= CHAPTER_TIME_EPS);
     ++seekGeneration;
 
-    presentationChapterTransition = true;
-    videoChapterSyncPaused = true;
     chapterAutoNext.value = true;
     if (viewOnly.value || isPreviewMode.value) {
       // 先更新进度条反馈，再等待媒体 seek 完成，避免点击后绿色进度停留在旧位置。
-      currentTime.value = target;
+      commitPresentationSeekTarget(target, video);
       if (autoplay || keepPlaying) {
         if (video) claimPresentationPlaybackGesture(video);
       }
     }
 
     try {
-      stopChapterAnimation();
       chapterPlayTarget.value = playableCh;
       lastPresentationAutoSwitchChapterId = playableCh.id;
       syncPresentationUiFromChapter(navCh, target);
@@ -8509,7 +10475,8 @@ export function useMovieEditor() {
       }
       syncChapterVisualState(playableCh, visualElapsed, {
         skipOutlineRebuild: false,
-        skipOverlaySync: false
+        skipOverlaySync: false,
+        immediatePresent: true
       });
       if (chapterNeedsOutlineRebuild(playableCh)) {
         refreshChapterOutlines(playableCh);
@@ -8605,12 +10572,13 @@ export function useMovieEditor() {
       }
 
       chapterPlayTarget.value = playableCh;
-      syncPresentationUiFromChapter(navCh, video.currentTime);
-      currentTime.value = video.currentTime;
-      const actualElapsed = Math.max(0, video.currentTime - playableCh.startTime);
+      const committedTime = commitPresentationSeekTarget(target, video);
+      syncPresentationUiFromChapter(navCh, committedTime);
+      const actualElapsed = Math.max(0, committedTime - playableCh.startTime);
       syncChapterVisualState(playableCh, actualElapsed, {
         skipOutlineRebuild: false,
-        skipOverlaySync: false
+        skipOverlaySync: false,
+        immediatePresent: true
       });
       if (chapterNeedsOutlineRebuild(playableCh)) {
         refreshChapterOutlines(playableCh);
@@ -8637,14 +10605,20 @@ export function useMovieEditor() {
           const repaired = await seekVideoTo(target, { pause: false });
           if (playbackReq !== chapterPlaybackRequestSeq) return;
           if (repaired || isSeekNearTarget(video, target)) {
-            currentTime.value = video.currentTime;
+            if (isPresentationSeekAcceptable(video, target)) {
+              presentationSeekTargetTime = null;
+              currentTime.value = video.currentTime;
+            } else {
+              presentationSeekTargetTime = target;
+              currentTime.value = target;
+            }
             await forceResumeVideoPlayback(video, { requestSeq: playbackReq });
             if (playbackReq !== chapterPlaybackRequestSeq) return;
           }
         }
         stopChapterAnimation();
-        ensureVideoSyncedChapterAnimation();
-        syncCurrentChapterAnimationFromVideo();
+        // 必须钉住目标章重刷，禁止 ensure/sync 按「可能仍是旧时间」的 currentTime 解析上一章
+        startVideoSyncedChapterAnimation(playableCh);
         debugViewPlayback("startChapterPlayback:play-success", {
           chapterId: playableCh.id,
           navChapterId: navCh.id,
@@ -8652,7 +10626,11 @@ export function useMovieEditor() {
           chapterPlayTargetId: chapterPlayTarget.value?.id ?? null
         });
       } else {
-        syncCurrentChapterAnimationFromVideo();
+        syncChapterVisualState(playableCh, Math.max(0, video.currentTime - playableCh.startTime), {
+          skipOutlineRebuild: false,
+          skipOverlaySync: false,
+          immediatePresent: true
+        });
         if (viewOnly.value || isPreviewMode.value) {
           // 不立刻放弃：finally 里还会 schedule 续播。
           debugViewPlayback("startChapterPlayback:play-pending", {
@@ -8669,14 +10647,38 @@ export function useMovieEditor() {
         videoChapterSyncPaused = false;
         presentationChapterCooldownUntil = performance.now() + 800;
         const activeVideo = videoEl.value;
-        if (activeVideo && isSeekNearTarget(activeVideo, target)) {
+        if (viewOnly.value || isPreviewMode.value) {
+          if (activeVideo && isPresentationSeekAcceptable(activeVideo, target)) {
+            presentationSeekTargetTime = null;
+            currentTime.value = activeVideo.currentTime;
+          } else {
+            presentationSeekTargetTime = target;
+            currentTime.value = target;
+          }
+        } else if (activeVideo && isSeekNearTarget(activeVideo, target)) {
           currentTime.value = activeVideo.currentTime;
         }
-        // 编辑态播放后清掉 playTarget，让 onTick 按视频时间持续同步节点选中
+        // 编辑态：时间仍早于目标章时继续钉住 playTarget，防止旧 currentTime 回刷显示态
         if (!viewOnly.value && !isPreviewMode.value) {
-          chapterPlayTarget.value = null;
+          const stillBeforeTarget =
+            !!activeVideo && activeVideo.currentTime < playableCh.startTime - CHAPTER_TIME_EPS;
+          chapterPlayTarget.value = stillBeforeTarget ? playableCh : null;
           editPlaybackSyncChapterId = playableCh.id;
-          editPlaybackSyncElapsed = Math.max(0, (activeVideo?.currentTime ?? target) - playableCh.startTime);
+          editPlaybackSyncElapsed = Math.max(
+            0,
+            (activeVideo?.currentTime ?? target) - playableCh.startTime
+          );
+          // 未续播：编辑态一律回到起始帧预览（与节点播放按钮初始态一致）
+          if (!autoplay && !keepPlaying) {
+            chapterPlayTarget.value = null;
+            _chAnimLock = false;
+            chAnimWallclock = false;
+            setEditModeActiveChapter(playableCh);
+            syncChapterMetaForm(playableCh);
+            applyChapterEditorVisualState(playableCh);
+          } else {
+            setEditModeActiveChapter(playableCh);
+          }
         } else if (chapterPlayTarget.value) {
           lastPresentationAutoSwitchChapterId = chapterPlayTarget.value.id;
         }
@@ -8689,8 +10691,11 @@ export function useMovieEditor() {
 
   function jumpToChapter(ch: Chapter, seekTime?: number) {
     const video = videoEl.value;
-    const wasPlaying = !!(video && (!video.paused || isPlaying.value));
     const presentation = viewOnly.value || isPreviewMode.value;
+    // 展示页：播放意图只由播放按钮/双击切换；列表与导航只改起点，不改 play/pause。
+    const wasPlaying = presentation
+      ? presentationPlaybackSession.intent === "play"
+      : !!(video && !video.paused && !video.ended);
     const navChapter =
       presentation ? resolvePresentationNavChapter(ch) : ch;
     let targetTime = seekTime ?? navChapter.startTime;
@@ -8699,7 +10704,12 @@ export function useMovieEditor() {
         navChapter.startTime,
         Math.min(targetTime, navChapter.endTime - CHAPTER_END_EPS)
       );
-      void seekPresentationTimelineTime(targetTime, true);
+      commandPresentationPlayback({
+        targetTime,
+        intent: wasPlaying ? "play" : "pause",
+        navChapter,
+        autoAdvance: wasPlaying
+      });
       return;
     }
     void startChapterPlayback(ch, {
@@ -8714,12 +10724,7 @@ export function useMovieEditor() {
   function prevCh() {
     if (!videoEl.value || !hasChapters.value) return;
     if (viewOnly.value || isPreviewMode.value) {
-      const nav = getPresentationNavChapters();
-      if (nav.length <= 1) return;
-      const ci = getActivePresentationNavIndex();
-      if (ci <= 0) return;
-      const targetChapter = nav[ci - 1];
-      void seekPresentationTimelineTime(targetChapter.startTime, true);
+      navigatePresentationChapter(-1);
       return;
     }
 
@@ -8749,12 +10754,7 @@ export function useMovieEditor() {
   function nextCh() {
     if (!videoEl.value || !hasChapters.value) return;
     if (viewOnly.value || isPreviewMode.value) {
-      const nav = getPresentationNavChapters();
-      if (nav.length <= 1) return;
-      const ci = getActivePresentationNavIndex();
-      if (ci < 0 || ci >= nav.length - 1) return;
-      const targetChapter = nav[ci + 1];
-      void seekPresentationTimelineTime(targetChapter.startTime, true);
+      navigatePresentationChapter(1);
       return;
     }
 
@@ -8776,7 +10776,7 @@ export function useMovieEditor() {
 
   function toggleLoop() {
     isLooping.value = !isLooping.value;
-    if (videoEl.value) videoEl.value.loop = isLooping.value;
+    if (videoEl.value) videoEl.value.loop = resolveEffectiveVideoLoop();
     toastShow(isLooping.value ? "循环播放 开" : "循环播放 关", "success");
   }
 
@@ -8794,13 +10794,12 @@ export function useMovieEditor() {
     cancelCameraTransitionSilently();
     chapterPlayTarget.value = null;
     chapterAutoNext.value = false;
+    resetPresentationPlaybackSession(0);
     presentationUiChapterId.value = null;
     presentationNavIndex.value = -1;
+    presentationUiRevision.value = 0;
     lastPresentationAutoSwitchChapterId = null;
-    presentationExpectPlaying = false;
-    clearPresentationResumeTimer();
-    videoChapterSyncPaused = false;
-    presentationChapterTransition = false;
+    presentationManualNavUntil = 0;
     chapterNavLock.value = false;
 
     ensureProjectNodes(proj);
@@ -8837,7 +10836,7 @@ export function useMovieEditor() {
     resetAllModelsToDefault();
     syncIntroPresentation();
 
-    sceneSavedSignature.value = sceneDraftSignature.value;
+    markSceneAsSavedBaseline();
   }
 
   function syncProjectTitleToStore() {
@@ -9073,20 +11072,12 @@ export function useMovieEditor() {
     ensureAllModelMixers();
     layoutEditorGizmosNearScene();
 
-    const ch =
-      (selectedChapterId.value ? chapters.value.find(c => c.id === selectedChapterId.value) : null) ??
-      chapters.value[0];
-    if (!ch) return meshes.size > 0;
-
-    selectedChapterId.value = ch.id;
-    applyChapterModelState(ch, 0);
-    syncChapterForm(ch);
-    syncModelSelectionForChapter(ch);
-
+    // 刷新/恢复会话：不默认选中动画，只框选模型到视野。
+    selectedChapterId.value = null;
+    selectedNodeId.value = null;
+    resetAllModelsToDefault();
     if (meshes.size > 0) {
-      const dur = getChapterCameraTransitionSec(ch);
-      if (isDefaultChapterCamera(ch)) frameCameraOnSceneModels(dur, ch);
-      else applyChapter(ch);
+      frameCameraOnSceneModels(0);
     }
 
     editSceneLinkEntry.value = false;
@@ -9095,16 +11086,16 @@ export function useMovieEditor() {
   }
 
   function applyChapterCameraForLoadedModels() {
-    const ch = selectedChapter.value ?? (chapters.value.length > 0 ? chapters.value[0] : null);
-    if (!ch || meshes.size === 0) return;
-    const dur = getChapterCameraTransitionSec(ch);
-    if (isDefaultChapterCamera(ch)) {
-      frameCameraOnSceneModels(dur, ch);
-    } else {
-      applyChapter(ch);
+    // 仅恢复相机框选，不自动选中任何动画节点
+    if (meshes.size === 0) return;
+    if (selectedChapter.value) {
+      const ch = selectedChapter.value;
+      const dur = getChapterCameraTransitionSec(ch);
+      if (isDefaultChapterCamera(ch)) frameCameraOnSceneModels(dur, ch);
+      else applyChapterCameraForNav(ch, "edit");
+      return;
     }
-    syncChapterForm(ch);
-    nextTick(handleResize);
+    frameCameraOnSceneModels(0);
   }
 
   async function loadModelSetByCode(code: string) {
@@ -9178,7 +11169,7 @@ export function useMovieEditor() {
     const model = selModel.value;
     const target = getTransformTarget(model.id, selModelNodeId.value);
     if (!target) return;
-    const cfg = getActiveModelConfig(ch);
+    const cfg = getWritableModelConfigForTarget(ch, model.id, selModelNodeId.value);
     const isRoot = !selModelNodeId.value;
     const bp = isRoot
       ? (target.userData.basePos || model.basePosition || DEFAULT_MODEL_BASE_POSITION)
@@ -9200,11 +11191,7 @@ export function useMovieEditor() {
   function hasUnstagedActiveModelEdits(): boolean {
     if (!selModel.value) return false;
     if (!animSegmentsBelongToCurrentSelection()) return formSnapshotHasVisualEdits(getModelFormSnapshot());
-    return (
-      animDirty.value ||
-      liveAnimSegmentsHaveEdits() ||
-      formSnapshotHasVisualEdits(getModelFormSnapshot())
-    );
+    return liveAnimSegmentsHaveEdits() || formSnapshotHasVisualEdits(getModelFormSnapshot());
   }
 
   /** 将指定目标的编辑写入章节（切换选中时传入上一选中项，避免串目标） */
@@ -9224,9 +11211,7 @@ export function useMovieEditor() {
     const formMatchesTarget = !target || selectionOwnerKey() === ownerKey;
 
     const hasAnimEdits = !!(
-      segmentsForTarget &&
-      (animDirty.value ||
-        segmentsForTarget.some(seg => animSegmentDiffersFromDefault(seg, model, nodeId)))
+      segmentsForTarget && animSegmentsHaveRealEdits(segmentsForTarget, model, nodeId ?? null)
     );
     const snapshot = getModelFormSnapshot();
     const hasVisualEdits = formMatchesTarget && formSnapshotHasVisualEdits(snapshot);
@@ -9354,7 +11339,16 @@ export function useMovieEditor() {
 
       const loadedAssetKeys = new Set<string>();
       for (const item of sceneData.models || []) {
-        if (!item.path) continue;
+        if (!item.path) {
+          const primitiveType = (item.type || "cube") as ModelType;
+          if (primitiveType === "custom") continue;
+          const m = mStore.createPrimitiveModel(proj.id, primitiveType, item.name || primitiveType);
+          adoptSceneModelIdentity(m, item);
+          if (item.color) m.color = item.color;
+          createPrim(m);
+          proj.models.push(m);
+          continue;
+        }
         const assetKey = normalizeModelAssetKey({ path: item.path, name: item.name });
         if (assetKey && loadedAssetKeys.has(assetKey)) continue;
         const url = resolveAssetUrl(item.path);
@@ -9432,7 +11426,7 @@ export function useMovieEditor() {
     await nextTick();
     handleResize();
     adaptPresentationViewport();
-    sceneSavedSignature.value = sceneDraftSignature.value;
+    markSceneAsSavedBaseline();
   }
 
   async function loadSceneByCode(code: string): Promise<"ok" | "not-found" | "error"> {
@@ -9601,9 +11595,10 @@ export function useMovieEditor() {
       shareLink.value = result.previewUrl ? rewireEditorFrontendHost(result.previewUrl) : buildShareLink(result.code);
       sceneSavedAt.value = result.updatedAt || result.createdAt || new Date().toISOString();
       sceneListVersion.value += 1;
+      void refreshSavedSceneCount();
       saveAllSettings();
       resumeProjectPersist();
-      sceneSavedSignature.value = sceneDraftSignature.value;
+      markSceneAsSavedBaseline();
       toastShow(sceneCode.value ? "场景已保存" : "场景已创建", "success");
       return result;
     } catch (e: any) {
@@ -9702,20 +11697,25 @@ export function useMovieEditor() {
       holdCurrentTime?: boolean;
     }
   ) {
-    const prevChapter = getActiveChapter();
-    if (
-      prevChapter &&
-      prevChapter.id !== chapter.id &&
-      !isPreviewMode.value &&
-      !viewOnly.value
-    ) {
-      flushChapterSessionsToConfigs(prevChapter);
+    // 必须在改 selectedChapterId 之前取出上一章并落盘
+    const prevChapter =
+      selectedChapterId.value && selectedChapterId.value !== chapter.id
+        ? chapters.value.find(c => c.id === selectedChapterId.value) ?? null
+        : null;
+    if (prevChapter && !isPreviewMode.value && !viewOnly.value) {
+      if (selModel.value && animSegmentsBelongToChapter(prevChapter.id)) {
+        captureSelectionSession(prevChapter.id, selModel.value.id, selModelNodeId.value);
+      }
+      flushChapterDraftsToModelConfigs(prevChapter);
       sanitizeChapterModelConfigs(prevChapter);
     }
 
     // 切换节点后清空全部内存会话，避免新节点读到旧节点的草稿
     if (!prevChapter || prevChapter.id !== chapter.id) {
       selectionEditDrafts.clear();
+      clearLiveAnimEditorState();
+      editPlaybackSyncChapterId = null;
+      editPlaybackSyncElapsed = -1;
     }
 
     stopChapterAnimation();
@@ -9729,14 +11729,24 @@ export function useMovieEditor() {
 
     selectedChapterId.value = chapter.id;
     playingIdx.value = idx;
+    // 编辑态：树选中与章节选中必须同一 id，否则会出现「树高亮 A + 进度条高亮 B」
+    if (!viewOnly.value && !isPreviewMode.value) {
+      selectedNodeId.value = chapter.id;
+      videoOnlyMode.value = false;
+      if (chapter.parentId) activeVideoId.value = chapter.parentId;
+    }
     if (!options?.holdCurrentTime) {
       currentTime.value = chapter.startTime;
     }
-    applyChapterCameraForNav(chapter, cameraMode);
-    resetLiveAnimEditorBuffers();
-    if (!prevChapter || prevChapter.id !== chapter.id) {
-      lastSyncedModelFormChapterId = null;
+
+    // 切换动画前先取消模型选中，避免 live 段/表单与上一动画叠到当前章 mesh
+    if (!viewOnly.value && !isPreviewMode.value && (selModelId.value || selModelNodeId.value)) {
+      selModelNodeId.value = null;
+      selModelId.value = null;
     }
+
+    applyChapterCameraForNav(chapter, cameraMode);
+    lastSyncedModelFormChapterId = null;
     applyChapterVisualStateForNav(chapter, previewAnimation, options?.visualElapsed);
     syncModelSelectionForChapter(chapter);
     scheduleChapterNavDeferredWork(chapter, gen, elapsed, previewAnimation);
@@ -9781,7 +11791,7 @@ export function useMovieEditor() {
   function selectChapter(ch: Chapter) {
     videoOnlyMode.value = false;
     if (ch.parentId) sceneNodeApi.setActiveVideo(ch.parentId);
-    selectedNodeId.value = ch.id;
+    setEditModeActiveChapter(ch);
     const video = videoEl.value;
     if (video && !video.paused) {
       presentationExpectPlaying = false;
@@ -9797,24 +11807,34 @@ export function useMovieEditor() {
     chapterAutoNext.value = false;
     presentationExpectPlaying = false;
     clearPresentationResumeTimer();
+    stopChapterAnimation();
 
     if (video) {
+      videoChapterSyncPaused = true;
       try {
         const target = resolved.chapter.startTime;
         if (Math.abs(video.currentTime - target) >= CHAPTER_TIME_EPS) {
           video.currentTime = target;
         }
-        currentTime.value = video.currentTime;
+        currentTime.value = target;
       } catch {
         /* ignore */
+      } finally {
+        videoChapterSyncPaused = false;
       }
     }
 
     navigateToChapter(resolved.chapter, resolved.idx, {
       seek: false,
       cameraMode: "playback",
-      visualElapsed: 0
+      visualElapsed: 0,
+      holdCurrentTime: true
     });
+    // navigate 后再强制起始帧一次，避免 seeked/残留锁把姿态打乱
+    if (!viewOnly.value && !isPreviewMode.value) {
+      setEditModeActiveChapter(resolved.chapter);
+      applyChapterEditorVisualState(resolved.chapter);
+    }
   }
 
   function getChapterAnimElapsed(ch: Chapter, t: number) {
@@ -9831,7 +11851,10 @@ export function useMovieEditor() {
       flushChapterSessionsToConfigs(ch);
       sanitizeChapterModelConfigs(ch);
     }
-    resetLiveAnimEditorBuffers();
+    // 不调用 resetLiveAnimEditorBuffers：会清空动画段导致右侧设置框闪一下关掉，
+    // 播放时 shouldUseLiveAnimSegments 已因 chapterPlayTarget 关闭而不读 live 段。
+    editPlaybackSyncChapterId = ch.id;
+    editPlaybackSyncElapsed = 0;
     applyChapterModelState(ch, 0, {
       skipOutlineRebuild: false,
       skipOverlaySync: false,
@@ -9873,6 +11896,7 @@ export function useMovieEditor() {
     _chAnimLock = false;
     editPlaybackSyncChapterId = null;
     editPlaybackSyncElapsed = -1;
+    editPlaybackCameraChapterId = null;
     invalidateChapterAnimTargetsCache();
   }
 
@@ -9881,10 +11905,24 @@ export function useMovieEditor() {
     if (!video) return;
     const ch = resolvePresentationPlaybackChapter(video);
     if (!ch || !chapterHasAnyModelEdits(ch)) {
+      // 钉住目标章时不要 reset（会把已隐藏模型整树显示回来）
+      if (chapterPlayTarget.value) return;
       resetAllModelsToDefault();
       return;
     }
-    applyChapterAnimOnly(ch, getPresentationAnimElapsed(video, ch));
+    const elapsed = getPresentationAnimElapsed(video, ch);
+    if (!viewOnly.value && !isPreviewMode.value) {
+      invalidateChapterAnimTargetsCache(ch.id);
+      invalidateChapterAnimPivotCaches(ch);
+      applyChapterModelState(ch, elapsed, {
+        skipOutlineRebuild: false,
+        skipOverlaySync: false,
+        forceElapsed: elapsed,
+        immediatePresent: true
+      });
+      return;
+    }
+    applyChapterAnimOnly(ch, elapsed);
   }
 
   function applyChapterAnimationAtElapsed(ch: Chapter, elapsedSec: number) {
@@ -9899,7 +11937,8 @@ export function useMovieEditor() {
   function ensureVideoSyncedChapterAnimation() {
     const video = videoEl.value;
     if (!video || video.paused) return false;
-    const activeCh = resolvePresentationPlaybackChapter(video);
+    // 优先 playTarget：seek 尾段 currentTime 可能仍在上一章
+    const activeCh = chapterPlayTarget.value ?? resolvePresentationPlaybackChapter(video);
     if (!activeCh || !chapterHasAnimation(activeCh)) {
       debugViewPlayback("ensureVideoSyncedChapterAnimation:skip", {
         currentTime: video.currentTime,
@@ -9909,7 +11948,7 @@ export function useMovieEditor() {
       });
       return false;
     }
-    if (_chAnimLock && !chAnimWallclock) return true;
+    if (_chAnimLock && !chAnimWallclock && chAnimChapterId === activeCh.id) return true;
     debugViewPlayback("ensureVideoSyncedChapterAnimation:start", {
       currentTime: video.currentTime,
       activeChapterId: activeCh.id,
@@ -9924,7 +11963,17 @@ export function useMovieEditor() {
     chAnimChapterId = _ch?.id ?? null;
     totalPlaying.value = false;
     videoAnimLastSyncAt = 0;
-    syncCurrentChapterAnimationFromVideo();
+    invalidateChapterAnimTargetsCache(_ch?.id);
+    const video = videoEl.value;
+    if (video && _ch) {
+      const timelineT = resolvePresentationPlaybackTime(video);
+      const elapsed = isChapterInPlaybackRange(_ch, timelineT)
+        ? getChapterAnimElapsed(_ch, timelineT)
+        : Math.max(0, timelineT - _ch.startTime);
+      resyncChapterMeshFromVideo(video, _ch, elapsed);
+    } else {
+      syncCurrentChapterAnimationFromVideo();
+    }
     return true;
   }
 
@@ -9958,29 +12007,30 @@ export function useMovieEditor() {
   function highlightSceneNode(nodeId: string) {
     selectedNodeId.value = nodeId;
     const node = getNodeById(nodes.value, nodeId);
-    if (node && isAnimationNode(node)) {
-      selectedChapterId.value = nodeId;
-      if (node.parentId) activeVideoId.value = node.parentId;
+    if (!node || !isAnimationNode(node)) return;
+
+    if (viewOnly.value || isPreviewMode.value) {
+      // Presentation: do not mutate session or sync UI from the *current* clock.
+      // List clicks must go through jumpToChapter → commandPresentationPlayback only.
+      return;
     }
+    setEditModeActiveChapter(node);
   }
 
   function playChapter(ch: Chapter) {
-    selectedNodeId.value = ch.id;
-    selectedChapterId.value = ch.id;
+    setEditModeActiveChapter(ch);
     videoOnlyMode.value = false;
-    if (ch.parentId) activeVideoId.value = ch.parentId;
 
     const resolved = resolveChapter(ch);
     if (!resolved) return;
     const { chapter } = resolved;
-    const video = videoEl.value;
-    const wasPlaying = !!(video && (!video.paused || isPlaying.value));
     const presentation = viewOnly.value || isPreviewMode.value;
 
+    // 编辑态：从点中的动画播到该视频末尾；不沿用其它视频的播放态
     void startChapterPlayback(chapter, {
       syncVideo: true,
       autoplay: true,
-      keepPlaying: presentation ? true : wasPlaying,
+      keepPlaying: presentation,
       userGesture: true,
       seekTime: chapter.startTime
     });
@@ -10003,7 +12053,7 @@ export function useMovieEditor() {
     camT[0] = round3(frame.target[0]);
     camT[1] = round3(frame.target[1]);
     camT[2] = round3(frame.target[2]);
-    camFov.value = ch.camera.fov;
+    camFov.value = clampChapterCameraFov(ch.camera.fov);
     camTransitionSec.value = ch.camera.transitionSec ?? CHAPTER_CAMERA_TRANSITION_SEC;
     cameraFormRevision.value++;
   }
@@ -10051,6 +12101,10 @@ export function useMovieEditor() {
     };
   }
 
+  function clampChapterCameraFov(fov: number) {
+    return clampNumber(fov, 10, 60);
+  }
+
   function applyCameraFormSnapshot(snapshot: ReturnType<typeof getCameraFormSnapshot>) {
     camP[0] = round3(snapshot.posX);
     camP[1] = round3(snapshot.posY);
@@ -10058,7 +12112,7 @@ export function useMovieEditor() {
     camT[0] = round3(snapshot.targetX);
     camT[1] = round3(snapshot.targetY);
     camT[2] = round3(snapshot.targetZ);
-    camFov.value = snapshot.fov;
+    camFov.value = clampChapterCameraFov(snapshot.fov);
     camTransitionSec.value = snapshot.transitionSec;
   }
 
@@ -10067,6 +12121,7 @@ export function useMovieEditor() {
     if (camTrans || chapterNavLock.value || isCameraTransitioning.value || cameraAnimating) return;
     camera.position.set(camP[0], camP[1], camP[2]);
     controls.target.set(camT[0], camT[1], camT[2]);
+    camFov.value = clampChapterCameraFov(camFov.value);
     camera.fov = camFov.value;
     camera.updateProjectionMatrix();
     finishCameraAnimationState();
@@ -10112,7 +12167,7 @@ export function useMovieEditor() {
         );
       }
       animSegments.splice(0, animSegments.length, seg);
-      bindAnimSegmentsToSelection();
+      bindAnimSegmentsToSelection(selModel.value?.id, selModelNodeId.value, selectedChapterId.value);
       invalidateSegPivotCache(seg);
       animDirty.value = false;
     } else {
@@ -10123,14 +12178,14 @@ export function useMovieEditor() {
         const seg = createDefaultAnimSegment(selModel.value, selModelNodeId.value);
         seedPristineAnimSegmentFromDefaults(seg, selModel.value, selModelNodeId.value);
         animSegments.push(seg);
-        bindAnimSegmentsToSelection();
+        bindAnimSegmentsToSelection(selModel.value.id, selModelNodeId.value, selectedChapterId.value);
       }
     }
 
     if (animSegments.length > 0) {
-      const previewMode = animSegmentHasTransformEdits(animSegments[0]) ? "end" : "start";
       editingSeg.value = animSegments[0];
-      editingSegMode.value = previewMode;
+      // 加载配置后默认起始帧；用户点「结束」再切 editingSegMode
+      editingSegMode.value = "start";
     } else {
       editingSeg.value = null;
       editingSegMode.value = "start";
@@ -10273,23 +12328,18 @@ export function useMovieEditor() {
   function syncModelSelectionForChapter(ch?: Chapter | null) {
     const chapter = ch ?? getActiveChapter();
 
-    // 如果当前已有选中模型，保持选中（即使该模型在本节点没有配置）
+    // 如果当前已有选中模型，保持选中并刷新表单（即使该模型在本节点没有配置）
     if (selModelId.value) {
       syncModelForm(chapter);
       return;
     }
 
-    // 没有选中模型时，尝试选中本节点第一个有配置的模型（向后兼容）
-    const chapterModelList = getChapterModels(chapter);
-    if (!chapter || chapterModelList.length === 0) {
-      resetModelFormDefaults();
-      modelFormRevision.value++;
-      lastIntroStateKey = "";
-      syncIntroPresentation();
-      return;
-    }
-
-    setSelectedModelId(chapterModelList[0].id, true);
+    // 未选中模型时不自动选中：下方设置框应保持隐藏
+    resetModelFormDefaults();
+    clearLiveAnimEditorState();
+    modelFormRevision.value++;
+    lastIntroStateKey = "";
+    syncIntroPresentation();
   }
 
   function syncModelForm(ch?: Chapter | null) {
@@ -10317,10 +12367,18 @@ export function useMovieEditor() {
 
     // 章节切换时 mesh 已在 applyChapterEditorVisualState 中统一刷新，此处只加载表单
     if (!chapterChanged) {
-      if (!chapterModelHasEdits(activeChapter, model.id)) {
+      if (isEditVideoMeshSyncActive()) {
+        // 播放跟视频时：按 elapsed 刷整章，切选中不得套 start/end 预览
+        applyChapterMeshFromCurrentVideo(activeChapter);
+      } else if (!chapterModelHasEdits(activeChapter, model.id)) {
         resetModelTreeToDefault(model);
       } else {
-        applyAllEditedTargetsForModel(activeChapter, model);
+        // 与播放按钮同一套起始帧，避免 applyAnimSegmentTransformToMesh 相对坐标偏差
+        applyChapterModelState(activeChapter, 0, {
+          skipOutlineRebuild: false,
+          skipOverlaySync: false,
+          forceElapsed: 0
+        });
       }
     }
 
@@ -10346,19 +12404,32 @@ export function useMovieEditor() {
     }
 
     // 表单加载后再统一刷新 mesh，避免首次切节点时 UI/3D 短暂不一致
-    if (chapterModelHasEdits(activeChapter, model.id)) {
-      applyAllEditedTargetsForModel(activeChapter, model);
-    } else if (!chapterChanged) {
+    if (isEditVideoMeshSyncActive()) {
+      applyChapterMeshFromCurrentVideo(activeChapter);
+    } else if (chapterModelHasEdits(activeChapter, model.id)) {
+      flushChapterSessionsToConfigs(activeChapter);
+      applyChapterModelState(activeChapter, 0, {
+        skipOutlineRebuild: false,
+        skipOverlaySync: false,
+        forceElapsed: 0,
+        immediatePresent: true
+      });
+      // 仅当前正在编辑「结束帧」时覆盖为 end；默认保持起始帧（与播放一致）
+      if (
+        animSegments[0] &&
+        selModel.value &&
+        editingSeg.value === animSegments[0] &&
+        editingSegMode.value === "end"
+      ) {
+        applyAnimSegmentTransformToMesh(
+          selModel.value,
+          selModelNodeId.value,
+          animSegments[0],
+          "end"
+        );
+      }
+    } else {
       resetModelTreeToDefault(model);
-    }
-    if (animSegments[0] && selModel.value) {
-      applyAnimSegmentTransformToMesh(
-        selModel.value,
-        selModelNodeId.value,
-        animSegments[0],
-        resolveAnimPreviewMode(animSegments[0], selModel.value, selModelNodeId.value)
-      );
-      bumpAnimSegmentRevision();
     }
     invalidatePickMeshCache();
     syncTransformVisualOverlays();
@@ -10502,6 +12573,7 @@ export function useMovieEditor() {
     expandedNodeIds,
     sceneNodeDraggingId,
     sceneNodeDropTargetId,
+    sceneNodeDropKind,
     videoNodeUploadTargetId,
     duration,
     getNextChapterRange,
@@ -10514,6 +12586,10 @@ export function useMovieEditor() {
     onClearAnimationSelection: () => {
       stopChapterAnimation();
       chapterPlayTarget.value = null;
+      // 点到视频/分组等非动画节点时取消模型选中
+      if (!viewOnly.value && !isPreviewMode.value) {
+        clearModelSelection();
+      }
     },
     hideVideoPip,
     videoOnlyMode,
@@ -10521,7 +12597,42 @@ export function useMovieEditor() {
   });
 
   function isChapterPlaying(ch: Chapter): boolean {
-    return isChapterListActive(ch) && (isPlaying.value || !!chapterPlayTarget.value || presentationChapterTransition);
+    // 多视频各自有 0 起点时间轴：播放态必须限定在当前活动视频内
+    if (ch.parentId && activeVideoId.value && ch.parentId !== activeVideoId.value) {
+      return false;
+    }
+    const video = videoEl.value;
+    const actuallyPlaying = isPlaying.value || !!(video && !video.paused && !video.ended);
+    if (!actuallyPlaying) return false;
+    if (chapterPlayTarget.value?.id === ch.id) return true;
+    return isChapterInPlaybackRange(ch, currentTime.value);
+  }
+
+  /** 编辑页动画行：播放中点暂停，未播放点播放 */
+  function toggleChapterPlayback(ch: Chapter) {
+    if (viewOnly.value || isPreviewMode.value) {
+      playChapter(ch);
+      return;
+    }
+    if (isChapterPlaying(ch)) {
+      presentationExpectPlaying = false;
+      clearPresentationResumeTimer();
+      chapterAutoNext.value = false;
+      chapterPlayTarget.value = null;
+      const video = videoEl.value;
+      if (video && !video.paused) {
+        try {
+          video.pause();
+        } catch {
+          /* ignore */
+        }
+      }
+      isPlaying.value = false;
+      stopChapterAnimation();
+      applyChapterEditorVisualState(ch);
+      return;
+    }
+    playChapter(ch);
   }
 
   function chCmd(c: string, ch: Chapter) {
@@ -10579,7 +12690,7 @@ export function useMovieEditor() {
     });
     selectedChapter.value.camera.position = roundVec3([...camP] as [number, number, number]);
     selectedChapter.value.camera.target = roundVec3([...camT] as [number, number, number]);
-    selectedChapter.value.camera.fov = camFov.value;
+    selectedChapter.value.camera.fov = clampChapterCameraFov(camFov.value);
     selectedChapter.value.camera.transitionSec = camTransitionSec.value;
     if (selModel.value) {
       persistActiveChapterDrafts(ch);
@@ -10601,6 +12712,7 @@ export function useMovieEditor() {
 
   function liveFov() {
     if (!camera || camTrans || isCameraTransitioning.value) return;
+    camFov.value = clampChapterCameraFov(camFov.value);
     camera.fov = camFov.value;
     camera.updateProjectionMatrix();
   }
@@ -10618,7 +12730,7 @@ export function useMovieEditor() {
     controls.update();
     const position: [number, number, number] = roundVec3([camera.position.x, camera.position.y, camera.position.z]);
     const target: [number, number, number] = roundVec3([controls.target.x, controls.target.y, controls.target.z]);
-    const fov = camera.fov;
+    const fov = clampChapterCameraFov(camera.fov);
     chStore.setChapterCamera(ch, position, target, fov);
     if (!selectedChapterId.value) {
       selectedChapterId.value = ch.id;
@@ -10647,7 +12759,24 @@ export function useMovieEditor() {
   }
 
   // Models
+  /** 取消模型/子部件选中（切换动画节点或视频节点时调用） */
+  function clearModelSelection() {
+    if (selModelId.value) hidePivotHelpers(selModelId.value);
+    selModelNodeId.value = null;
+    selModelId.value = null;
+    clearLiveAnimEditorState();
+    resetModelFormDefaults();
+    modelFormRevision.value++;
+    updateSelectionHighlight();
+    lastIntroStateKey = "";
+    syncIntroPresentation();
+  }
+
   function setSelectedModelId(modelId: string | null, sync = true) {
+    if (modelId === null) {
+      clearModelSelection();
+      return;
+    }
     const prevModelId = selModelId.value;
     const prevNodeId = selModelNodeId.value;
     if (
@@ -10656,7 +12785,8 @@ export function useMovieEditor() {
       prevModelId !== modelId &&
       selectedChapter.value &&
       !viewOnly.value &&
-      !isPreviewMode.value
+      !isPreviewMode.value &&
+      animSegmentsBelongToChapter(selectedChapter.value.id)
     ) {
       captureSelectionSession(selectedChapter.value.id, prevModelId, prevNodeId);
       clearLiveAnimEditorState();
@@ -10697,7 +12827,7 @@ export function useMovieEditor() {
     if (!animDirty.value || animSegments.length === 0) return false;
     const ch = getActiveChapter();
     if (!ch || !selModel.value) return animDirty.value;
-    const cfg = getActiveModelConfig(ch);
+    const cfg = readActiveModelConfig(ch);
     const saved = cfg.animConfig?.segments?.[0];
     if (!saved) return true;
     const current = animSegments[0];
@@ -10757,11 +12887,16 @@ export function useMovieEditor() {
     }
 
     if (selectionChanged && selectedChapter.value && !viewOnly.value && !isPreviewMode.value) {
-      if (prevModelId) {
+      if (prevModelId && animSegmentsBelongToChapter(selectedChapter.value.id)) {
         captureSelectionSession(selectedChapter.value.id, prevModelId, prevNodeId);
-        const prevModel = models.value.find(item => item.id === prevModelId);
-        if (prevModel) {
-          applyTargetAnimVisualState(selectedChapter.value, prevModel, prevNodeId);
+        if (isEditVideoMeshSyncActive()) {
+          // 播放中切选中：整章跟视频 elapsed，禁止把上一目标套成 end 预览帧
+          applyChapterMeshFromCurrentVideo(selectedChapter.value);
+        } else {
+          const prevModel = models.value.find(item => item.id === prevModelId);
+          if (prevModel) {
+            applyTargetAnimVisualState(selectedChapter.value, prevModel, prevNodeId);
+          }
         }
       }
       clearLiveAnimEditorState();
@@ -11004,30 +13139,49 @@ export function useMovieEditor() {
     mIntro.value = snapshot.intro;
   }
 
+  function syncWritableModelConfigFromForm(ch: Chapter) {
+    const writable = ensureWritableActiveModelConfig(ch);
+    writable.visible = mVis.value;
+    writable.outline = mOut.value;
+    writable.wireframe = mWire.value;
+    writable.highlight = mHL.value;
+    writable.outlineColor = mOutlineColor.value;
+    writable.wireframeColor = mWireColor.value;
+    writable.modelHighlightColor = mHLColor.value;
+    writable.animation = mAni.value;
+    writable.intro = mIntro.value;
+    writable.scale = mScl.value;
+    writable.posOffset = [mOff[0], mOff[1], mOff[2]];
+  }
+
   function applyMCfgLive(field: string, value?: any) {
     if (!selModel.value) return;
     const ch = getActiveChapter();
-    const cfg = ch
-      ? getActiveModelConfig(ch)
-      : {
-          visible: mVis.value,
-          posOffset: [mOff[0], mOff[1], mOff[2]] as [number, number, number],
-          scale: mScl.value,
-          highlight: mHL.value,
-          outlineColor: mOutlineColor.value,
-          wireframeColor: mWireColor.value,
-          modelHighlightColor: mHLColor.value,
-          outline: mOut.value,
-          wireframe: mWire.value,
-          animation: mAni.value,
-          intro: mIntro.value
-        };
+    // 用 live 快照驱动即时预览，避免 getActiveModelConfig 在未编辑节点写入空壳配置
+    const cfg = {
+      ...createDefaultModelConfig(),
+      visible: mVis.value,
+      posOffset: [mOff[0], mOff[1], mOff[2]] as [number, number, number],
+      scale: mScl.value,
+      highlight: mHL.value,
+      outlineColor: mOutlineColor.value,
+      wireframeColor: mWireColor.value,
+      modelHighlightColor: mHLColor.value,
+      outline: mOut.value,
+      wireframe: mWire.value,
+      animation: mAni.value,
+      intro: mIntro.value
+    };
     const targets = getNodeObjects(undefined, undefined, true);
     const root = meshes.get(selModel.value.id);
 
     if (field === "visible") {
       cfg.visible = mVis.value;
-      for (const target of targets) rebuildOutlineForObject(selModel.value, target, cfg);
+      for (const target of targets) {
+        // 显隐必须直接写 Object3D.visible，避免后续章节同步路径跳过 touchVisibility
+        target.visible = !!mVis.value;
+        rebuildOutlineForObject(selModel.value, target, cfg);
+      }
     } else if (field === "outline") {
       cfg.outline = mOut.value;
       for (const target of targets) rebuildOutlineForObject(selModel.value, target, cfg);
@@ -11063,6 +13217,15 @@ export function useMovieEditor() {
       }
     } else if (field === "intro") {
       cfg.intro = mIntro.value;
+      if (ch) {
+        if (mIntro.value?.trim()) {
+          syncWritableModelConfigFromForm(ch);
+          captureSelectionSession(ch.id, selModel.value.id, selModelNodeId.value);
+        } else {
+          pruneActiveTargetModelConfigIfUnedited(ch, selModel.value.id, selModelNodeId.value);
+          captureSelectionSession(ch.id, selModel.value.id, selModelNodeId.value);
+        }
+      }
       lastIntroStateKey = "";
       syncIntroPresentation();
     } else if (field === "position") {
@@ -11093,15 +13256,54 @@ export function useMovieEditor() {
       }
     }
 
-    // 编辑态下强制按当前动画配置全量重算一次可视效果，
-    // 避免章节切换后的临时态导致 outline/wireframe/highlight 不刷新。
+    // 编辑态：开关类变更需落盘并刷新描边；显隐单独处理，禁止整树重算动画位姿
     if (
       ch &&
       !viewOnly.value &&
       !isPreviewMode.value &&
-      ["outline", "wireframe", "highlight", "outlineColor", "wireframeColor", "modelHighlightColor"].includes(field)
+      ["visible", "outline", "wireframe", "highlight", "outlineColor", "wireframeColor", "modelHighlightColor"].includes(field)
     ) {
-      applyChapterEditorVisualState(ch);
+      const snapshot = getModelFormSnapshot();
+      const hasVisual = formSnapshotHasVisualEdits(snapshot);
+      if (hasVisual) {
+        syncWritableModelConfigFromForm(ch);
+        captureSelectionSession(ch.id, selModel.value.id, selModelNodeId.value);
+      } else {
+        pruneActiveTargetModelConfigIfUnedited(ch, selModel.value.id, selModelNodeId.value);
+        captureSelectionSession(ch.id, selModel.value.id, selModelNodeId.value);
+      }
+
+      const liveCfg = {
+        ...createDefaultModelConfig(),
+        visible: mVis.value,
+        outline: mOut.value,
+        wireframe: mWire.value,
+        highlight: mHL.value,
+        outlineColor: mOutlineColor.value,
+        wireframeColor: mWireColor.value,
+        modelHighlightColor: mHLColor.value,
+        animation: mAni.value,
+        intro: mIntro.value,
+        scale: mScl.value,
+        posOffset: [mOff[0], mOff[1], mOff[2]] as [number, number, number]
+      };
+
+      if (field === "visible") {
+        // 只改可见性/描边，绝不走 applyAllEditedTargetsForModel（会 reset 变换把动画 mesh 打飞）
+        for (const target of getNodeObjects(selModel.value.id, selModelNodeId.value, true)) {
+          target.visible = !!mVis.value;
+          rebuildOutlineForObject(selModel.value, target, liveCfg);
+        }
+      } else {
+        applyAllEditedTargetsForModel(ch, selModel.value);
+        for (const target of getNodeObjects(selModel.value.id, selModelNodeId.value, true)) {
+          rebuildOutlineForObject(selModel.value, target, liveCfg);
+        }
+      }
+      syncModelConfigOutlinePass();
+      invalidatePickMeshCache();
+      syncTransformVisualOverlays();
+      modelFormRevision.value++;
     }
   }
 
@@ -11260,26 +13462,64 @@ export function useMovieEditor() {
     });
   }
 
+  /** 退出预览后按当前选中恢复右上角视频窗（选中动画/视频时应仍显示） */
+  function restoreEditModeVideoPipFromSelection() {
+    const selNode = selectedNodeId.value ? getNodeById(nodes.value, selectedNodeId.value) : null;
+
+    let video: SceneVideoNode | null = null;
+    if (selNode && isAnimationNode(selNode) && selNode.parentId) {
+      const parent = getNodeById(nodes.value, selNode.parentId);
+      if (parent && isVideoNode(parent)) video = parent;
+    } else if (selNode && isVideoNode(selNode)) {
+      video = selNode;
+    } else if (videoOnlyMode.value && activeVideoId.value) {
+      const active = getNodeById(nodes.value, activeVideoId.value);
+      if (active && isVideoNode(active)) video = active;
+    }
+
+    if (video?.videoSrc) {
+      showVideoPip.value = true;
+      syncVideoElementSrc(video.videoSrc);
+      return true;
+    }
+
+    showVideoPip.value = false;
+    clearVideoElementSrc({ silent: true });
+    return false;
+  }
+
   function exitPreview() {
     if (viewOnly.value || !isPreviewMode.value) return;
 
     isPreviewMode.value = false;
-    showVideoPip.value = false;
     chapterPlayTarget.value = null;
+    resetPresentationPlaybackSession(currentTime.value);
     presentationUiChapterId.value = null;
     presentationNavIndex.value = -1;
+    presentationUiRevision.value = 0;
     lastPresentationAutoSwitchChapterId = null;
     chapterAutoNext.value = false;
-    presentationExpectPlaying = false;
-    clearPresentationResumeTimer();
+    presentationManualNavUntil = 0;
     stopChapterAnimation();
+    isPlaying.value = false;
 
-    const ch = getActiveChapter();
-    if (videoEl.value) {
-      videoEl.value.pause();
-      if (ch) videoEl.value.currentTime = ch.startTime;
+    // 优先用当前选中的动画节点，避免预览过程把 selectedChapterId 改掉后状态不一致
+    const selNode = selectedNodeId.value ? getNodeById(nodes.value, selectedNodeId.value) : null;
+    const ch =
+      (selNode && isAnimationNode(selNode) ? selNode : null) ??
+      selectedChapter.value ??
+      null;
+
+    if (ch) {
+      selectedChapterId.value = ch.id;
+      selectedNodeId.value = ch.id;
+      videoOnlyMode.value = false;
     }
-    currentTime.value = ch?.startTime ?? 0;
+
+    restoreEditModeVideoPipFromSelection();
+
+    const seekTime = ch?.startTime ?? 0;
+    currentTime.value = seekTime;
 
     syncEditorGizmosVisibility();
     syncPresentationInteractionMode();
@@ -11301,6 +13541,15 @@ export function useMovieEditor() {
     updateSelectionHighlight();
 
     nextTick(() => {
+      const v = videoEl.value;
+      if (v) {
+        try {
+          v.pause();
+          if (Number.isFinite(seekTime)) v.currentTime = seekTime;
+        } catch {
+          /* ignore */
+        }
+      }
       handleResize();
       adaptPresentationViewport();
     });
@@ -11366,22 +13615,38 @@ export function useMovieEditor() {
     updateSelectionHighlight();
 
     const ch = getActiveChapter();
-    const chapterChanged = !!(selectedChapterId.value && selectedChapterId.value !== prevChapterId);
+    // 含切到其他动画、或离开动画节点（selectedChapterId → null）
+    const chapterIdChanged = prevChapterId !== selectedChapterId.value;
 
-    if (chapterChanged && ch) {
-      // 章节切换时先把上一章节当前选中模型的临时编辑会话落入草稿，
-      // 避免动画1的面板状态在动画2里继续沿用造成“串配置”错觉。
-      if (!viewOnly.value && !isPreviewMode.value && prevChapterId && prevModelId) {
-        captureSelectionSession(prevChapterId, prevModelId, selModelNodeId.value);
-        const prevChapter = chapters.value.find(item => item.id === prevChapterId);
-        if (prevChapter) {
-          flushChapterDraftsToModelConfigs(prevChapter);
-          sanitizeChapterModelConfigs(prevChapter);
+    if (chapterIdChanged && prevChapterId) {
+      // 落盘/清草稿已在 navigateToChapter 完成；此处只清 UI 选中
+      if (!viewOnly.value && !isPreviewMode.value) {
+        selectionEditDrafts.clear();
+        clearLiveAnimEditorState();
+        lastSyncedModelFormChapterId = null;
+
+        if (selModelId.value || selModelNodeId.value) {
+          selModelNodeId.value = null;
+          selModelId.value = null;
+          resetModelFormDefaults();
         }
-      }
-      clearLiveAnimEditorState();
-      if (selModel.value) {
-        syncModelForm(ch);
+
+        // 关键：播放跟视频时禁止在这里套编辑态起始帧！
+        // syncEditModePlaybackFromVideo 会随时间改 selectedChapterId，若此处
+        // applyChapterEditorVisualState，会与 syncVideoDrivenChapterMesh 抢 mesh，
+        // 第二轮循环表现为「奇怪起点→奇怪终点」。预览没有这段逻辑所以正常。
+        // 仅以「视频正在播」为准；停播后残留的 chapterPlayTarget 不得挡住起始帧恢复。
+        const videoDriving = !!(videoEl.value && !videoEl.value.paused);
+        if (!videoDriving) {
+          if (ch) {
+            applyChapterEditorVisualState(ch);
+          } else {
+            resetAllModelsToDefault();
+          }
+        }
+
+        modelFormRevision.value++;
+        updateSelectionHighlight();
       }
       lastIntroStateKey = "";
       queueMicrotask(() => {
@@ -11446,8 +13711,9 @@ export function useMovieEditor() {
       handleResize();
       window.addEventListener("resize", handleResize);
       if (timelineChapters.value.length > 0) {
+        // 展示页刷新：停在片头，等待用户手势再播（避免无点击自动播放）。
         void beginPresentationPlayback(getPresentationStartChapter(), {
-          autoplay: true
+          autoplay: false
         });
       }
       return;
@@ -11585,7 +13851,15 @@ export function useMovieEditor() {
     handleResize();
     window.addEventListener("resize", handleResize);
     stripPreviewModeFromLocation();
-    sceneSavedSignature.value = sceneDraftSignature.value;
+    // 灯光布局/环境贴图等可能在下一帧才落稳，延迟再标定一次，避免误报未保存红点
+    markSceneAsSavedBaseline();
+    await nextTick();
+    markSceneAsSavedBaseline();
+    requestAnimationFrame(() => {
+      markSceneAsSavedBaseline();
+      window.setTimeout(() => markSceneAsSavedBaseline(), 300);
+    });
+    void refreshSavedSceneCount();
     setTimeout(() => rootEl.value?.focus(), 100);
     } catch (e) {
       console.error("[movie-editor] boot failed", e);
@@ -11612,11 +13886,26 @@ export function useMovieEditor() {
     unbindControlsInteraction();
     clearHoverHighlight();
     clearSelectionHighlight();
-    composer?.dispose?.();
+    try {
+      composer?.dispose?.();
+    } catch {
+      /* ignore */
+    }
+    composer = undefined;
     meshes.forEach((_, id) => rmMesh(id));
     disposeViewportEnvironment(envMap);
     envMap = null;
-    renderer?.dispose();
+    try {
+      renderer?.forceContextLoss?.();
+    } catch {
+      /* ignore */
+    }
+    try {
+      renderer?.dispose();
+    } catch {
+      /* ignore */
+    }
+    renderer = undefined as unknown as THREE.WebGLRenderer;
     dracoLoader?.dispose?.();
     clearInterval(subTimer);
     window.removeEventListener("resize", handleResize);
@@ -11657,7 +13946,8 @@ export function useMovieEditor() {
   function renameActiveVideoNode(name: string) {
     const video = activeVideoNode.value;
     if (!video) return;
-    video.name = name.trim() || video.name;
+    // 允许清空（输入过程中），勿用旧名回填否则最后一个字符删不掉
+    video.name = name;
     video.updatedAt = new Date().toISOString();
   }
 
@@ -11666,8 +13956,18 @@ export function useMovieEditor() {
     if (!id || !currProj.value) return;
     const node = currProj.value.nodes.find(n => n.id === id);
     if (!node || node.type !== "group") return;
-    node.name = name.trim() || node.name;
+    node.name = name;
     node.updatedAt = new Date().toISOString();
+  }
+
+  function getPresentationModelState(modelId: string) {
+    const object = meshes.get(modelId);
+    if (!object) return null;
+    return {
+      visible: object.visible,
+      position: [object.position.x, object.position.y, object.position.z],
+      scale: [object.scale.x, object.scale.y, object.scale.z]
+    };
   }
 
   return reactive({
@@ -11686,6 +13986,11 @@ export function useMovieEditor() {
     currentTime,
     duration,
     isPlaying,
+    presentationPlaybackSession,
+    presentationDisplayTime,
+    presentationCurrentNavChapterId,
+    presentationDisplayPlaying,
+    getPresentationModelState,
     isLooping,
     playbackRate,
     playbackRateLabel,
@@ -11734,6 +14039,9 @@ export function useMovieEditor() {
     sceneHasUnsavedChanges,
     canSaveScene,
     sceneListVersion,
+    savedSceneCount,
+    canOpenSceneList,
+    refreshSavedSceneCount,
     chapterFormRevision,
     chForm,
     subForm,
@@ -11889,6 +14197,7 @@ export function useMovieEditor() {
     saveTitle,
     selectChapter,
     playChapter,
+    toggleChapterPlayback,
     highlightSceneNode,
     addChapter,
     addChildChapter,
@@ -11901,6 +14210,7 @@ export function useMovieEditor() {
     isPresentationTimelineSegmentCurrent,
     presentationUiChapterId,
     presentationNavIndex,
+    presentationUiRevision,
     canPresentationPrevChapter,
     canPresentationNextChapter,
     getPresentationNavChapters,
@@ -11920,6 +14230,7 @@ export function useMovieEditor() {
     startDragSceneVideo: sceneNodeApi.startDragSceneVideo,
     endDragSceneVideo: sceneNodeApi.endDragSceneVideo,
     setSceneNodeDropTarget: sceneNodeApi.setSceneNodeDropTarget,
+    canDropDraggedVideoTo: sceneNodeApi.canDropDraggedVideoTo,
     triggerVideoNodeUpload: sceneNodeApi.triggerVideoNodeUpload,
     renameActiveVideoNode,
     renameSelectedGroup,
@@ -11930,6 +14241,7 @@ export function useMovieEditor() {
     expandedNodeIds,
     sceneNodeDraggingId,
     sceneNodeDropTargetId,
+    sceneNodeDropKind,
     videoOnlyMode,
     showNodePanel,
     activeVideoNode,
@@ -11969,6 +14281,7 @@ export function useMovieEditor() {
     onVideoPlay,
     onVideoPause,
     onVideoEnd,
+    onVideoSeeked,
     onVideoErr,
     applySettings,
     applyToneMapping,
@@ -11980,9 +14293,16 @@ export function useMovieEditor() {
     clearEnvironmentMap,
     toggleBloom,
     toggleColor,
+    setPpContrast,
+    setPpSaturation,
+    setPpExposure,
     applyGrid,
     applyEnv,
+    setEnvReflectionIntensity,
+    setEnvIntensityVal,
+    setEnvRotation,
     applyShadow,
+    applyShadowIntensity,
     addSceneLight,
     removeSceneLight,
     selectSceneLight,

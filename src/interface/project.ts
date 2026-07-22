@@ -53,6 +53,9 @@ export interface SceneVideoNode extends SceneNodeBase {
   videoDisplayTop?: number;
   videoDisplayXRatio?: number;
   videoDisplayYRatio?: number;
+  /** 落盘时的视口宽高，用于编辑↔预览像素换算 */
+  videoDisplayViewportWidth?: number;
+  videoDisplayViewportHeight?: number;
 }
 
 /** 视频节点动画（原 Chapter） */

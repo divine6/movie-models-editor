@@ -104,7 +104,7 @@
 
 <script setup lang="ts" name="editor-model-animation">
 import { ElMessageBox } from "element-plus";
-import { computed, unref, watch } from "vue";
+import { computed, nextTick, unref, watch } from "vue";
 
 import EditorSegmentTransform from "@/components/business/movie-editor/editor-segment-transform.vue";
 import { useMovieEditorContext } from "@/composables/useMovieEditorContext";
@@ -132,6 +132,8 @@ const currentSegment = computed(() => editor.animSegments[0] ?? null);
 
 let lastUserSig = "";
 let sigReady = false;
+let baselineToken = 0;
+
 const buildUserSig = (seg: any) => {
   if (!seg) return "";
   return JSON.stringify({
@@ -148,16 +150,29 @@ const buildUserSig = (seg: any) => {
   });
 };
 
+/** 章节/选中切换时重建基线，避免误触发 markAnimDirty → 未编辑节点出现「已改」 */
+const resetDirtyBaseline = (seg: any) => {
+  const token = ++baselineToken;
+  sigReady = false;
+  lastUserSig = buildUserSig(seg);
+  nextTick(() => {
+    if (token !== baselineToken) return;
+    lastUserSig = buildUserSig(unref(currentSegment));
+    sigReady = true;
+  });
+};
+
 watch(
   currentSegment,
   seg => {
-    if (!seg) return;
+    if (!seg) {
+      sigReady = false;
+      lastUserSig = "";
+      return;
+    }
     if (!seg._expandedPanels) seg._expandedPanels = ["start", "end"];
     if (!seg.easing) seg.easing = "easeInOut";
-
-    // baseline signature for dirty detection
-    lastUserSig = buildUserSig(seg);
-    sigReady = true;
+    resetDirtyBaseline(seg);
   },
   { immediate: true }
 );
@@ -165,9 +180,7 @@ watch(
 watch(
   () => unref(editor.animSegmentRevision),
   () => {
-    sigReady = false;
-    lastUserSig = buildUserSig(unref(currentSegment));
-    sigReady = true;
+    resetDirtyBaseline(unref(currentSegment));
   }
 );
 

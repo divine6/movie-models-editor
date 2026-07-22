@@ -84,12 +84,19 @@
           <el-icon><Setting /></el-icon>
           后台管理
         </el-button>
+        <el-button size="default" @click="onCreateNewScene"> 新建 </el-button>
         <el-button size="default" :disabled="!editor.hasVideo || editor.chapters.length === 0" @click="editor.togglePreview">
           <el-icon><View /></el-icon>
           预览
         </el-button>
-        <el-button size="default" @click="onCreateNewScene"> 新建 </el-button>
-        <el-button size="default" :disabled="!editor.modelSetCode" @click="sceneListVisible = true"> 编辑列表 </el-button>
+        <el-button
+          size="default"
+          :disabled="!editor.canOpenSceneList"
+          title="至少保存过 1 个场景后可打开编辑列表"
+          @click="sceneListVisible = true"
+        >
+          编辑列表
+        </el-button>
         <el-button
           class="editor-topbar__save-btn"
           type="primary"
@@ -98,7 +105,11 @@
           :disabled="!editor.canSaveScene"
           @click="editor.saveSceneToServer"
         >
-          <span v-if="editor.sceneHasUnsavedChanges" class="editor-topbar__save-dot" aria-hidden="true" />
+          <span
+            v-if="editor.sceneHasUnsavedChanges && editor.hasVideo && editor.chapters.length > 0"
+            class="editor-topbar__save-dot"
+            aria-hidden="true"
+          />
           {{ editor.sceneCode ? "更新" : "保存" }}
         </el-button>
       </div>

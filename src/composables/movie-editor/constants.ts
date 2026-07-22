@@ -49,6 +49,10 @@ export function getSceneSettingsStorageKey(modelSetCode?: string | null) {
 
 export const CHAPTER_TIME_EPS = 0.05;
 export const CHAPTER_END_EPS = 0.02;
+/** 视频下动画节点最小时长（秒）：结束时间至少比开始时间多 1 秒 */
+export const MIN_ANIMATION_NODE_DURATION = 1;
+/** 新建动画节点默认时长（秒）：默认结束 = 开始 + 1，且不超过视频总时长 */
+export const DEFAULT_ANIMATION_NODE_DURATION = 1;
 export const SEEK_READY_TIMEOUT_MS = 4000;
 export const SEEK_EVENT_TIMEOUT_MS = 280;
 export const CHAPTER_CAMERA_SWITCH_EDIT_SEC = 0.15;
@@ -83,7 +87,7 @@ export const DEFAULT_SCENE_SETTINGS = {
   ppSaturation: 0,
   toneMapping: "ACESFilmicToneMapping",
   envIntensityVal: 1,
-  /** 1 = 保持 GLTF 原始 envMapIntensity；仅乘算反射，不改粗糙度/金属度 */
+  /** 1 = 原始；>1 镜面/玻璃感（清漆 + 低粗糙度）；与环境贴图强度独立 */
   envReflectionIntensity: 1,
   envRotation: 0,
   envMapUrl: null as string | null,

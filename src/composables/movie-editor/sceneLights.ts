@@ -10,6 +10,8 @@ export interface SceneLightRuntime {
   light: THREE.Light;
   target: THREE.Object3D;
   gizmo: THREE.Group;
+  /** 仅视觉结构变化时重建 gizmo，避免拖滑块时 dispose/重建闪屏 */
+  gizmoVisualKey?: string;
 }
 
 const _dir = new THREE.Vector3();
@@ -142,11 +144,49 @@ function applyLightDirection(light: THREE.DirectionalLight | THREE.SpotLight, ta
   target.updateMatrixWorld();
 }
 
+function sceneLightGizmoVisualKey(config: SceneLightSettings, selected: boolean) {
+  return [
+    config.type,
+    config.color,
+    config.name,
+    selected ? 1 : 0,
+    config.angle,
+    config.distance
+  ].join("|");
+}
+
 function rebuildSceneLightGizmo(runtime: SceneLightRuntime, selected = false) {
   runtime.group.remove(runtime.gizmo);
   disposeObject3D(runtime.gizmo);
   runtime.gizmo = createSceneLightGizmo(runtime.config, runtime.target, selected);
   runtime.group.add(runtime.gizmo);
+  runtime.gizmoVisualKey = sceneLightGizmoVisualKey(runtime.config, selected);
+}
+
+/** 照射方向变化时只改 gizmo 朝向，不销毁重建（拖滑块不闪屏） */
+function syncSceneLightGizmoDirection(runtime: SceneLightRuntime) {
+  if (runtime.config.type === "point") return;
+  const dir = runtime.target.position.clone();
+  if (dir.lengthSq() < 1e-10) return;
+  dir.normalize();
+
+  runtime.gizmo.traverse(child => {
+    if (child instanceof THREE.ArrowHelper) {
+      child.setDirection(dir);
+      return;
+    }
+    const mesh = child as THREE.Mesh;
+    if (mesh.isMesh && mesh.geometry?.type === "CircleGeometry") {
+      mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), dir.clone().negate());
+      return;
+    }
+    const lines = child as THREE.LineSegments;
+    if (lines.isLineSegments && runtime.config.type === "spot") {
+      const height = 1.1;
+      lines.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir);
+      lines.position.copy(dir).multiplyScalar(height * 0.5);
+    }
+  });
 }
 
 export function buildSceneLightRuntime(config: SceneLightSettings, selected = false): SceneLightRuntime {
@@ -202,7 +242,14 @@ export function buildSceneLightRuntime(config: SceneLightSettings, selected = fa
   }
   group.add(gizmo);
 
-  return { config, group, light, target, gizmo };
+  return {
+    config,
+    group,
+    light,
+    target,
+    gizmo,
+    gizmoVisualKey: sceneLightGizmoVisualKey(config, selected)
+  };
 }
 
 export function syncSceneLightRuntime(runtime: SceneLightRuntime, config: SceneLightSettings, selected = false) {
@@ -228,7 +275,12 @@ export function syncSceneLightRuntime(runtime: SceneLightRuntime, config: SceneL
     runtime.light.decay = config.decay;
   }
 
-  rebuildSceneLightGizmo(runtime, selected);
+  const visualKey = sceneLightGizmoVisualKey(config, selected);
+  if (runtime.gizmoVisualKey !== visualKey) {
+    rebuildSceneLightGizmo(runtime, selected);
+  } else {
+    syncSceneLightGizmoDirection(runtime);
+  }
 }
 
 export function disposeSceneLightRuntime(runtime: SceneLightRuntime) {

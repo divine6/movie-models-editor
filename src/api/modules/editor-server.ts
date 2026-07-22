@@ -160,6 +160,8 @@ export function resolveAssetUrl(path: string) {
   if (!path) return "";
   // 本地临时地址不可走服务端代理
   if (isTransientMediaUrl(path)) return unwrapTransientMediaUrl(path);
+  // 前端 public 静态资源（E2E fixture 等）保持同源，勿拼到 editor-api
+  if (path.startsWith("/e2e/")) return path;
 
   const normalizeLegacyPath = (pathname: string) => {
     let p = pathname.startsWith("/") ? pathname : `/${pathname}`;

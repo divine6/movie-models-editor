@@ -72,15 +72,53 @@ if (import.meta.env.DEV) {
   watchEffect(() => {
     (window as any).__movieEditorTest = {
       videoOnlyMode: editor.videoOnlyMode,
+      viewOnly: editor.viewOnly,
       selectedNodeId: editor.selectedNodeId,
       selectedChapterId: editor.selectedChapterId,
       activeVideoId: editor.activeVideoId,
       hasVideo: editor.hasVideo,
+      currentTime: editor.currentTime,
+      isPlaying: editor.isPlaying,
+      presentationUiChapterId: editor.presentationUiChapterId,
+      presentationNavIndex: editor.presentationNavIndex,
+      presentationNavChapters: editor.presentationNavChapters.map(ch => ({
+        id: ch.id,
+        name: ch.name,
+        startTime: ch.startTime,
+        endTime: ch.endTime
+      })),
+      getPresentationNavChapters: () =>
+        editor.presentationNavChapters.map(ch => ({
+          id: ch.id,
+          name: ch.name,
+          startTime: ch.startTime,
+          endTime: ch.endTime
+        })),
       nodes: JSON.parse(JSON.stringify(editor.nodes ?? [])),
       chapterSubtitles: JSON.parse(JSON.stringify(editor.chapterSubtitles ?? [])),
       sceneCode: editor.sceneCode,
       isPreviewMode: editor.isPreviewMode,
       editorInitializing: editor.editorInitializing,
+      activeVideoId: editor.activeVideoId,
+      getActiveChapterIdForUi: () => editor.getActiveChapterIdForUi(),
+      prevCh: () => editor.prevCh(),
+      nextCh: () => editor.nextCh(),
+      togglePlay: () => editor.togglePlay(),
+      jumpToChapterId: (id: string) => {
+        const ch =
+          editor.presentationNavChapters.find((c: { id: string }) => c.id === id) ??
+          editor.chapters.find((c: { id: string }) => c.id === id);
+        if (ch) editor.jumpToChapter(ch);
+      },
+      getPlaybackSession: () => ({ ...editor.presentationPlaybackSession }),
+      getPresentationModelState: (modelId: string) => editor.getPresentationModelState(modelId),
+      getVideoState: () => ({
+        paused: editor.videoEl?.paused ?? true,
+        ended: editor.videoEl?.ended ?? false,
+        currentTime: editor.videoEl?.currentTime ?? 0,
+        duration: editor.videoEl?.duration ?? 0,
+        readyState: editor.videoEl?.readyState ?? 0
+      }),
       loadSceneForEdit: (code: string) => editor.loadSceneForEdit(code),
       openChapterDrawer: () => {
         const btn = document.querySelector(".editor-header [data-testid='open-chapter-drawer']") as HTMLElement | null;

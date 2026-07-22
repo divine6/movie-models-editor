@@ -1,0 +1,27 @@
+# 运行时镜像：使用本地已构建的 dist-tenant + movie-models-server
+# 构建上下文: saas3.0 目录
+# 前置: cd movie-models-editor && pnpm run build:docker
+
+FROM node:20-alpine
+
+WORKDIR /app
+
+ENV NODE_ENV=production \
+    PORT=4000 \
+    EDITOR_DIST_PATH=/app/editor-dist \
+    STORAGE_DRIVER=mysql
+
+COPY movie-models-server/package.json ./
+RUN npm install --omit=dev --registry=https://registry.npmmirror.com && npm cache clean --force
+
+COPY movie-models-server/ .
+COPY movie-models-editor/dist-tenant ./editor-dist
+
+RUN mkdir -p storage/uploads/models storage/uploads/videos storage/models storage/data
+
+EXPOSE 4000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
+  CMD node -e "fetch('http://127.0.0.1:4000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+
+CMD ["node", "src/index.js"]

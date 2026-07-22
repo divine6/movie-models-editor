@@ -7,14 +7,19 @@ param(
     [string]$Tag = "movie-models:latest",
     [string]$ApiUrl = "https://ext.highlands.ltd/light-sass-api/",
     [string]$ContextPath = "/movie-editor",
-    [switch]$NoCache
+    [switch]$NoCache,
+    [switch]$LocalFrontend
 )
 
 $ErrorActionPreference = "Stop"
 
 $EditorRoot = Split-Path $PSScriptRoot -Parent
 $ContextRoot = (Resolve-Path (Join-Path $EditorRoot "..")).Path
-$Dockerfile = Join-Path $EditorRoot "docker/Dockerfile"
+$Dockerfile = if ($LocalFrontend) {
+    Join-Path $EditorRoot "docker/Dockerfile.runtime"
+} else {
+    Join-Path $EditorRoot "docker/Dockerfile"
+}
 $DockerignoreSrc = Join-Path $EditorRoot "docker/.dockerignore"
 $DockerignoreDst = Join-Path $ContextRoot ".dockerignore"
 
@@ -24,7 +29,7 @@ if (-not (Test-Path $ServerDir)) {
 }
 
 $Npmrc = Join-Path $env:USERPROFILE ".npmrc"
-if (-not (Test-Path $Npmrc)) {
+if (-not $LocalFrontend -and -not (Test-Path $Npmrc)) {
     throw "npm auth not found: $Npmrc (required for private packages like base-components)."
 }
 
@@ -33,20 +38,40 @@ Write-Host "==> Dockerfile:   $Dockerfile"
 Write-Host "==> Image tag:    $Tag"
 Write-Host "==> VITE_API_URL: $ApiUrl"
 Write-Host "==> Context path: $ContextPath"
-Write-Host "==> npmrc:        $Npmrc"
+if (-not $LocalFrontend) {
+    Write-Host "==> npmrc:        $Npmrc"
+} else {
+    Write-Host "==> Mode:         local frontend build + runtime image"
+}
 
 Copy-Item $DockerignoreSrc $DockerignoreDst -Force
+
+if ($LocalFrontend) {
+    Write-Host "==> Local frontend build (docker.tenant)..."
+    Push-Location $EditorRoot
+    try {
+        pnpm run build:docker
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    } finally {
+        Pop-Location
+    }
+}
 
 $buildArgs = @(
     "build",
     "-f", $Dockerfile,
-    "-t", $Tag,
-    "--secret", "id=npmrc,src=$Npmrc",
-    "--build-arg", "VITE_API_URL=$ApiUrl",
-    "--build-arg", "VITE_PUBLIC_PATH=$ContextPath/",
-    "--build-arg", "VITE_EDITOR_SERVER_URL=$ContextPath",
-    "--build-arg", "VITE_EDITOR_FRONTEND_URL=$ContextPath"
+    "-t", $Tag
 )
+
+if (-not $LocalFrontend) {
+    $buildArgs += @(
+        "--secret", "id=npmrc,src=$Npmrc",
+        "--build-arg", "VITE_API_URL=$ApiUrl",
+        "--build-arg", "VITE_PUBLIC_PATH=$ContextPath/",
+        "--build-arg", "VITE_EDITOR_SERVER_URL=$ContextPath",
+        "--build-arg", "VITE_EDITOR_FRONTEND_URL=$ContextPath"
+    )
+}
 
 if ($NoCache) {
     $buildArgs += "--no-cache"

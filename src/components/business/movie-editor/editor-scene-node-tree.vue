@@ -2,7 +2,12 @@
   <div
     class="scene-node-tree"
     data-testid="scene-node-tree"
-    :class="{ 'is-preview': preview, 'is-empty': displayedRootNodes.length === 0 }"
+    :class="{
+      'is-preview': preview,
+      'is-empty': displayedRootNodes.length === 0,
+      'is-root-drop-allow': isRootDropTarget,
+      'is-root-drop-forbid': isRootDropForbidden
+    }"
     @dragover.prevent="onRootDragOver"
     @dragleave="onRootDragLeave"
     @drop.prevent="onRootDrop"
@@ -40,7 +45,10 @@
     <div
       v-if="displayedRootNodes.length === 0"
       class="scene-node-tree-empty"
-      :class="{ 'scene-node-tree-empty--root-drop': isRootDropTarget }"
+      :class="{
+        'scene-node-tree-empty--root-drop': isRootDropTarget,
+        'scene-node-tree-empty--root-forbid': isRootDropForbidden
+      }"
     >
       <base-empty :size="isSearching ? 'default' : 'small'" :text="isSearching ? '未找到匹配节点' : '暂无节点'">
         <template #desc>
@@ -68,7 +76,12 @@ const emit = defineEmits<{
 
 const editor = useMovieEditorContext();
 const rootNodes = computed(() => editor.rootSceneNodes);
-const isRootDropTarget = computed(() => editor.sceneNodeDropTargetId === "__root__");
+const isRootDropTarget = computed(
+  () => editor.sceneNodeDropTargetId === "__root__" && editor.sceneNodeDropKind === "allow"
+);
+const isRootDropForbidden = computed(
+  () => editor.sceneNodeDropTargetId === "__root__" && editor.sceneNodeDropKind === "forbid"
+);
 const keyword = ref("");
 const isSearching = computed(() => keyword.value.trim().length > 0);
 
@@ -126,17 +139,30 @@ function onRootMenu(cmd: string) {
   else if (cmd === "video") editor.addVideoNode();
 }
 
-function onRootDragOver() {
-  if (editor.sceneNodeDraggingId) editor.setSceneNodeDropTarget("__root__");
+function onRootDragOver(e: DragEvent) {
+  if (!editor.sceneNodeDraggingId) return;
+  e.preventDefault();
+  if (editor.canDropDraggedVideoTo(null)) {
+    if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
+    editor.setSceneNodeDropTarget("__root__", "allow");
+  } else {
+    if (e.dataTransfer) e.dataTransfer.dropEffect = "none";
+    editor.setSceneNodeDropTarget("__root__", "forbid");
+  }
 }
 
-function onRootDragLeave() {
+function onRootDragLeave(e: DragEvent) {
+  const related = e.relatedTarget as Node | null;
+  if (related && (e.currentTarget as HTMLElement).contains(related)) return;
   if (editor.sceneNodeDropTargetId === "__root__") editor.setSceneNodeDropTarget(null);
 }
 
-function onRootDrop() {
+function onRootDrop(e: DragEvent) {
+  e.preventDefault();
   const videoId = editor.sceneNodeDraggingId;
-  if (videoId) editor.moveSceneVideoToGroup(videoId, null);
+  if (videoId && editor.canDropDraggedVideoTo(null)) {
+    editor.moveSceneVideoToGroup(videoId, null);
+  }
   editor.endDragSceneVideo();
 }
 </script>
