@@ -322,8 +322,12 @@ export function applyMergedNodeMetadata(root: THREE.Object3D, nodes: ModelHierar
   walk(nodes);
 }
 
-/** 收集与 nodeId 对应的 Object3D（合并材质 / 材质组宿主） */
 export function collectObjectsForNodeId(root: THREE.Object3D, nodeId: string): THREE.Object3D[] {
+  const index = root.userData?.nodeObjectIndex as Map<string, THREE.Object3D[]> | undefined;
+  if (index?.has(nodeId)) {
+    return index.get(nodeId)!.slice();
+  }
+
   let host: THREE.Object3D | null = null;
   const parts: THREE.Object3D[] = [];
 
@@ -342,6 +346,38 @@ export function collectObjectsForNodeId(root: THREE.Object3D, nodeId: string): T
 
   if (host) return [host];
   return parts;
+}
+
+/** 为模型根建立 nodeId → Object3D[] 索引，避免每次 traverse 整树（百级节点时关键） */
+export function buildNodeObjectIndex(root: THREE.Object3D): Map<string, THREE.Object3D[]> {
+  const index = new Map<string, THREE.Object3D[]>();
+  const hosts = new Map<string, THREE.Object3D>();
+
+  root.traverse(obj => {
+    if (isHierarchyExempt(obj)) return;
+    const nid = obj.userData?.nodeId as string | undefined;
+    const mid = obj.userData?.mergedNodeId as string | undefined;
+    if (nid) {
+      if (obj.userData?.materialGroupHost) {
+        hosts.set(nid, obj);
+      } else {
+        const list = index.get(nid) || [];
+        list.push(obj);
+        index.set(nid, list);
+      }
+    }
+    if (mid && mid !== nid && !obj.userData?.materialGroupHost) {
+      const list = index.get(mid) || [];
+      list.push(obj);
+      index.set(mid, list);
+    }
+  });
+
+  for (const [nid, host] of hosts) {
+    index.set(nid, [host]);
+  }
+  root.userData.nodeObjectIndex = index;
+  return index;
 }
 
 export function resolveDisplayNodeId(nodes: ModelHierarchyNode[], nodeId: string): string {
@@ -373,6 +409,18 @@ export function findHierarchyNode(nodes: ModelHierarchyNode[], nodeId: string): 
     if (found) return found;
   }
   return null;
+}
+
+/** 从根到目标节点（含）的 id 路径；找不到返回空数组 */
+export function findHierarchyPathIds(nodes: ModelHierarchyNode[], nodeId: string): string[] {
+  for (const node of nodes) {
+    if (node.id === nodeId || node.mergedNodeIds?.includes(nodeId)) {
+      return [node.id];
+    }
+    const childPath = findHierarchyPathIds(node.children, nodeId);
+    if (childPath.length) return [node.id, ...childPath];
+  }
+  return [];
 }
 
 export function countHierarchyNodes(nodes: ModelHierarchyNode[]): number {

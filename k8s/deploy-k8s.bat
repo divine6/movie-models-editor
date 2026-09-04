@@ -1,7 +1,7 @@
 @echo off
 setlocal EnableExtensions EnableDelayedExpansion
 
-REM 仅 kubectl 部署（镜像需已在 Harbor）
+REM 仅 kubectl 部署 v2（不会更新现网 Deployment movie-editor）
 REM 用法: deploy-k8s.bat [tag]
 REM 环境变量 KUBECONFIG 可覆盖默认 kubeconfig 路径
 
@@ -28,8 +28,15 @@ set "IMAGE_TAG=%~1"
 if "%IMAGE_TAG%"=="" set "IMAGE_TAG=latest"
 set "FULL_IMAGE=%HARBOR_REGISTRY%/%HARBOR_PROJECT%/%IMAGE_NAME%:%IMAGE_TAG%"
 
+echo %FULL_IMAGE% | findstr /i /c:"/movie-editor/movie-editor:" >nul
+if not errorlevel 1 (
+  echo [ERROR] Refusing to deploy production image: %FULL_IMAGE%
+  echo IMAGE_NAME must be movie-editor-v2.
+  exit /b 1
+)
+
 echo ========================================
-echo  movie-editor K8s Rollout
+echo  movie-editor-v2 K8s Rollout
 echo ========================================
 echo KUBECONFIG: %KUBECONFIG%
 echo Image:      %FULL_IMAGE%

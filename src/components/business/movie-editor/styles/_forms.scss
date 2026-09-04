@@ -255,6 +255,13 @@
     overflow: hidden;
   }
 
+  .chapter-detail-body-scroll {
+    flex: 1;
+    min-height: 0;
+    overflow: auto;
+    padding: 0 0 12px;
+  }
+
   .chapter-detail-head {
     flex-shrink: 0;
     display: flex;
@@ -492,6 +499,20 @@
     display: flex;
     flex-direction: column;
     gap: 10px;
+
+    &.is-collapsed-hint {
+      gap: 0;
+      padding: 0;
+      margin: 0;
+      border: none;
+    }
+  }
+
+  .chapter-cam-moved-hint {
+    margin: 0 0 4px;
+    font-size: 11px;
+    line-height: 1.4;
+    color: var(--text-color-3);
   }
 
   .chapter-field-label {

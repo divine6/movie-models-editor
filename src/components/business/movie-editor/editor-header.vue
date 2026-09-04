@@ -106,11 +106,11 @@
           @click="editor.saveSceneToServer"
         >
           <span
-            v-if="editor.sceneHasUnsavedChanges && editor.hasVideo && editor.chapters.length > 0"
+            v-if="editor.sceneNeedsPersist && editor.hasVideo && editor.chapters.length > 0"
             class="editor-topbar__save-dot"
             aria-hidden="true"
           />
-          {{ editor.sceneCode ? "更新" : "保存" }}
+          {{ saveSceneButtonLabel }}
         </el-button>
       </div>
     </template>
@@ -148,7 +148,7 @@
 <script setup lang="ts" name="editor-header">
 import { ElMessageBox } from "element-plus";
 import { Close, Edit, Setting, View } from "@element-plus/icons-vue";
-import { computed, nextTick, ref } from "vue";
+import { computed, nextTick, ref, unref } from "vue";
 import { useRoute, useRouter } from "vue-router";
 
 import projectLogo from "@/assets/images/common/logo.svg";
@@ -177,6 +177,13 @@ const sceneListVisible = ref(false);
 const titleInputRef = ref<{ focus: () => void } | null>(null);
 const defaultTitle = computed(() => $t("OpWeb.Project.Demo", "演示项目"));
 const displayTitle = computed(() => editor.projectTitle.trim() || defaultTitle.value);
+const saveSceneButtonLabel = computed(() => {
+  if (unref(editor.savingScene)) {
+    const pct = Math.max(0, Math.min(100, Number(unref(editor.persistPercent) || 0)));
+    return editor.sceneCode ? `更新中 ${pct}%` : `保存中 ${pct}%`;
+  }
+  return editor.sceneCode ? "更新" : "保存";
+});
 
 function openAdmin() {
   router.push({ path: "/project/admin" });
@@ -201,7 +208,7 @@ const finishEdit = () => {
 
 async function onCreateNewScene() {
   if (editor.savingScene) return;
-  if (editor.sceneHasUnsavedChanges) {
+  if (editor.sceneNeedsPersist) {
     try {
       await ElMessageBox.confirm("当前场景有未保存修改，确认新建并丢弃当前修改吗？", "提示", {
         type: "warning"

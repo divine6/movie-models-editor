@@ -9,14 +9,55 @@ interface SceneNodeState {
   nodeIdCounter: number;
 }
 
+/** 从 grp_12 / vid_3 / anim_50 中取数字后缀 */
+function parseNodeIdCounter(id: string | null | undefined): number {
+  if (!id || typeof id !== "string") return 0;
+  const m = /^(?:grp|vid|anim)_(\d+)$/.exec(id.trim());
+  if (!m) return 0;
+  const n = Number(m[1]);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
 export const useSceneNodeStore = defineStore("sceneNode", {
   state: (): SceneNodeState => ({
     nodeIdCounter: 0
   }),
 
   actions: {
-    createGroup(projectId: string, name: string, parentId?: string, sortOrder = 0): SceneGroupNode {
-      const id = `grp_${++this.nodeIdCounter}`;
+    /** 加载/导入场景后调用：计数器至少高于已有节点，避免再生成重复 PRIMARY */
+    syncCounterFromNodes(nodes: SceneNode[] | null | undefined) {
+      let max = this.nodeIdCounter;
+      for (const n of nodes || []) {
+        max = Math.max(max, parseNodeIdCounter(n.id));
+      }
+      if (max > this.nodeIdCounter) this.nodeIdCounter = max;
+    },
+
+    /**
+     * scene_node.id 在库内全局唯一。本地计数器只保证本机不重复，
+     * 新建场景落库前跳到时间戳，避免 anim_58 这类序号撞上其它场景。
+     */
+    bumpCounterForGlobalUniqueness() {
+      const floor = Date.now();
+      if (this.nodeIdCounter < floor) this.nodeIdCounter = floor;
+    },
+
+    nextUniqueId(prefix: "grp" | "vid" | "anim", existingIds?: Set<string>) {
+      let id = "";
+      do {
+        id = `${prefix}_${++this.nodeIdCounter}`;
+      } while (existingIds?.has(id));
+      return id;
+    },
+
+    createGroup(
+      projectId: string,
+      name: string,
+      parentId?: string,
+      sortOrder = 0,
+      existingIds?: Set<string>
+    ): SceneGroupNode {
+      const id = this.nextUniqueId("grp", existingIds);
       const now = new Date().toISOString();
       return {
         id,
@@ -30,8 +71,14 @@ export const useSceneNodeStore = defineStore("sceneNode", {
       };
     },
 
-    createVideo(projectId: string, name: string, parentId?: string, sortOrder = 0): SceneVideoNode {
-      const id = `vid_${++this.nodeIdCounter}`;
+    createVideo(
+      projectId: string,
+      name: string,
+      parentId?: string,
+      sortOrder = 0,
+      existingIds?: Set<string>
+    ): SceneVideoNode {
+      const id = this.nextUniqueId("vid", existingIds);
       const now = new Date().toISOString();
       return {
         id,
@@ -56,9 +103,10 @@ export const useSceneNodeStore = defineStore("sceneNode", {
       parentVideoId: string,
       startTime: number,
       endTime: number,
-      sortOrder = 0
+      sortOrder = 0,
+      existingIds?: Set<string>
     ): SceneAnimationNode {
-      const id = `anim_${++this.nodeIdCounter}`;
+      const id = this.nextUniqueId("anim", existingIds);
       const now = new Date().toISOString();
       return {
         id,
@@ -78,6 +126,7 @@ export const useSceneNodeStore = defineStore("sceneNode", {
           transitionSec: DEFAULT_CAMERA.transitionSec
         },
         modelConfigs: {},
+        clips: [],
         createdAt: now,
         updatedAt: now
       };

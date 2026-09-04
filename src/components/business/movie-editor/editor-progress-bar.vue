@@ -25,13 +25,13 @@
           </el-tooltip>
         </div>
       </div>
-      <div class="prog-playhead" :style="{ left: `${editor.pct(editor.currentTime)}%` }" />
+      <div class="prog-playhead" :style="{ left: `${playheadPct}%` }" />
     </div>
     <div class="progress-meta">
       <div class="progress-meta-left">
-        <button class="progress-ctrl-btn" type="button" :title="editor.isPlaying ? '暂停' : '播放'" @click.stop="editor.togglePlay">
+        <button class="progress-ctrl-btn" type="button" :title="timelinePlaying ? '暂停' : '播放'" @click.stop="editor.togglePlay">
           <svg
-            v-if="editor.isPlaying"
+            v-if="timelinePlaying"
             width="12"
             height="12"
             viewBox="0 0 12 12"
@@ -73,9 +73,9 @@
           {{ editor.playbackRateLabel }}
         </button>
         <div class="progress-time">
-          <span class="progress-time-current">{{ editor.fmt(editor.currentTime) }}</span>
+          <span class="progress-time-current">{{ editor.fmt(displayTime) }}</span>
           <span class="progress-time-sep">/</span>
-          <span class="progress-time-total">{{ editor.fmt(editor.duration) }}</span>
+          <span class="progress-time-total">{{ editor.fmt(displayDuration) }}</span>
         </div>
       </div>
       <div v-if="activeChapterLabel" class="progress-chapter">{{ activeChapterLabel }}</div>
@@ -91,25 +91,56 @@ import type { Chapter } from "@/interface/project";
 
 const editor = useMovieEditorContext();
 
-const usePresentationSegments = computed(() => editor.viewOnly || editor.isPreviewMode);
-
-const progressSegments = computed(() =>
-  usePresentationSegments.value ? editor.presentationNavChapters : editor.timelineChapters
+const timelinePlaying = computed(() =>
+  editor.playbackClock
+    ? !!editor.playbackClock.playing
+    : editor.wallclockPreviewActive
+      ? !!editor.totalPlaying
+      : !!editor.isPlaying
 );
+const displayTime = computed(() =>
+  editor.playbackClock
+    ? editor.playbackClock.time
+    : editor.wallclockPreviewActive
+      ? editor.clipPlayElapsed
+      : editor.currentTime
+);
+const displayDuration = computed(() =>
+  editor.playbackClock
+    ? editor.playbackClock.duration
+    : editor.wallclockPreviewActive
+      ? editor.clipPlayDuration
+      : editor.duration
+);
+
+const progressSegments = computed(() => editor.timelineChapters);
 const trailPct = computed(() => {
-  if (!editor.duration || editor.duration <= 0) return 0;
-  return Math.max(0, Math.min(100, (editor.currentTime / editor.duration) * 100));
+  const dur = displayDuration.value;
+  if (!dur || dur <= 0) return 0;
+  return Math.max(0, Math.min(100, (displayTime.value / dur) * 100));
 });
+const playheadPct = computed(() => trailPct.value);
 
 function segmentStyle(ch: Chapter) {
   return editor.chapterSegmentStyle(ch);
 }
 
 function segmentFillScale(i: number) {
-  return usePresentationSegments.value ? editor.presentationFillScale(i) : editor.fillScale(i);
+  return editor.fillScale(i);
 }
 
 const activeChapterLabel = computed(() => {
+  void editor.playbackUiRevision;
+  void editor.selectedChapterId;
+  void editor.selectedNodeId;
+  void editor.currentTime;
+  void editor.presentationUiRevision;
+  void editor.isPlaying;
+  if (editor.viewOnly || editor.isPreviewMode) {
+    const idx = editor.currentChapterIdx;
+    if (idx >= 0) return editor.timelineChapters[idx]?.name ?? "";
+    return "";
+  }
   const activeId = editor.getActiveChapterIdForUi();
   if (activeId) {
     return editor.chapters.find(ch => ch.id === activeId)?.name ?? "";

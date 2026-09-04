@@ -13,29 +13,29 @@ services:
         - npmrc
       args:
         VITE_API_URL: ${VITE_API_URL:-https://ext.highlands.ltd/light-sass-api/}
-        VITE_PUBLIC_PATH: ${VITE_PUBLIC_PATH:-/movie-editor/}
-        VITE_EDITOR_SERVER_URL: ${VITE_EDITOR_SERVER_URL:-/movie-editor}
-        VITE_EDITOR_FRONTEND_URL: ${VITE_EDITOR_FRONTEND_URL:-/movie-editor}
-    image: ${APP_IMAGE:-core.harbor.domain:30003/movie-editor/movie-editor:latest}
-    container_name: movie-editor-app
+        VITE_PUBLIC_PATH: ${VITE_PUBLIC_PATH:-/movie-editor-v2/}
+        VITE_EDITOR_SERVER_URL: ${VITE_EDITOR_SERVER_URL:-/movie-editor-v2}
+        VITE_EDITOR_FRONTEND_URL: ${VITE_EDITOR_FRONTEND_URL:-/movie-editor-v2}
+    image: ${APP_IMAGE:-core.harbor.domain:30003/movie-editor/movie-editor-v2:latest}
+    container_name: movie-editor-v2-app
     restart: unless-stopped
     ports:
       - "${APP_PORT:-4000}:4000"
     environment:
       PORT: 4000
       STORAGE_DRIVER: mysql
-      BASE_PATH: ${BASE_PATH:-/movie-editor}
-      EDITOR_FRONTEND_URL: ${EDITOR_FRONTEND_URL:-https://api.highlands.ltd/movie-editor}
+      BASE_PATH: ${BASE_PATH:-/movie-editor-v2}
+      EDITOR_FRONTEND_URL: ${EDITOR_FRONTEND_URL:-https://api.highlands.ltd/movie-editor-v2}
       DB_HOST: ${DB_HOST:-192.168.10.220}
       DB_PORT: ${DB_PORT:-3306}
       DB_USER: ${DB_USER:-root}
       DB_PASSWORD: ${DB_PASSWORD:-root}
-      DB_NAME: ${DB_NAME:-movie_models}
+      DB_NAME: ${DB_NAME:-movie_editor_v2}
     volumes:
-      - movie_editor_uploads:/app/storage
+      - movie_editor_v2_uploads:/app/storage
 
 volumes:
-  movie_editor_uploads:
+  movie_editor_v2_uploads:
 
 secrets:
   npmrc:

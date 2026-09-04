@@ -15,7 +15,7 @@
     <div class="video-pip" :class="{ 'is-loading': videoLoading }" :style="videoPipBoxStyle">
       <video
         :ref="editor.bindRef('videoEl')"
-        :muted="editor.viewOnly || editor.isPreviewMode"
+        :muted="editor.videoIsMuted"
         preload="metadata"
         playsinline
         @loadstart="onVideoLoadStart"
@@ -85,9 +85,21 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue"
 
 import { useVideoPip } from "@/composables/movie-editor/useVideoPip";
 import { useMovieEditorContext } from "@/composables/useMovieEditorContext";
+import type { SceneAnimationNode } from "@/interface/project";
 import { isCoarsePointerDevice } from "@/utils/device";
 
 const editor = useMovieEditorContext();
+
+/** 当前应读写视频框布局的动画（编辑选中 / 预览播放中的动画） */
+function resolvePipLayoutAnimation(): SceneAnimationNode | null {
+  const id =
+    (typeof editor.getActiveChapterIdForUi === "function" ? editor.getActiveChapterIdForUi() : null) ||
+    editor.selectedChapterId ||
+    null;
+  if (!id) return null;
+  const ch = editor.chapters?.find((c: SceneAnimationNode) => c.id === id);
+  return ch && ch.type === "animation" ? ch : null;
+}
 
 const { pipGroupRef, pipStyle, pipDragging, pipResizing, placePipToRight, onPipDragStart, onPipResizeStart } =
   useVideoPip({
@@ -95,34 +107,43 @@ const { pipGroupRef, pipStyle, pipDragging, pipResizing, placePipToRight, onPipD
   getViewOnly: () => editor.viewOnly,
   getIsPreviewMode: () => editor.isPreviewMode,
   getHasVideo: () => editor.hasVideo,
-  getVideoDisplayWidth: () => editor.activeVideoNode?.videoDisplayWidth || 0,
-  getVideoDisplayWidthRatio: () => editor.activeVideoNode?.videoDisplayWidthRatio,
-  getVideoDisplayLeft: () => editor.activeVideoNode?.videoDisplayLeft,
-  getVideoDisplayTop: () => editor.activeVideoNode?.videoDisplayTop,
-  getVideoDisplayXRatio: () => editor.activeVideoNode?.videoDisplayXRatio,
-  getVideoDisplayYRatio: () => editor.activeVideoNode?.videoDisplayYRatio,
-  getVideoDisplayViewportWidth: () => editor.activeVideoNode?.videoDisplayViewportWidth,
-  getVideoDisplayViewportHeight: () => editor.activeVideoNode?.videoDisplayViewportHeight,
+  getActiveAnimationId: () =>
+    (typeof editor.getActiveChapterIdForUi === "function" ? editor.getActiveChapterIdForUi() : null) ||
+    editor.selectedChapterId ||
+    null,
+  getVideoDisplayWidth: () => resolvePipLayoutAnimation()?.videoDisplayWidth || 0,
+  getVideoDisplayWidthRatio: () => resolvePipLayoutAnimation()?.videoDisplayWidthRatio,
+  getVideoDisplayLeft: () => resolvePipLayoutAnimation()?.videoDisplayLeft,
+  getVideoDisplayTop: () => resolvePipLayoutAnimation()?.videoDisplayTop,
+  getVideoDisplayXRatio: () => resolvePipLayoutAnimation()?.videoDisplayXRatio,
+  getVideoDisplayYRatio: () => resolvePipLayoutAnimation()?.videoDisplayYRatio,
+  getVideoDisplayViewportWidth: () => resolvePipLayoutAnimation()?.videoDisplayViewportWidth,
+  getVideoDisplayViewportHeight: () => resolvePipLayoutAnimation()?.videoDisplayViewportHeight,
   setVideoDisplayWidth: width => {
-    if (editor.activeVideoNode) editor.activeVideoNode.videoDisplayWidth = width;
+    const anim = resolvePipLayoutAnimation();
+    if (anim) anim.videoDisplayWidth = width;
   },
   setVideoDisplayWidthRatio: ratio => {
-    if (editor.activeVideoNode) editor.activeVideoNode.videoDisplayWidthRatio = ratio;
+    const anim = resolvePipLayoutAnimation();
+    if (anim) anim.videoDisplayWidthRatio = ratio;
   },
   setVideoDisplayPosition: (left, top) => {
-    if (!editor.activeVideoNode) return;
-    editor.activeVideoNode.videoDisplayLeft = left;
-    editor.activeVideoNode.videoDisplayTop = top;
+    const anim = resolvePipLayoutAnimation();
+    if (!anim) return;
+    anim.videoDisplayLeft = left;
+    anim.videoDisplayTop = top;
   },
   setVideoDisplayPositionRatio: (xRatio, yRatio) => {
-    if (!editor.activeVideoNode) return;
-    editor.activeVideoNode.videoDisplayXRatio = xRatio;
-    editor.activeVideoNode.videoDisplayYRatio = yRatio;
+    const anim = resolvePipLayoutAnimation();
+    if (!anim) return;
+    anim.videoDisplayXRatio = xRatio;
+    anim.videoDisplayYRatio = yRatio;
   },
   setVideoDisplayViewportSize: (width, height) => {
-    if (!editor.activeVideoNode) return;
-    editor.activeVideoNode.videoDisplayViewportWidth = width;
-    editor.activeVideoNode.videoDisplayViewportHeight = height;
+    const anim = resolvePipLayoutAnimation();
+    if (!anim) return;
+    anim.videoDisplayViewportWidth = width;
+    anim.videoDisplayViewportHeight = height;
   }
 });
 
@@ -270,14 +291,17 @@ watch(
 );
 
 watch(
-  () => editor.activeVideoId,
-  (id, prev) => {
-    if (!editor.showVideoPip || !id || id === prev) return;
-    // 仅视频节点真正切换时重排 PiP；同源切章不要挪窗口（看起来像刷新）。
-    const video = editor.videoEl;
-    if (video?.dataset.editorSrcKey && video.getAttribute("src") && !video.error) {
-      return;
-    }
+  () => [
+    editor.selectedChapterId,
+    editor.selectedNodeId,
+    typeof editor.getActiveChapterIdForUi === "function" ? editor.getActiveChapterIdForUi() : null
+  ],
+  (curr, prev) => {
+    if (!editor.showVideoPip || !editor.hasVideo) return;
+    const currId = curr?.[2] ?? curr?.[0] ?? null;
+    const prevId = prev?.[2] ?? prev?.[0] ?? null;
+    // 切换动画时按该动画的视频框设置落位；同源未切动画不重复跳
+    if (currId && currId === prevId && curr?.[1] === prev?.[1]) return;
     applyStoredPipLayout();
   }
 );
@@ -292,14 +316,6 @@ watch(
 
 watch(
   () => editor.isPreviewMode,
-  () => {
-    if (!editor.showVideoPip || !editor.hasVideo) return;
-    applyStoredPipLayout();
-  }
-);
-
-watch(
-  () => editor.selectedNodeId,
   () => {
     if (!editor.showVideoPip || !editor.hasVideo) return;
     applyStoredPipLayout();

@@ -61,6 +61,58 @@ export function defaultSceneLightName(type: SceneLightType, index: number) {
   }
 }
 
+/** 场景模块默认三路光源（与场景面板出厂预设一致） */
+const DEFAULT_SCENE_LIGHT_TEMPLATES: ReadonlyArray<Omit<SceneLightSettings, "id">> = [
+  {
+    type: "directional",
+    name: "平行光 1",
+    color: "#ffffff",
+    intensity: 3.45,
+    position: [2.54, 3.47, 2.54],
+    rotation: [-68, 10.7, 0],
+    distance: 0,
+    decay: 2,
+    angle: 45,
+    penumbra: 0.2,
+    castShadow: true
+  },
+  {
+    type: "spot",
+    name: "聚光灯 1",
+    color: "#ffffff",
+    intensity: 2.65,
+    position: [2.1, 3.5, 0.25],
+    rotation: [-75.1, 35.4, -1.5],
+    distance: 5.35,
+    decay: 0.65,
+    angle: 46.3,
+    penumbra: 0.15,
+    castShadow: false
+  },
+  {
+    type: "directional",
+    name: "平行光 2",
+    color: "#ffffff",
+    intensity: 1.75,
+    position: [-3.6, 3.6, -3.1],
+    rotation: [-129, -30, -19],
+    distance: 0,
+    decay: 2,
+    angle: 45,
+    penumbra: 0.2,
+    castShadow: true
+  }
+];
+
+export function createDefaultSceneLights(): SceneLightSettings[] {
+  return DEFAULT_SCENE_LIGHT_TEMPLATES.map(template => ({
+    ...template,
+    id: createSceneLightId(),
+    position: [...template.position] as [number, number, number],
+    rotation: [...template.rotation] as [number, number, number]
+  }));
+}
+
 export function createDefaultSceneLight(
   type: SceneLightType,
   index: number,

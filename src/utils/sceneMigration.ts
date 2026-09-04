@@ -24,6 +24,7 @@ function legacyChapterToAnimation(ch: Chapter, videoId: string, sortOrder: numbe
       transitionSec: DEFAULT_CAMERA.transitionSec
     },
     modelConfigs: ch.modelConfigs || {},
+    clips: Array.isArray((ch as SceneAnimationNode).clips) ? (ch as SceneAnimationNode).clips : [],
     createdAt: ch.createdAt,
     updatedAt: ch.updatedAt
   };
@@ -86,16 +87,20 @@ export function migrateProjectToSceneNodesV2(project: ProjectDetail): ProjectDet
 
 export function ensureProjectNodes(project: ProjectDetail | null): ProjectDetail | null {
   if (!project) return null;
-  if (project.schemaVersion === SCHEMA_VERSION && Array.isArray(project.nodes)) {
+  const hasNodes = Array.isArray(project.nodes) && project.nodes.length > 0;
+  const hasLegacyChapters = Array.isArray(project.chapters) && project.chapters.length > 0;
+  if (project.schemaVersion === SCHEMA_VERSION && hasNodes) {
     return project;
   }
-  if (Array.isArray(project.chapters) && project.chapters.length > 0) {
-    return migrateProjectToSceneNodesV2(project);
+  if (hasLegacyChapters) {
+    const migrated = migrateProjectToSceneNodesV2(project);
+    Object.assign(project, migrated);
+    return project;
   }
-  if (!project.nodes) {
+  if (!Array.isArray(project.nodes)) {
     project.nodes = [];
-    project.schemaVersion = SCHEMA_VERSION;
   }
+  project.schemaVersion = SCHEMA_VERSION;
   return project;
 }
 

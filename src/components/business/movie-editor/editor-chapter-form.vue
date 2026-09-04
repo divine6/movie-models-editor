@@ -35,77 +35,8 @@
         </p>
       </div>
 
-      <div class="detail-section chapter-camera-section">
-        <div class="detail-section-title">{{ $t("OpWeb.Editor.Camera", "镜头") }}</div>
-
-        <div class="chapter-cam-group">
-          <div class="chapter-cam-group-label">{{ $t("OpWeb.Editor.CameraPosition", "相机位置") }}</div>
-          <div class="chapter-cam-grid chapter-cam-grid--3">
-            <div class="chapter-cam-field">
-              <label class="chapter-axis-label">X</label>
-              <el-input-number v-model="cameraForm.posX" :step="0.001" :precision="3" :controls="false" size="small" />
-            </div>
-            <div class="chapter-cam-field">
-              <label class="chapter-axis-label">Y</label>
-              <el-input-number v-model="cameraForm.posY" :step="0.001" :precision="3" :controls="false" size="small" />
-            </div>
-            <div class="chapter-cam-field">
-              <label class="chapter-axis-label">Z</label>
-              <el-input-number v-model="cameraForm.posZ" :step="0.001" :precision="3" :controls="false" size="small" />
-            </div>
-          </div>
-        </div>
-
-        <div class="chapter-cam-group">
-          <div class="chapter-cam-group-label">{{ $t("OpWeb.Editor.CameraTarget", "观察目标") }}</div>
-          <div class="chapter-cam-grid chapter-cam-grid--3">
-            <div class="chapter-cam-field">
-              <label class="chapter-axis-label">X</label>
-              <el-input-number v-model="cameraForm.targetX" :step="0.001" :precision="3" :controls="false" size="small" />
-            </div>
-            <div class="chapter-cam-field">
-              <label class="chapter-axis-label">Y</label>
-              <el-input-number v-model="cameraForm.targetY" :step="0.001" :precision="3" :controls="false" size="small" />
-            </div>
-            <div class="chapter-cam-field">
-              <label class="chapter-axis-label">Z</label>
-              <el-input-number v-model="cameraForm.targetZ" :step="0.001" :precision="3" :controls="false" size="small" />
-            </div>
-          </div>
-        </div>
-
-        <div class="chapter-fov-field">
-          <label class="chapter-field-label">{{ $t("OpWeb.Editor.Fov", "FOV") }}</label>
-          <div class="chapter-fov-row">
-            <el-slider v-model="cameraForm.fov" :min="10" :max="60" :step="1" size="small" />
-            <el-input-number
-              v-model="cameraForm.fov"
-              :min="10"
-              :max="60"
-              :step="1"
-              :controls="false"
-              size="small"
-              class="chapter-fov-input"
-            />
-          </div>
-        </div>
-
-        <div class="chapter-form-field chapter-transition-field">
-          <label class="chapter-field-label">{{ $t("OpWeb.Editor.CameraTransitionSec", "运镜时长（秒）") }}</label>
-          <el-input-number
-            v-model="cameraForm.transitionSec"
-            :min="0.1"
-            :max="10"
-            :step="0.1"
-            :precision="1"
-            :controls="false"
-            size="small"
-          />
-        </div>
-
-        <el-button class="chapter-capture-btn" size="small" type="primary" plain @click="editor.captureCam">
-          {{ $t("OpWeb.Editor.CaptureCamera", "捕获当前视角") }}
-        </el-button>
+      <div class="detail-section chapter-camera-section is-collapsed-hint">
+        <p class="chapter-cam-moved-hint">运镜请在下方各「片段」中捕获；此处仅保留动画在视频上的起止时间。</p>
       </div>
     </div>
   </div>
@@ -115,7 +46,7 @@
 </template>
 
 <script setup lang="ts" name="editor-chapter-form">
-import { computed, nextTick, reactive, unref, watch } from "vue";
+import { computed, reactive, unref, watch } from "vue";
 
 import { useMovieEditorContext } from "@/composables/useMovieEditorContext";
 import { useTranslate } from "@/hooks/useTranslate";
@@ -144,9 +75,13 @@ let isSyncingChapterForm = false;
 let isSyncingCameraForm = false;
 
 const activeChapter = computed(() => {
-  const chapterId = unref(editor.selectedChapterId);
+  const chapterId = unref(editor.selectedChapterId) || unref(editor.selectedNodeId);
   if (!chapterId) return null;
-  return editor.chapters.find(ch => ch.id === chapterId) ?? null;
+  const fromChapters = editor.chapters.find(ch => ch.id === chapterId);
+  if (fromChapters) return fromChapters;
+  // 兜底：selectedChapterId 尚未跟上时，用树选中的动画节点
+  const node = editor.nodes.find(n => n.id === chapterId);
+  return node?.type === "animation" ? node : null;
 });
 
 const isChildChapter = computed(() => !!activeChapter.value?.parentId);
@@ -173,13 +108,17 @@ const syncForms = () => {
     fov: Math.min(60, Math.max(10, ch.camera.fov)),
     transitionSec: ch.camera.transitionSec ?? cameraForm.transitionSec ?? 0.5
   });
-  void nextTick(() => {
-    isSyncingChapterForm = false;
-    isSyncingCameraForm = false;
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => {
+      window.setTimeout(() => {
+        isSyncingChapterForm = false;
+        isSyncingCameraForm = false;
+      }, 80);
+    });
   });
 };
 
-watch(() => [editor.selectedChapterId, editor.chapterFormRevision, editor.cameraFormRevision] as const, syncForms, {
+watch(() => [editor.selectedChapterId, editor.selectedNodeId, editor.chapterFormRevision, editor.cameraFormRevision] as const, syncForms, {
   immediate: true
 });
 
@@ -189,36 +128,6 @@ watch(
     if (isSyncingChapterForm || unref(editor.chapterNavLock)) return;
     editor.applyChapterFormSnapshot({ ...chapterForm });
     editor.saveChF();
-  },
-  { deep: true }
-);
-
-watch(
-  cameraForm,
-  () => {
-    if (
-      isSyncingCameraForm ||
-      unref(editor.chapterNavLock) ||
-      unref(editor.isCameraTransitioning)
-    ) {
-      return;
-    }
-    cameraForm.posX = round3(cameraForm.posX);
-    cameraForm.posY = round3(cameraForm.posY);
-    cameraForm.posZ = round3(cameraForm.posZ);
-    cameraForm.targetX = round3(cameraForm.targetX);
-    cameraForm.targetY = round3(cameraForm.targetY);
-    cameraForm.targetZ = round3(cameraForm.targetZ);
-    cameraForm.fov = Math.min(60, Math.max(10, cameraForm.fov));
-    editor.applyCameraFormSnapshot({ ...cameraForm });
-    editor.applyCameraFormToViewport();
-    const ch = activeChapter.value;
-    if (ch) {
-      ch.camera.position = [cameraForm.posX, cameraForm.posY, cameraForm.posZ];
-      ch.camera.target = [cameraForm.targetX, cameraForm.targetY, cameraForm.targetZ];
-      ch.camera.fov = cameraForm.fov;
-      ch.camera.transitionSec = cameraForm.transitionSec;
-    }
   },
   { deep: true }
 );

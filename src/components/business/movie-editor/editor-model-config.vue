@@ -31,6 +31,9 @@
         <el-switch v-model="formData.animation" size="small" />
       </div>
     </div>
+    <p class="model-config-anim-hint">
+      章节默认外观（未播到片段时）。片段变换/高亮/线框请在左侧「动画时间轴」中按轨道编辑。
+    </p>
 
     <div class="model-highlight-color-row">
       <span class="model-switch-label">{{ $t("OpWeb.Editor.OutlineColor", "轮廓颜色") }}</span>
@@ -73,8 +76,6 @@
         :placeholder="$t('OpWeb.Editor.ModelIntroPlaceholder', '播放当前节点时，在模型旁显示此介绍')"
       />
     </div>
-
-    <editor-model-animation :form-data="formData" :on-apply="applyLive" />
   </div>
 </template>
 
@@ -222,6 +223,13 @@ const onModelHighlightColorChange = () => {
     line-height: 20px;
     color: var(--text-color-2);
   }
+}
+
+.movie-editor .model-config-anim-hint {
+  margin: -6px 0 12px;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--text-color-3);
 }
 
 .movie-editor .model-highlight-color-row {

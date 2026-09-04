@@ -1,4 +1,6 @@
-# harbor:
+# harbor v2:
 https://core.harbor.domain:30003/movie-editor
+image: core.harbor.domain:30003/movie-editor/movie-editor-v2:latest
 
-#
+# 现网旧包（禁止再推送）:
+# core.harbor.domain:30003/movie-editor/movie-editor:latest

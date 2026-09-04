@@ -1,0 +1,556 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>UltimateBox 3D 场景编辑器使用说明</title>
+  <style>@page {
+  size: A4;
+  margin: 10mm 11mm 11mm 11mm;
+}
+
+html {
+  font-size: 11.5px;
+}
+
+body {
+  font-family: "Microsoft YaHei", "PingFang SC", "Noto Sans SC", "Segoe UI", sans-serif;
+  color: #1f2328;
+  line-height: 1.38;
+  margin: 0;
+  padding: 0;
+}
+
+h1 {
+  font-size: 18px;
+  line-height: 1.2;
+  margin: 0 0 4px;
+  color: #111827;
+  border-bottom: 2px solid #2426c0;
+  padding-bottom: 4px;
+}
+
+h2 {
+  font-size: 14px;
+  margin: 9px 0 4px;
+  color: #1e1b4b;
+  page-break-after: avoid;
+}
+
+h3 {
+  font-size: 12.5px;
+  margin: 6px 0 3px;
+  color: #312e81;
+  page-break-after: avoid;
+}
+
+h4 {
+  font-size: 11.5px;
+  margin: 5px 0 2px;
+  page-break-after: avoid;
+}
+
+p {
+  margin: 0 0 4px;
+}
+
+ul,
+ol {
+  margin: 0 0 4px;
+  padding-left: 18px;
+}
+
+li {
+  margin: 0;
+}
+
+blockquote {
+  margin: 4px 0 6px;
+  padding: 4px 8px;
+  background: #f5f6fb;
+  border-left: 3px solid #2426c0;
+  color: #374151;
+}
+
+blockquote p {
+  margin: 0;
+}
+
+code {
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 10.5px;
+  background: #f3f4f6;
+  padding: 0 3px;
+  border-radius: 2px;
+}
+
+pre {
+  background: #111827;
+  color: #e5e7eb;
+  padding: 6px 8px;
+  border-radius: 4px;
+  overflow: hidden;
+  font-size: 10.5px;
+  line-height: 1.35;
+  margin: 3px 0 6px;
+}
+
+pre code {
+  background: transparent;
+  color: inherit;
+  padding: 0;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 3px 0 6px;
+  font-size: 11px;
+}
+
+th,
+td {
+  border: 1px solid #d1d5db;
+  padding: 3px 6px;
+  text-align: left;
+  vertical-align: top;
+}
+
+th {
+  background: #eef0f8;
+  color: #1e1b4b;
+  font-weight: 600;
+}
+
+tr:nth-child(even) td {
+  background: #fafafa;
+}
+
+img {
+  display: block;
+  max-width: 100%;
+  max-height: 220px;
+  width: auto;
+  height: auto;
+  object-fit: contain;
+  border: 1px solid #e5e7eb;
+  border-radius: 3px;
+  margin: 3px auto 6px;
+  page-break-inside: auto;
+  break-inside: auto;
+}
+
+img[src*="guide-header"] {
+  max-height: 36px;
+  width: 100%;
+}
+
+img[src*="guide-06"] {
+  max-height: 78px;
+  width: 100%;
+}
+
+img[src*="guide-01"],
+img[src*="guide-05"],
+img[src*="guide-11"] {
+  max-height: 210px;
+}
+
+img[src*="guide-viewport"] {
+  max-height: 200px;
+}
+
+img[src*="guide-02"],
+img[src*="guide-03"],
+img[src*="guide-04"],
+img[src*="guide-07"],
+img[src*="guide-clip"],
+img[src*="guide-node"] {
+  max-height: 240px;
+}
+
+hr {
+  border: none;
+  border-top: 1px solid #e5e7eb;
+  margin: 6px 0;
+}
+
+a {
+  color: #2426c0;
+  text-decoration: none;
+}
+</style>
+</head>
+<body>
+<h1>UltimateBox 3D 场景编辑器使用说明</h1>
+<p><strong>文档版本</strong>：2026-08-17　<strong>适用产品</strong>：UltimateBox 3D Explorer</p>
+<blockquote>
+<p>编辑 / 展示地址由工作人员另行发放。本文只说明操作，不提供可打开的网址。</p>
+</blockquote>
+<hr>
+<h2>1. 产品用途</h2>
+<p>将 <strong>讲解视频</strong> 与 <strong>GLB 模型</strong> 按时间对齐：镜头、模型动作、字幕随视频播放。保存后可生成只读展示页。</p>
+<p>推荐浏览器：<strong>Chrome / Edge 90+</strong>。</p>
+<pre><code>分组（可选） → 视频 → 动画节点（视频上的一段时间） → 片段（运镜 + 模型动作）
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>对象</th>
+<th>作用</th>
+<th>编辑位置</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>视频</td>
+<td>讲解片源</td>
+<td>左侧节点树</td>
+</tr>
+<tr>
+<td>动画节点</td>
+<td>视频上的一段讲解；最短 1 秒，同级不可重叠</td>
+<td>左侧「动画信息」</td>
+</tr>
+<tr>
+<td>片段</td>
+<td>该段内的运镜与模型姿态 / 外观</td>
+<td>左侧时间轴</td>
+</tr>
+<tr>
+<td>章节默认外观</td>
+<td>尚未播到片段时的显示</td>
+<td>右侧「模型」（未在编片段时）</td>
+</tr>
+</tbody></table>
+<p><strong>推荐顺序：</strong> 上传视频 → 添加动画并对齐时间 → 片段中捕获运镜 → 点选模型改外观 / 姿态 → 字幕 → 预览 → 顶部「保存 / 更新」→「编辑列表」复制展示链接。</p>
+<p><img src="images/guide-01-overview.png" alt="界面总览"></p>
+<table>
+<thead>
+<tr>
+<th>区域</th>
+<th>功能</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>顶部</td>
+<td>名称、新建、预览、编辑列表、保存 / 更新</td>
+</tr>
+<tr>
+<td>左侧</td>
+<td>节点树；选中动画后编辑时间与片段</td>
+</tr>
+<tr>
+<td>中间</td>
+<td>3D 视口、视频小窗、进度条</td>
+</tr>
+<tr>
+<td>右侧</td>
+<td>模型 / 字幕 / 场景</td>
+</tr>
+</tbody></table>
+<h2>2. 顶部工具栏</h2>
+<p><img src="images/guide-header.png" alt="顶部工具栏"></p>
+<table>
+<thead>
+<tr>
+<th>按钮</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>名称 ✏️</td>
+<td>改场景标题，Enter 确认</td>
+</tr>
+<tr>
+<td>新建</td>
+<td>空白草稿；有未保存修改会确认</td>
+</tr>
+<tr>
+<td>预览</td>
+<td>须已有视频 + 至少一个动画。Esc 退出</td>
+</tr>
+<tr>
+<td>编辑列表</td>
+<td>成功保存过 1 次后可开：修改 / 复制链接 / 删除</td>
+</tr>
+<tr>
+<td>保存 / 更新</td>
+<td>须视频 + 动画。橙色圆点 = 有未保存修改。保存中勿关页</td>
+</tr>
+</tbody></table>
+<p><img src="images/guide-06-edit-list.png" alt="编辑列表"></p>
+<p>展示链接交给观看方或由工作人员转发，勿使用文档中的示例地址。</p>
+<h2>3. 节点树</h2>
+<p><img src="images/guide-node-tree.png" alt="节点树"></p>
+<p>「＋ 添加」可建 <strong>分组</strong> 或 <strong>视频</strong>。分组行上的「+」可继续加子分组 / 子视频。搜索按名称过滤；<strong>仅视频节点</strong>可拖入分组。</p>
+<table>
+<thead>
+<tr>
+<th>节点</th>
+<th>行内操作</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>视频</td>
+<td>⬆ 上传 / 替换（建议 MP4）→ 成功后出现小窗；⊕ 添加动画；🗑 删除（含子动画）</td>
+</tr>
+<tr>
+<td>动画</td>
+<td>▶ 播放该段；🗑 删除。默认 1 秒，结束须 ≥ 开始 + 1 秒</td>
+</tr>
+</tbody></table>
+<p>选中动画后，下方只改 <strong>名称、开始 / 结束</strong>。运镜在片段里捕获。</p>
+<h2>4. 动画片段</h2>
+<p>选中动画节点后，在下方设置起止时间，并用「片段」编辑运镜与模型动作。</p>
+<p><img src="images/guide-07-animation-timeline.png" alt="动画信息与片段"></p>
+<table>
+<thead>
+<tr>
+<th>操作</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>▶ 播放</td>
+<td>按顺序预览本动画全部片段</td>
+</tr>
+<tr>
+<td>保存</td>
+<td>写入本动画的片段（顶部「更新」才提交整场）</td>
+</tr>
+<tr>
+<td>数字芯片</td>
+<td>切换片段；「+」新建；「×」删除（至少留 1 个）</td>
+</tr>
+<tr>
+<td>起 / 止</td>
+<td>本片段时间窗；必须播完才进下一段</td>
+</tr>
+<tr>
+<td>捕获视口</td>
+<td>把当前镜头写入本片段</td>
+</tr>
+<tr>
+<td>过渡</td>
+<td>切到本镜头的时长，<strong>0 = 瞬切</strong></td>
+</tr>
+<tr>
+<td>FOV</td>
+<td>约 20°–120°</td>
+</tr>
+</tbody></table>
+<p>视口：<strong>左键旋转、滚轮缩放、右键平移</strong> →「捕获视口」→「播放」检查衔接。</p>
+<p><strong>两套时间互不绑定：</strong> 片段起止是时间窗；模型「间隔 / 起始→结束」是姿态插值（可为 0）。要对齐结束，把窗长与姿态时长调成一致。</p>
+<p><img src="images/guide-clip-edit.png" alt="片段模型"></p>
+<p>视口或右侧树点选模型，即加入当前片段。Shift 范围多选，Ctrl / ⌘ 追加。标记：<strong>已改</strong> 已写入，<strong>编辑中</strong> 未提交，<strong>选中</strong> 多选中。</p>
+<table>
+<thead>
+<tr>
+<th>外观</th>
+<th>姿态</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>显示 / 轮廓 / 线框 / 高亮；「颜色与介绍…」可改色和气泡文字</td>
+<td>「起始 / 结束」：位置、缩放、旋转；间隔、起始→结束、曲线、旋转中心</td>
+</tr>
+</tbody></table>
+<p>流程：选片段 → 捕获运镜 → 点模型 → 改外观与起止姿态 → 时间轴「播放」→「保存」→ 顶部「更新」。</p>
+<h2>5. 视口</h2>
+<p><img src="images/guide-viewport.png" alt="视口"></p>
+<table>
+<thead>
+<tr>
+<th>操作</th>
+<th>作用</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>单击模型</td>
+<td>选中并聚焦（点空白取消）</td>
+</tr>
+<tr>
+<td>Shift / Ctrl + 单击</td>
+<td>加入当前片段多选</td>
+</tr>
+<tr>
+<td>视频小窗</td>
+<td>与 3D 同步。编辑时可拖动、拖角缩放；位置按动画节点记忆。✕ 移除视频</td>
+</tr>
+<tr>
+<td>进度条</td>
+<td>▶ 播放；倍速 1 / 1.25 / 1.5 / 2 / 0.5；点击分段跳转</td>
+</tr>
+</tbody></table>
+<p>字幕出现在视口底部；介绍文字以气泡跟在模型旁。均只在对应时段显示。</p>
+<h2>6. 模型 · 字幕 · 场景</h2>
+<h3>模型</h3>
+<p><img src="images/guide-02-model-config.png" alt="模型"></p>
+<p>列表为当前场景 GLB。点卡片聚焦；🗑 仅从本场景移除。树中 Group / Mesh / Bone 可单独选。编片段时，外观请在左侧时间轴改。</p>
+<p>未编片段时，右侧为 <strong>章节默认外观</strong>：显示、轮廓、线框、高亮、是否播动画、介绍文字。</p>
+<h3>字幕</h3>
+<p><img src="images/guide-03-subtitle.png" alt="字幕"></p>
+<p>绑定当前动画节点。填开始 / 结束（整数秒）、文本（≤100 字）、文字色 / 背景色 →「＋ 添加字幕」。点列表项可改，🗑 删除。</p>
+<h3>场景（全局，对所有动画生效）</h3>
+<p><img src="images/guide-04-scene.png" alt="灯光"></p>
+<table>
+<thead>
+<tr>
+<th>区块</th>
+<th>要点</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>灯光</td>
+<td>环境光强度；「+ 添加灯光」：平行光 / 聚光灯 / 点光源。选中后调颜色、强度、位置、方向、阴影</td>
+</tr>
+<tr>
+<td>材质</td>
+<td>先在模型树选中对象，再改颜色；子部件只改该部件</td>
+</tr>
+<tr>
+<td>后处理</td>
+<td>Bloom、GTAO、抗锯齿（FXAA / SMAA / SSAA）、采样倍数、30/45/60 FPS、色调映射（建议 ACES Filmic）、曝光 / 对比度 / 饱和度</td>
+</tr>
+<tr>
+<td>环境</td>
+<td>HDR（.hdr）、旋转 / 强度、镜面反射、雾、阴影、网格。展示时建议关网格</td>
+</tr>
+<tr>
+<td>重置</td>
+<td>面板底栏，恢复默认</td>
+</tr>
+</tbody></table>
+<p><img src="images/guide-04-scene-env.png" alt="后处理"></p>
+<h2>7. 预览与展示</h2>
+<p><img src="images/guide-05-preview.png" alt="预览"></p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>预览</th>
+<th>展示</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>进入</td>
+<td>顶部「预览」</td>
+<td>工作人员发放的 <code>mode=view</code> 链接，无需登录</td>
+</tr>
+<tr>
+<td>顶栏</td>
+<td>UltimateBox 预览</td>
+<td>UltimateBox 3D Explorer</td>
+</tr>
+<tr>
+<td>编辑</td>
+<td>可退出再改</td>
+<td>只读</td>
+</tr>
+</tbody></table>
+<table>
+<thead>
+<tr>
+<th>操作</th>
+<th>方式</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>播放 / 暂停</td>
+<td>播放按钮、空格、<strong>双击</strong>视口（单击不切换，防误触）</td>
+</tr>
+<tr>
+<td>上 / 下一段</td>
+<td>视口 ◀ ▶ 或 ← →（只切段，不暂停）</td>
+</tr>
+<tr>
+<td>跳转</td>
+<td>进度条分段；列表可选段落</td>
+</tr>
+<tr>
+<td>退出预览</td>
+<td>「退出预览」或 Esc</td>
+</tr>
+</tbody></table>
+<p><img src="images/guide-11-view-mode.png" alt="展示"></p>
+<p>分享前：时间轴「保存」→ 顶部「更新」→「编辑列表」→「复制链接」。编辑 <code>code</code> 与展示 <code>code</code> 不同，展示编号在首次保存后生成。</p>
+<h2>8. 快捷键与限制</h2>
+<table>
+<thead>
+<tr>
+<th>键</th>
+<th>功能</th>
+<th>范围</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>空格</td>
+<td>播放 / 暂停</td>
+<td>编辑 / 预览 / 展示</td>
+</tr>
+<tr>
+<td>← →</td>
+<td>上 / 下一段</td>
+<td>同上</td>
+</tr>
+<tr>
+<td>Esc</td>
+<td>退出预览</td>
+<td>预览</td>
+</tr>
+<tr>
+<td>单击 / Shift / Ctrl+单击</td>
+<td>选模型</td>
+<td>编辑</td>
+</tr>
+</tbody></table>
+<p>在输入框内快捷键不生效。视频建议 MP4（&lt; 200MB），模型 GLB/GLTF（单文件建议 &lt; 50MB）。</p>
+<h2>9. 常见问题</h2>
+<table>
+<thead>
+<tr>
+<th>现象</th>
+<th>处理</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>一直「正在初始化…」</td>
+<td>刷新；换 Chrome / Edge；查网络</td>
+</tr>
+<tr>
+<td>预览灰掉</td>
+<td>先上传视频并添加动画节点</td>
+</tr>
+<tr>
+<td>保存灰掉</td>
+<td>同上，且当前不在保存中。片段改完先点时间轴「保存」</td>
+</tr>
+<tr>
+<td>时间改不了</td>
+<td>须在视频时长内、≥1 秒、同级不重叠</td>
+</tr>
+<tr>
+<td>看不到模型</td>
+<td>确认场景已绑定 GLB；检查「显示」与片段外观</td>
+</tr>
+<tr>
+<td>镜头不对</td>
+<td>先调视口再「捕获视口」；运镜只在 <strong>当前片段</strong></td>
+</tr>
+<tr>
+<td>动作完了还停</td>
+<td>片段窗长 &gt; 姿态时长。把止点与姿态时长对齐</td>
+</tr>
+<tr>
+<td>右侧高亮预览无效</td>
+<td>播放以 <strong>片段外观</strong> 为准</td>
+</tr>
+<tr>
+<td>编辑列表打不开</td>
+<td>链接须带编辑场景编号，且已成功保存过 1 个场景</td>
+</tr>
+</tbody></table>
+<hr>
+<p><em>问题请联系 UltimateBox 技术支持。</em></p>
+
+</body>
+</html>

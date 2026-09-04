@@ -2,17 +2,17 @@
 # 在 saas3.0 目录执行:
 #   docker compose -f movie-models-editor/docker/docker-compose.yml up -d --build
 #
-# Harbor 镜像配置见 docker/harbor.env
+# Harbor 镜像配置见 docker/harbor.env（已指向 movie-editor-v2）
 # K8s 部署（外部 MySQL 192.168.10.220:3306）见 docker/docker-compose.k8s.yml
 
 services:
   mysql:
     image: mysql:8.4
-    container_name: movie-models-mysql
+    container_name: movie-editor-v2-mysql
     restart: unless-stopped
     environment:
       MYSQL_ROOT_PASSWORD: ${DB_PASSWORD:-root}
-      MYSQL_DATABASE: ${DB_NAME:-movie_models}
+      MYSQL_DATABASE: ${DB_NAME:-movie_editor_v2}
     ports:
       - "${DB_PORT:-3306}:3306"
     volumes:
@@ -33,8 +33,11 @@ services:
         - npmrc
       args:
         VITE_API_URL: ${VITE_API_URL:-https://ext.highlands.ltd/light-sass-api/}
-    image: ${APP_IMAGE:-core.harbor.domain:30003/movie-editor/movie-editor:latest}
-    container_name: movie-models-app
+        VITE_PUBLIC_PATH: ${VITE_PUBLIC_PATH:-/movie-editor-v2/}
+        VITE_EDITOR_SERVER_URL: ${VITE_EDITOR_SERVER_URL:-/movie-editor-v2}
+        VITE_EDITOR_FRONTEND_URL: ${VITE_EDITOR_FRONTEND_URL:-/movie-editor-v2}
+    image: ${APP_IMAGE:-core.harbor.domain:30003/movie-editor/movie-editor-v2:latest}
+    container_name: movie-editor-v2-app
     restart: unless-stopped
     depends_on:
       mysql:
@@ -44,17 +47,19 @@ services:
     environment:
       PORT: 4000
       STORAGE_DRIVER: mysql
+      PUBLIC_PATH: ${PUBLIC_PATH:-/movie-editor-v2}
+      EDITOR_FRONTEND_URL: ${EDITOR_FRONTEND_URL:-https://api.highlands.ltd/movie-editor-v2}
       DB_HOST: mysql
       DB_PORT: 3306
       DB_USER: root
       DB_PASSWORD: ${DB_PASSWORD:-root}
-      DB_NAME: ${DB_NAME:-movie_models}
+      DB_NAME: ${DB_NAME:-movie_editor_v2}
     volumes:
-      - movie_models_uploads:/app/storage
+      - movie_editor_v2_uploads:/app/storage
 
 volumes:
   movie_models_mysql_data:
-  movie_models_uploads:
+  movie_editor_v2_uploads:
 
 secrets:
   npmrc:

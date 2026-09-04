@@ -1,0 +1,21 @@
+# 追加 v2 访问路径（不要删除现网 Ingress 的 /movie-editor）
+# 应用: kubectl apply -f k8s/ingress.yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api-highlands-ltd-u3d-v2
+  namespace: u3d
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: 50m
+spec:
+  rules:
+    - host: api.highlands.ltd
+      http:
+        paths:
+          - path: /movie-editor-v2
+            pathType: Prefix
+            backend:
+              service:
+                name: movie-editor-v2
+                port:
+                  number: 4000

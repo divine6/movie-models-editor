@@ -1086,6 +1086,7 @@
   flex: 1;
   overflow-y: auto;
   padding: 4px;
+  user-select: none;
 }
 
 .model-card {
@@ -1108,13 +1109,23 @@
     background: var(--primary-color-1);
   }
 
-  &.hovered:not(.selected) {
+  &.multi-selected:not(.selected) {
+    border-color: rgb(74 222 128 / 45%);
+    background: rgb(74 222 128 / 12%);
+  }
+
+  &.multi-selected.selected {
+    border-color: #86efac;
+    background: rgb(74 222 128 / 28%);
+  }
+
+  &.hovered:not(.selected):not(.multi-selected) {
     border-color: var(--primary-color-5);
     background: var(--primary-color-1);
     box-shadow: 0 0 0 1px var(--primary-color-2);
   }
 
-  &.hovered-child:not(.selected) {
+  &.hovered-child:not(.selected):not(.multi-selected) {
     border-color: var(--primary-color-4);
     background: color-mix(in srgb, var(--primary-color-1) 60%, var(--fill-color-5));
   }
@@ -1189,6 +1200,7 @@
   cursor: pointer;
   border: 1px solid transparent;
   transition: all 0.15s;
+  user-select: none;
 
   &:hover {
     background: var(--fill-color-5);
@@ -1200,7 +1212,24 @@
     border-color: var(--primary-color-6);
   }
 
-  &.hovered:not(.selected) {
+  &.multi-selected:not(.selected) {
+    background: rgb(74 222 128 / 14%);
+    border-color: rgb(74 222 128 / 40%);
+  }
+
+  &.multi-selected.selected {
+    background: #4ade80;
+    border-color: #86efac;
+    color: #052e16;
+
+    .tree-node-name,
+    .tree-node-type,
+    .tree-node-icon {
+      color: #052e16;
+    }
+  }
+
+  &.hovered:not(.selected):not(.multi-selected) {
     background: var(--primary-color-1);
     border-color: var(--primary-color-5);
     box-shadow: inset 2px 0 0 var(--primary-color-5);
@@ -1223,6 +1252,21 @@
     background: #e6f4ff;
     color: #1677ff;
     border: 1px solid #91caff;
+
+    &.is-soft {
+      opacity: 0.72;
+    }
+  }
+
+  .sel-badge {
+    flex-shrink: 0;
+    font-size: 10px;
+    line-height: 15px;
+    padding: 0 5px;
+    border-radius: 3px;
+    background: rgb(74 222 128 / 18%);
+    color: #86efac;
+    border: 1px solid rgb(74 222 128 / 40%);
   }
 }
 

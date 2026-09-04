@@ -215,6 +215,7 @@ async function onDelete(row: EditorServerSceneItem) {
     if (editor.sceneCode === row.code) {
       editor.sceneCode = null;
       editor.shareLink = "";
+      editor.persistBoundSceneCode?.(null);
     }
     editor.sceneListVersion += 1;
     ElMessage.success("场景已删除");

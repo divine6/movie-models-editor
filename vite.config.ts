@@ -4,6 +4,7 @@ import { ConfigEnv, defineConfig, loadEnv, UserConfig } from "vite";
 
 import { wrapperEnv } from "./build/getEnv";
 import { createVitePlugins } from "./build/plugins";
+import { editorApiRangePlugin } from "./build/editorApiRangePlugin";
 import { projectAssetsPlugin } from "./build/projectAssetsPlugin";
 import { createProxy } from "./build/proxy";
 import pkg from "./package.json";
@@ -20,17 +21,13 @@ export default defineConfig(({ mode }: ConfigEnv): UserConfig => {
   const env = loadEnv(mode, root);
   const viteEnv = wrapperEnv(env);
 
-  // 根据 mode 动态设置输出目录名称
+  // 根据 mode 或 VITE_APP_TYPE 设置输出目录（docker.v2 没有 .tenant 后缀）
   const getOutDir = (mode: string): string => {
-    // 从 mode 中提取应用类型
-    // 例如: development.owner -> owner, production.tenant -> tenant
-    const match = mode.match(/\.(owner|tenant)/);
-    if (match && match[1]) {
-      // 如果 tenant 输出为 dist-tenant
-      //  owner 输出为 dist-owner，
-      return `dist-${match[1]}`;
+    const fromMode = mode.match(/\.(owner|tenant)/)?.[1];
+    const appType = fromMode || String(viteEnv.VITE_APP_TYPE || "").trim();
+    if (appType === "owner" || appType === "tenant") {
+      return `dist-${appType}`;
     }
-    // 默认使用 dist
     return "dist";
   };
 
@@ -63,7 +60,7 @@ export default defineConfig(({ mode }: ConfigEnv): UserConfig => {
       // Load proxy configuration from .env.development
       proxy: createProxy(viteEnv.VITE_PROXY)
     },
-    plugins: [...createVitePlugins(viteEnv), projectAssetsPlugin()],
+    plugins: [...createVitePlugins(viteEnv), projectAssetsPlugin(), editorApiRangePlugin()],
     esbuild: {
       pure: viteEnv.VITE_DROP_CONSOLE ? ["console.log", "debugger"] : []
     },

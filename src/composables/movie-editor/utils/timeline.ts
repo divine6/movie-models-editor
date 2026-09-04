@@ -36,8 +36,10 @@ export function createTimelineHelpers(duration: Ref<number>, currentTime: Ref<nu
   const chapterSegmentStyle = (ch: Chapter) => {
     const dur = duration.value;
     if (dur <= 0) return { left: "0%", width: "0%" };
-    const left = (ch.startTime / dur) * 100;
-    const width = ((ch.endTime - ch.startTime) / dur) * 100;
+    const start = Math.max(0, Math.min(dur, ch.startTime));
+    const end = Math.max(start, Math.min(dur, ch.endTime));
+    const left = (start / dur) * 100;
+    const width = ((end - start) / dur) * 100;
     return {
       left: `${left}%`,
       width: `${Math.max(0.15, width)}%`

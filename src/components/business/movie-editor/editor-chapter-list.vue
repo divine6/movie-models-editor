@@ -39,7 +39,10 @@
             <span>动画信息</span>
             <span class="chapter-detail-sub">{{ selectedAnimationNode.name || "未命名动画" }}</span>
           </div>
-          <editor-chapter-form />
+          <div class="chapter-detail-body-scroll">
+            <editor-chapter-form />
+            <editor-animation-timeline />
+          </div>
         </div>
 
         <div v-else-if="selectedVideoNode" class="chapter-panel-detail">
@@ -86,6 +89,7 @@
 <script setup lang="ts" name="editor-chapter-list">
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 
+import EditorAnimationTimeline from "@/components/business/movie-editor/editor-animation-timeline.vue";
 import EditorChapterForm from "@/components/business/movie-editor/editor-chapter-form.vue";
 import EditorChapterPreviewDrawer from "@/components/business/movie-editor/editor-chapter-preview-drawer.vue";
 import EditorSceneNodeTree from "@/components/business/movie-editor/editor-scene-node-tree.vue";
@@ -119,18 +123,8 @@ const selectedVideoNode = computed(() => (selectedNode.value?.type === "video" ?
 const selectedGroupNode = computed(() => (selectedNode.value?.type === "group" ? selectedNode.value : null));
 
 const onPreviewChapterPlay = (chapter: Chapter) => {
-  if (editor.viewOnly || editor.isPreviewMode) {
-    // 统一走 jump/seek，避免先 highlight 再跳转导致列表/进度条短暂不同步
-    editor.jumpToChapter(chapter);
-  } else {
-    const wasPlaying = !!(editor.videoEl && (!editor.videoEl.paused || editor.isPlaying));
-    void editor.startChapterPlayback(chapter, {
-      autoplay: true,
-      syncVideo: true,
-      userGesture: true,
-      keepPlaying: wasPlaying
-    });
-  }
+  // 统一走 jump/seek，避免 startChapterPlayback 把切章堵在 yield/加载上
+  editor.jumpToChapter(chapter);
   // Delay closing the drawer so the touch cannot click-through onto the play button
   // (which would immediately pause after a play jump). Keep short so切章体感更即时。
   if (!editor.viewOnly || (typeof window !== "undefined" && window.innerWidth <= 768)) {

@@ -1,6 +1,6 @@
 import * as THREE from "three";
 
-import { SCENE_GRID_DIVISIONS, SCENE_GRID_SIZE, SCENE_TONE_MAPPING_EXPOSURE, SCENE_VIEWPORT_BG } from "@/utils/three/constants";
+import { SCENE_GRID_DIVISIONS, SCENE_GRID_SIZE, SCENE_VIEWPORT_BG } from "@/utils/three/constants";
 
 /** 色调映射选项（与 Three.js renderer.toneMapping 对应） */
 export const TONE_MAPPING_OPTIONS = [
@@ -37,6 +37,7 @@ export const CURVE_LABELS: Record<string, string> = {
 };
 
 export const SCENE_SETTINGS_STORAGE_KEY = "movie-editor-scene-settings";
+export const BOUND_SCENE_CODE_STORAGE_KEY = "movie-editor-bound-scene-code";
 
 /** 后处理抗锯齿模式（编辑器走 EffectComposer，MSAA 对最终画面几乎无效） */
 export type AntialiasingMode = "none" | "ssaa" | "smaa" | "fxaa";
@@ -45,6 +46,13 @@ export type AntialiasingMode = "none" | "ssaa" | "smaa" | "fxaa";
 export function getSceneSettingsStorageKey(modelSetCode?: string | null) {
   const code = modelSetCode?.trim();
   return code ? `${SCENE_SETTINGS_STORAGE_KEY}-${code}` : SCENE_SETTINGS_STORAGE_KEY;
+}
+
+/** 记住当前项目已绑定的服务端场景 code，刷新后走更新而不是重复创建 */
+export function getBoundSceneCodeStorageKey(modelSetCode?: string | null, projectId?: string | null) {
+  const ms = modelSetCode?.trim() || "_";
+  const pid = projectId?.trim() || "_";
+  return `${BOUND_SCENE_CODE_STORAGE_KEY}:${ms}:${pid}`;
 }
 
 export const CHAPTER_TIME_EPS = 0.05;
@@ -70,27 +78,25 @@ export function normalizeTargetFps(value: unknown): TargetFps {
 }
 
 export const DEFAULT_SCENE_SETTINGS = {
-  ambIntensity: 0.35,
-  dirIntensity: 0.65,
-  fillIntensity: 0.2,
+  ambIntensity: 0.4,
   matColor: "#ffffff",
-  matRoughness: 0.5,
-  matMetalness: 0,
-  matNormalStr: 1,
-  matEmissiveInt: 0,
   matAoInt: 1,
+  aoDistanceFallOff: 0.51,
+  aoRadius: 0.2,
+  aoScale: 0.26,
   bloomIntensity: 0,
   bloomThreshold: 0.2,
   bloomRadius: 0.5,
-  ppExposure: SCENE_TONE_MAPPING_EXPOSURE,
+  // 默认曝光度：客户要求将场景曝光度默认值调为 0.7
+  ppExposure: 0.7,
   ppContrast: 0,
   ppSaturation: 0,
   toneMapping: "ACESFilmicToneMapping",
-  envIntensityVal: 1,
+  envIntensityVal: 0.95,
   /** 1 = 原始；>1 镜面/玻璃感（清漆 + 低粗糙度）；与环境贴图强度独立 */
-  envReflectionIntensity: 1,
-  envRotation: 0,
-  envMapUrl: null as string | null,
+  envReflectionIntensity: 0.8,
+  envRotation: 56.3,
+  envMapUrl: "/models/seaside.hdr",
   envMapIsHdr: true,
   envReflectionSphereVisible: false,
   bgColorVal: SCENE_VIEWPORT_BG,

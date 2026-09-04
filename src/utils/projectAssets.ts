@@ -14,7 +14,7 @@ export function projectAssetUrl(relativePath: string): string {
   return `${normalizedBase}${relativePath.replace(/^\//, "")}`;
 }
 
-/** Draco 解码器目录（随 VITE_PUBLIC_PATH 子路径部署） */
+/** Draco 解码器目录（随 VITE_PUBLIC_PATH 子路径部署；需含 wasm + wrapper + js） */
 export function dracoDecoderPath(): string {
   return projectAssetUrl("draco/");
 }

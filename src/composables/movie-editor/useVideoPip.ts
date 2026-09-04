@@ -20,6 +20,10 @@ export interface UseVideoPipOptions {
   getViewOnly: () => boolean;
   getIsPreviewMode: () => boolean;
   getHasVideo: () => boolean;
+  /** 当前动画 id：切换时按该动画单独存储的尺寸落位 */
+  getActiveAnimationId?: () => string | null | undefined;
+  /** @deprecated 兼容旧调用；优先用 getActiveAnimationId */
+  getActiveVideoId?: () => string | null | undefined;
   getVideoDisplayWidth: () => number;
   getVideoDisplayWidthRatio: () => number | undefined;
   getVideoDisplayLeft: () => number | undefined;
@@ -40,6 +44,8 @@ export function useVideoPip({
   getViewOnly,
   getIsPreviewMode,
   getHasVideo,
+  getActiveAnimationId,
+  getActiveVideoId,
   getVideoDisplayWidth,
   getVideoDisplayWidthRatio,
   getVideoDisplayLeft,
@@ -63,7 +69,8 @@ export function useVideoPip({
   /** 首次按存储布局落位前隐藏，避免闪到默认角再跳过去 */
   const pipLayoutReady = ref(false);
 
-  function isMobilePresentationViewport() {
+  /** 手机/触屏：不做视频框大小适配同步，也不回写尺寸 */
+  function isMobileViewport() {
     if (typeof window === "undefined") return false;
     const coarse = window.matchMedia?.("(pointer: coarse)")?.matches ?? false;
     return coarse || window.innerWidth <= 768;
@@ -160,6 +167,21 @@ export function useVideoPip({
     return { width, left, top };
   }
 
+  /** 当前动画是否已单独设置过视频框（有则用设置，无则默认） */
+  function hasStoredPipLayout() {
+    const width = getVideoDisplayWidth();
+    const widthRatio = getVideoDisplayWidthRatio();
+    const xRatio = getVideoDisplayXRatio();
+    const yRatio = getVideoDisplayYRatio();
+    const left = getVideoDisplayLeft();
+    const top = getVideoDisplayTop();
+    if (Number.isFinite(widthRatio) && (widthRatio as number) > 0) return true;
+    if (typeof width === "number" && width > 0) return true;
+    if (Number.isFinite(xRatio) && Number.isFinite(yRatio)) return true;
+    if (Number.isFinite(left) && Number.isFinite(top)) return true;
+    return false;
+  }
+
   /**
    * 编辑/预览视口尺寸不同：用落盘时记录的视口把像素换算到当前区域。
    * 优先 视口比例；其次 绝对像素 × (当前视口/落盘视口)；最后才用裸像素。
@@ -168,6 +190,20 @@ export function useVideoPip({
     const currentW = viewport.clientWidth;
     const currentH = viewport.clientHeight;
     const maxWidth = Math.max(PIP_MIN_WIDTH, currentW * PIP_MAX_WIDTH_RATIO);
+    const presentation = getViewOnly() || getIsPreviewMode();
+
+    if (!hasStoredPipLayout()) {
+      const width = clamp(resolvePipWidth(currentW, presentation), PIP_MIN_WIDTH, maxWidth);
+      pipWidth.value = width;
+      const fallback = resolveDefaultPipPosition(viewport);
+      const boxHeight = getPipVideoHeight() || Math.round(width * 9 / 16);
+      const bounds = resolveStorageBounds(viewport, boxHeight);
+      return {
+        width,
+        left: Math.round(clamp(fallback.left, bounds.minLeft, bounds.maxLeft)),
+        top: Math.round(clamp(fallback.top, bounds.minTop, bounds.maxTop))
+      };
+    }
 
     const storedWidth = getVideoDisplayWidth();
     const storedWidthRatio = getVideoDisplayWidthRatio();
@@ -192,7 +228,7 @@ export function useVideoPip({
     } else if (storedWidth > 0) {
       width = storedWidth;
     } else {
-      width = resolvePipWidth(currentW, getViewOnly() || getIsPreviewMode());
+      width = resolvePipWidth(currentW, presentation);
     }
     width = clamp(Math.round(width), PIP_MIN_WIDTH, maxWidth);
 
@@ -234,18 +270,28 @@ export function useVideoPip({
     const viewport = getViewportEl();
     if (!viewport) return;
     const presentation = getViewOnly() || getIsPreviewMode();
-    const fixedMobilePresentation = presentation && isMobilePresentationViewport();
+    const mobile = isMobileViewport();
 
-    if (fixedMobilePresentation) {
-      const layout = resolveFixedMobilePipLayout(viewport);
-      pipWidth.value = layout.width;
-      pipLeft.value = layout.left;
-      pipTop.value = layout.top;
-      // 不再 clamp 到贴顶，保持顶栏下方的固定位
+    // 手机端：只用固定/默认布局，不按电脑端存储尺寸做适配同步
+    if (mobile) {
+      if (presentation) {
+        const layout = resolveFixedMobilePipLayout(viewport);
+        pipWidth.value = layout.width;
+        pipLeft.value = layout.left;
+        pipTop.value = layout.top;
+      } else if (!pipLayoutReady.value || resetWidth) {
+        const maxWidth = Math.max(PIP_MIN_WIDTH, viewport.clientWidth * PIP_MAX_WIDTH_RATIO);
+        pipWidth.value = clamp(resolvePipWidth(viewport.clientWidth, false), PIP_MIN_WIDTH, maxWidth);
+        const fallback = resolveDefaultPipPosition(viewport);
+        pipLeft.value = fallback.left;
+        pipTop.value = fallback.top;
+        clampPipBounds();
+      }
       pipLayoutReady.value = true;
       return;
     }
 
+    // 电脑端：按当前动画单独存储的尺寸/比例适配；未设置则默认大小位置
     if (preferStoredPosition || resetWidth) {
       const layout = resolveConvertedLayout(viewport);
       pipWidth.value = layout.width;
@@ -268,6 +314,8 @@ export function useVideoPip({
   }
 
   function persistCurrentPipPosition() {
+    // 手机端不回写尺寸，避免覆盖各场景在电脑端单独存储的视频框大小
+    if (isMobileViewport()) return;
     const viewport = getViewportEl();
     const group = pipGroupRef.value;
     if (!viewport || !group) return;
@@ -383,7 +431,8 @@ export function useVideoPip({
     if (viewport) {
       viewportObserver = new ResizeObserver(() => {
         if (pipDragging.value || pipResizing.value) return;
-        // 视口尺寸变化（进/出预览侧栏变化）时按存储比例重新换算
+        // 视频框大小适配同步仅电脑端；手机端不随视口变化改尺寸
+        if (isMobileViewport()) return;
         placePipToRight(true, true);
       });
       viewportObserver.observe(viewport);
@@ -418,6 +467,16 @@ export function useVideoPip({
     () => getViewOnly(),
     only => {
       if (!only || !getHasVideo()) return;
+      pipLayoutReady.value = false;
+      applyStoredLayoutSoon();
+    }
+  );
+
+  // 每个动画单独存储尺寸：切换动画时按当前动画落位（有设置用设置，无则默认）
+  watch(
+    () => getActiveAnimationId?.() ?? getActiveVideoId?.() ?? null,
+    (id, prev) => {
+      if (!id || id === prev || !getHasVideo()) return;
       pipLayoutReady.value = false;
       applyStoredLayoutSoon();
     }

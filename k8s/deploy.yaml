@@ -1,18 +1,18 @@
-# movie-editor K8s 部署清单
-# namespace: u3d | service: movie-editor | 镜像拉取密钥: harbor
-# 外部 MySQL: 192.168.10.220:3306（不部署集群内 MySQL）
-# 线上访问: https://api.highlands.ltd/movie-editor
+# movie-editor-v2 K8s 部署清单（与现网并行，不替换现网 Deployment movie-editor）
+# namespace: u3d | service: movie-editor-v2 | 镜像拉取密钥: harbor
+# 外部 MySQL: 192.168.10.220:3306  库名: movie_editor_v2
+# 线上访问: https://api.highlands.ltd/movie-editor-v2
 #
-# 网关路由识别（同一服务内前后端分流）:
-#   后端 API:  /movie-editor/api/*、/movie-editor/uploads/*、/movie-editor/files/*、/movie-editor/health
-#   前端 SPA:  /movie-editor/*（其余路径，含静态资源与 hash 路由）
+# 本文件已全部指向 v2，apply 不会改现网 movie-editor。
+# 网关需追加路径（不要改现网 /movie-editor）:
+#   /movie-editor-v2 → service movie-editor-v2:4000
 #
 # 部署: k8s\deploy.bat  或  kubectl apply -f k8s/deploy.yaml
 
 apiVersion: v1
 kind: Secret
 metadata:
-  name: movie-editor-db
+  name: movie-editor-v2-db
   namespace: u3d
 type: Opaque
 stringData:
@@ -22,7 +22,7 @@ stringData:
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: movie-editor-uploads
+  name: movie-editor-v2-uploads
   namespace: u3d
 spec:
   accessModes:
@@ -34,25 +34,25 @@ spec:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: movie-editor
+  name: movie-editor-v2
   namespace: u3d
   labels:
-    app: movie-editor
+    app: movie-editor-v2
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: movie-editor
+      app: movie-editor-v2
   template:
     metadata:
       labels:
-        app: movie-editor
+        app: movie-editor-v2
     spec:
       imagePullSecrets:
         - name: harbor
       containers:
-        - name: movie-editor
-          image: core.harbor.domain:30003/movie-editor/movie-editor:latest
+        - name: movie-editor-v2
+          image: core.harbor.domain:30003/movie-editor/movie-editor-v2:latest
           imagePullPolicy: Always
           ports:
             - name: http
@@ -68,24 +68,23 @@ spec:
             - name: DB_PORT
               value: "3306"
             - name: DB_NAME
-              value: movie_editor
+              value: movie_editor_v2
             - name: DB_USER
               valueFrom:
                 secretKeyRef:
-                  name: movie-editor-db
+                  name: movie-editor-v2-db
                   key: DB_USER
             - name: DB_PASSWORD
               valueFrom:
                 secretKeyRef:
-                  name: movie-editor-db
+                  name: movie-editor-v2-db
                   key: DB_PASSWORD
-            # 网关保留 /movie-editor 前缀，应用内 PUBLIC_PATH 中间件剥离后走路由
             - name: PUBLIC_PATH
-              value: "/movie-editor"
+              value: "/movie-editor-v2"
             - name: BASE_PATH
               value: ""
             - name: EDITOR_FRONTEND_URL
-              value: "https://api.highlands.ltd/movie-editor"
+              value: "https://api.highlands.ltd/movie-editor-v2"
           volumeMounts:
             - name: uploads
               mountPath: /app/storage
@@ -113,21 +112,21 @@ spec:
       volumes:
         - name: uploads
           persistentVolumeClaim:
-            claimName: movie-editor-uploads
+            claimName: movie-editor-v2-uploads
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: movie-editor
+  name: movie-editor-v2
   namespace: u3d
   labels:
-    app: movie-editor
+    app: movie-editor-v2
 spec:
   type: NodePort
   selector:
-    app: movie-editor
+    app: movie-editor-v2
   ports:
     - name: http
       port: 4000
       targetPort: http
-      nodePort: 30400
+      nodePort: 30401

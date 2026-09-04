@@ -1,11 +1,10 @@
 @echo off
 setlocal EnableExtensions EnableDelayedExpansion
 
-REM 一键：构建镜像 -> 推送 Harbor -> kubectl 部署到 u3d 命名空间
+REM 一键构建/推送/部署 movie-editor-v2（不会推送或更新现网 movie-editor）
 REM 用法:
-REM   deploy.bat              使用 latest 标签
+REM   deploy.bat              使用 movie-editor-v2:latest
 REM   deploy.bat v1.0.0       指定镜像标签
-REM 可选环境变量: HARBOR_USER / HARBOR_PASSWORD（Harbor 登录）
 
 set "SCRIPT_DIR=%~dp0"
 set "PROJECT_ROOT=%SCRIPT_DIR%.."
@@ -44,18 +43,26 @@ if "%IMAGE_TAG%"=="" set "IMAGE_TAG=latest"
 set "FULL_IMAGE=%HARBOR_REGISTRY%/%HARBOR_PROJECT%/%IMAGE_NAME%:%IMAGE_TAG%"
 set "LATEST_IMAGE=%HARBOR_REGISTRY%/%HARBOR_PROJECT%/%IMAGE_NAME%:latest"
 
+echo %FULL_IMAGE% | findstr /i /c:"/movie-editor/movie-editor:" >nul
+if not errorlevel 1 (
+  echo [ERROR] Refusing to build/push production image: %FULL_IMAGE%
+  echo IMAGE_NAME must be movie-editor-v2.
+  exit /b 1
+)
+
 echo ========================================
-echo  movie-editor K8s Deploy
+echo  movie-editor-v2 K8s Deploy
 echo ========================================
 echo KUBECONFIG:  %KUBECONFIG%
 echo Image:       %FULL_IMAGE%
 echo Namespace:   u3d
-echo Service:     movie-editor
+echo Service:     movie-editor-v2
+echo Access:      https://api.highlands.ltd/movie-editor-v2
 echo ========================================
 echo.
 
-echo [1/5] Build Docker image (local frontend + runtime)...
-powershell -NoProfile -ExecutionPolicy Bypass -File "%PROJECT_ROOT%\scripts\docker-build.ps1" -Tag "%FULL_IMAGE%" -LocalFrontend
+echo [1/5] Build Docker image (v2 frontend + runtime)...
+powershell -NoProfile -ExecutionPolicy Bypass -File "%PROJECT_ROOT%\scripts\docker-build.ps1" -Tag "%FULL_IMAGE%" -LocalFrontend -ViteMode docker.v2 -ContextPath "/movie-editor-v2"
 if errorlevel 1 (
   echo [ERROR] Docker build failed.
   exit /b 1
@@ -88,7 +95,7 @@ if /i not "%IMAGE_TAG%"=="latest" (
   docker tag "%FULL_IMAGE%" "%LATEST_IMAGE%"
   docker push "%LATEST_IMAGE%"
   if errorlevel 1 (
-    echo [ERROR] docker push latest failed.
+    echo [ERROR] docker push movie-editor-v2:latest failed.
     exit /b 1
   )
 )
@@ -97,7 +104,7 @@ echo.
 echo [4/5] Apply K8s manifests and rollout...
 call "%SCRIPT_DIR%_kubectl-apply.cmd" "%SCRIPT_DIR%deploy.yaml" "%FULL_IMAGE%"
 if errorlevel 1 (
-  echo [ERROR] K8s deploy failed. Image is already in Harbor; run deploy-k8s.bat after updating kubeconfig.
+  echo [ERROR] K8s deploy failed.
   exit /b 1
 )
 echo.
@@ -106,12 +113,13 @@ echo [5/5] Done.
 
 echo.
 echo ========================================
-echo  Deploy succeeded
+echo  v2 Deploy succeeded
 echo ========================================
 echo Image:     %FULL_IMAGE%
-echo Pods:      kubectl get pods -l app=movie-editor -n u3d
-echo Service:   kubectl get svc movie-editor -n u3d
-echo Access:    https://api.highlands.ltd/movie-editor
+echo Pods:      kubectl get pods -l app=movie-editor-v2 -n u3d
+echo Service:   kubectl get svc movie-editor-v2 -n u3d
+echo Access:    https://api.highlands.ltd/movie-editor-v2
+echo Ingress:   kubectl apply -f k8s\ingress.yaml
 echo ========================================
 
 endlocal

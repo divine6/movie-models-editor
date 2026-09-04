@@ -36,6 +36,7 @@ export const useChapterStore = defineStore("chapter", {
           transitionSec: DEFAULT_CAMERA.transitionSec
         },
         modelConfigs: {},
+        clips: [],
         parentId,
         createdAt: now,
         updatedAt: now

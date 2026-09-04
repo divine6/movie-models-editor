@@ -91,7 +91,7 @@
                       :max="LIGHT_MAX"
                       :step="0.05"
                       size="small"
-                      @input="lightNumApply(n => { if (selectedLight) selectedLight.intensity = n })"
+                      @input="(v) => lightNumApply(n => { if (selectedLight) selectedLight.intensity = n }, v)"
                     /><el-input-number
                       v-model="selectedLight.intensity"
                       :min="0"
@@ -99,7 +99,7 @@
                       :step="0.05"
                       :controls="false"
                       size="small"
-                      @input="lightNumApply(n => { if (selectedLight) selectedLight.intensity = n })"
+                      @input="(v) => lightNumApply(n => { if (selectedLight) selectedLight.intensity = n }, v)"
                     />
                   </div>
                 </div>
@@ -115,7 +115,7 @@
                           :max="POS_MAX"
                           :step="0.05"
                           size="small"
-                          @input="lightNumApply(n => { if (selectedLight) selectedLight.position[axis.idx] = n })"
+                          @input="(v) => lightNumApply(n => { if (selectedLight) selectedLight.position[axis.idx] = n }, v)"
                         /><el-input-number
                           v-model="selectedLight.position[axis.idx]"
                           :min="POS_MIN"
@@ -123,7 +123,7 @@
                           :step="0.05"
                           :controls="false"
                           size="small"
-                          @input="lightNumApply(n => { if (selectedLight) selectedLight.position[axis.idx] = n })"
+                          @input="(v) => lightNumApply(n => { if (selectedLight) selectedLight.position[axis.idx] = n }, v)"
                         />
                       </div>
                     </div>
@@ -141,7 +141,7 @@
                           :max="180"
                           :step="0.05"
                           size="small"
-                          @input="lightNumApply(n => { if (selectedLight) selectedLight.rotation[axis.idx] = n })"
+                          @input="(v) => lightNumApply(n => { if (selectedLight) selectedLight.rotation[axis.idx] = n }, v)"
                         /><el-input-number
                           v-model="selectedLight.rotation[axis.idx]"
                           :min="-180"
@@ -149,7 +149,7 @@
                           :step="0.05"
                           :controls="false"
                           size="small"
-                          @input="lightNumApply(n => { if (selectedLight) selectedLight.rotation[axis.idx] = n })"
+                          @input="(v) => lightNumApply(n => { if (selectedLight) selectedLight.rotation[axis.idx] = n }, v)"
                         />
                       </div>
                     </div>
@@ -169,7 +169,7 @@
                         :max="100"
                         :step="0.05"
                         size="small"
-                        @input="lightNumApply(n => { if (selectedLight) selectedLight.distance = n })"
+                        @input="(v) => lightNumApply(n => { if (selectedLight) selectedLight.distance = n }, v)"
                       /><el-input-number
                         v-model="selectedLight.distance"
                         :min="0"
@@ -177,7 +177,7 @@
                         :step="0.05"
                         :controls="false"
                         size="small"
-                        @input="lightNumApply(n => { if (selectedLight) selectedLight.distance = n })"
+                        @input="(v) => lightNumApply(n => { if (selectedLight) selectedLight.distance = n }, v)"
                       />
                     </div>
                   </div>
@@ -190,7 +190,7 @@
                         :max="5"
                         :step="0.05"
                         size="small"
-                        @input="lightNumApply(n => { if (selectedLight) selectedLight.decay = n })"
+                        @input="(v) => lightNumApply(n => { if (selectedLight) selectedLight.decay = n }, v)"
                       /><el-input-number
                         v-model="selectedLight.decay"
                         :min="0"
@@ -198,7 +198,7 @@
                         :step="0.05"
                         :controls="false"
                         size="small"
-                        @input="lightNumApply(n => { if (selectedLight) selectedLight.decay = n })"
+                        @input="(v) => lightNumApply(n => { if (selectedLight) selectedLight.decay = n }, v)"
                       />
                     </div>
                   </div>
@@ -213,7 +213,7 @@
                         :max="90"
                         :step="0.05"
                         size="small"
-                        @input="lightNumApply(n => { if (selectedLight) selectedLight.angle = n })"
+                        @input="(v) => lightNumApply(n => { if (selectedLight) selectedLight.angle = n }, v)"
                       /><el-input-number
                         v-model="selectedLight.angle"
                         :min="1"
@@ -221,7 +221,7 @@
                         :step="0.05"
                         :controls="false"
                         size="small"
-                        @input="lightNumApply(n => { if (selectedLight) selectedLight.angle = n })"
+                        @input="(v) => lightNumApply(n => { if (selectedLight) selectedLight.angle = n }, v)"
                       />
                     </div>
                   </div>
@@ -234,7 +234,7 @@
                         :max="1"
                         :step="0.05"
                         size="small"
-                        @input="lightNumApply(n => { if (selectedLight) selectedLight.penumbra = n })"
+                        @input="(v) => lightNumApply(n => { if (selectedLight) selectedLight.penumbra = n }, v)"
                       /><el-input-number
                         v-model="selectedLight.penumbra"
                         :min="0"
@@ -242,7 +242,7 @@
                         :step="0.05"
                         :controls="false"
                         size="small"
-                        @input="lightNumApply(n => { if (selectedLight) selectedLight.penumbra = n })"
+                        @input="(v) => lightNumApply(n => { if (selectedLight) selectedLight.penumbra = n }, v)"
                       />
                     </div>
                   </div>
@@ -281,90 +281,6 @@
                     @change="editor.applyMatToCurModel"
                     @active-change="editor.applyMatToCurModel"
                   />
-                </div>
-                <div class="sp-field">
-                  <label>粗糙度</label>
-                  <div class="sp-slider-row">
-                    <el-slider
-                      v-model="editor.matRoughness"
-                      :min="0"
-                      :max="1"
-                      :step="0.05"
-                      size="small"
-                      @input="numApply('matRoughness', editor.applyMatToCurModel)"
-                    /><el-input-number
-                      v-model="editor.matRoughness"
-                      :min="0"
-                      :max="1"
-                      :step="0.05"
-                      :controls="false"
-                      size="small"
-                      @input="numApply('matRoughness', editor.applyMatToCurModel)"
-                    />
-                  </div>
-                </div>
-                <div class="sp-field">
-                  <label>金属度</label>
-                  <div class="sp-slider-row">
-                    <el-slider
-                      v-model="editor.matMetalness"
-                      :min="0"
-                      :max="1"
-                      :step="0.05"
-                      size="small"
-                      @input="numApply('matMetalness', editor.applyMatToCurModel)"
-                    /><el-input-number
-                      v-model="editor.matMetalness"
-                      :min="0"
-                      :max="1"
-                      :step="0.05"
-                      :controls="false"
-                      size="small"
-                      @input="numApply('matMetalness', editor.applyMatToCurModel)"
-                    />
-                  </div>
-                </div>
-                <div class="sp-field">
-                  <label>法线强度</label>
-                  <div class="sp-slider-row">
-                    <el-slider
-                      v-model="editor.matNormalStr"
-                      :min="0"
-                      :max="5"
-                      :step="0.05"
-                      size="small"
-                      @input="numApply('matNormalStr', editor.applyMatToCurModel)"
-                    /><el-input-number
-                      v-model="editor.matNormalStr"
-                      :min="0"
-                      :max="5"
-                      :step="0.05"
-                      :controls="false"
-                      size="small"
-                      @input="numApply('matNormalStr', editor.applyMatToCurModel)"
-                    />
-                  </div>
-                </div>
-                <div class="sp-field">
-                  <label>自发光</label>
-                  <div class="sp-slider-row">
-                    <el-slider
-                      v-model="editor.matEmissiveInt"
-                      :min="0"
-                      :max="5"
-                      :step="0.05"
-                      size="small"
-                      @input="numApply('matEmissiveInt', editor.applyMatToCurModel)"
-                    /><el-input-number
-                      v-model="editor.matEmissiveInt"
-                      :min="0"
-                      :max="5"
-                      :step="0.05"
-                      :controls="false"
-                      size="small"
-                      @input="numApply('matEmissiveInt', editor.applyMatToCurModel)"
-                    />
-                  </div>
                 </div>
               </template>
             </div>
@@ -419,6 +335,73 @@
                     :controls="false"
                     size="small"
                     @input="numApply('bloomRadius', editor.toggleBloom)"
+                  />
+                </div>
+              </div>
+            </div>
+            <div class="sp-module">
+              <div class="sp-module-title">环境光遮蔽 Ambient Occlusion (GTAO)</div>
+              <p class="sp-hint">作用于场景中全部模型及其子部件（屏幕空间，随模型尺度自适应）</p>
+              <div class="sp-field">
+                <label>距离衰减 distanceFallOff</label>
+                <div class="sp-slider-row">
+                  <el-slider
+                    v-model="editor.aoDistanceFallOff"
+                    :min="0.01"
+                    :max="3"
+                    :step="0.05"
+                    size="small"
+                    @input="(v) => numApply('aoDistanceFallOff', editor.applyAO)(v)"
+                  /><el-input-number
+                    v-model="editor.aoDistanceFallOff"
+                    :min="0.01"
+                    :max="3"
+                    :step="0.05"
+                    :controls="false"
+                    size="small"
+                    @input="(v) => numApply('aoDistanceFallOff', editor.applyAO)(v)"
+                  />
+                </div>
+              </div>
+              <div class="sp-field">
+                <label>半径 radius</label>
+                <div class="sp-slider-row">
+                  <el-slider
+                    v-model="editor.aoRadius"
+                    :min="0.1"
+                    :max="1"
+                    :step="0.05"
+                    size="small"
+                    @input="(v) => numApply('aoRadius', editor.applyAO)(v)"
+                  /><el-input-number
+                    v-model="editor.aoRadius"
+                    :min="0.1"
+                    :max="1"
+                    :step="0.05"
+                    :controls="false"
+                    size="small"
+                    @input="(v) => numApply('aoRadius', editor.applyAO)(v)"
+                  />
+                </div>
+              </div>
+              <div class="sp-field">
+                <label>强度 scale</label>
+                <div class="sp-slider-row">
+                  <el-slider
+                    v-model="editor.aoScale"
+                    :min="0.01"
+                    :max="2"
+                    :step="0.05"
+                    size="small"
+                    @input="(v) => numApply('aoScale', editor.applyAO)(v)"
+                  /><el-input-number
+                    v-model="editor.aoScale"
+                    :min="0.01"
+                    :max="2"
+                    :step="0.05"
+                    :controls="false"
+                    size="small"
+                    @input="(v) => numApply('aoScale', editor.applyAO)(v)"
                   />
                 </div>
               </div>
@@ -807,11 +790,9 @@ function numApply(key: string, apply: () => void) {
   };
 }
 
-function lightNumApply(assign: (n: number) => void) {
-  return (val?: number | null) => {
-    if (typeof val === "number" && Number.isFinite(val)) assign(val);
-    editor.applySceneLights();
-  };
+function lightNumApply(assign: (n: number) => void, val?: number | null) {
+  if (typeof val === "number" && Number.isFinite(val)) assign(val);
+  editor.applySceneLights();
 }
 
 function setAntialiasRatio(value: number) {

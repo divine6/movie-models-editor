@@ -13,3 +13,14 @@ stats.html
 *.njsproj
 *.sln
 *.sw?
+backups/
+playwright-report/
+test-results/
+k8s/kubectl.exe
+k8s/*.kubeconfig
+k8s/*.key
+k8s/_*.crt
+k8s/kubeconfig.*
+TEST_REPORT.md
+Test.md
+public/__qa_*.js

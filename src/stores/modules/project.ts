@@ -1,9 +1,9 @@
 import { defineStore } from "pinia";
 
-import type { Model, Project, ProjectDetail } from "@/interface/project";
+import type { Model, Project, ProjectDetail, SceneNode } from "@/interface/project";
+import { getSuspendedPersistSnapshot, isProjectPersistSuspended } from "@/utils/projectPersist";
 
 import piniaPersistConfig from "../helper/persist";
-import { getSuspendedPersistSnapshot, isProjectPersistSuspended } from "@/utils/projectPersist";
 
 function sanitizeModelForPersist(model: Model): Model {
   const { file: _file, glbData: _glbData, url, ...rest } = model;
@@ -13,22 +13,61 @@ function sanitizeModelForPersist(model: Model): Model {
   };
 }
 
+function sanitizeNodeForPersist(node: SceneNode): SceneNode {
+  if (node.type !== "video" || !node.videoSrc?.startsWith("blob:")) return node;
+  return {
+    ...node,
+    videoSrc: null
+  };
+}
+
 function sanitizeProjectDetail(project: ProjectDetail | null): ProjectDetail | null {
   if (!project) return null;
   return {
     ...project,
-    models: project.models.map(sanitizeModelForPersist)
+    nodes: (project.nodes || []).map(sanitizeNodeForPersist),
+    models: (project.models || []).map(sanitizeModelForPersist)
   };
 }
 
-function sanitizeProjectState(state: {
-  currentProject: ProjectDetail | null;
-  projects: Project[];
-  projectIdCounter: number;
-}) {
+interface PersistedProjectState {
+  currentProject?: ProjectDetail | null;
+  currentProjectId?: string | null;
+  projects?: Project[];
+  projectIdCounter?: number;
+}
+
+function sanitizeProjectList(projects: Project[], currentProject: ProjectDetail | null): Project[] {
+  const deduplicated = new Map<string, Project>();
+  for (const project of projects) {
+    const detail = project as ProjectDetail;
+    deduplicated.set(project.id, Array.isArray(detail.models) ? sanitizeProjectDetail(detail)! : project);
+  }
+  if (currentProject) deduplicated.set(currentProject.id, sanitizeProjectDetail(currentProject)!);
+  return [...deduplicated.values()];
+}
+
+function sanitizeProjectState(state: ProjectState) {
+  const currentProject = sanitizeProjectDetail(state.currentProject);
   return {
-    ...state,
-    currentProject: sanitizeProjectDetail(state.currentProject)
+    currentProjectId: currentProject?.id ?? null,
+    projects: sanitizeProjectList(state.projects, currentProject),
+    projectIdCounter: state.projectIdCounter
+  };
+}
+
+function deserializeProjectState(value: string): ProjectState {
+  const persisted = JSON.parse(value) as PersistedProjectState;
+  const legacyCurrentProject = sanitizeProjectDetail(persisted.currentProject ?? null);
+  const projects = sanitizeProjectList(persisted.projects ?? [], legacyCurrentProject);
+  const currentProjectId = persisted.currentProjectId ?? legacyCurrentProject?.id ?? null;
+  const currentProject = currentProjectId
+    ? ((projects.find(project => project.id === currentProjectId) as ProjectDetail | undefined) ?? legacyCurrentProject)
+    : null;
+  return {
+    currentProject,
+    projects,
+    projectIdCounter: persisted.projectIdCounter ?? 0
   };
 }
 
@@ -36,6 +75,37 @@ interface ProjectState {
   currentProject: ProjectDetail | null;
   projects: Project[];
   projectIdCounter: number;
+}
+
+let lastProjectPersistSnapshot: string | null = null;
+let lastProjectSerializeAt = 0;
+let queuedProjectPersistState: ProjectState | null = null;
+let projectSerializeTimer: ReturnType<typeof setTimeout> | null = null;
+const PROJECT_SERIALIZE_MIN_MS = 2500;
+
+function stringifyProjectState(state: ProjectState) {
+  lastProjectPersistSnapshot = JSON.stringify(sanitizeProjectState(state));
+  lastProjectSerializeAt = Date.now();
+  return lastProjectPersistSnapshot;
+}
+
+function flushQueuedProjectPersist() {
+  if (projectSerializeTimer) {
+    clearTimeout(projectSerializeTimer);
+    projectSerializeTimer = null;
+  }
+  if (!queuedProjectPersistState || isProjectPersistSuspended()) return;
+  const snap = stringifyProjectState(queuedProjectPersistState);
+  queuedProjectPersistState = null;
+  try {
+    localStorage.setItem("movie-model-editor-project", snap);
+  } catch {
+    /* quota / private mode */
+  }
+}
+
+if (typeof window !== "undefined") {
+  window.addEventListener("pagehide", flushQueuedProjectPersist);
 }
 
 export const useProjectStore = defineStore("project", {
@@ -144,34 +214,46 @@ export const useProjectStore = defineStore("project", {
 
     /** 清除无效的视频数据（刷新页面后 blob URL 失效） */
     clearInvalidVideoData() {
-      if (this.currentProject?.videoSrc) {
-        // blob URL 和 data URL 刷新后仍然有效，但 blob URL 需要检查
-        const src = this.currentProject.videoSrc;
-        // 如果是 blob URL，刷新后一定失效
-        if (src.startsWith("blob:")) {
-          this.currentProject.videoSrc = null;
-          this.currentProject.videoDuration = 0;
-          this.currentProject.videoWidth = 0;
-          this.currentProject.videoHeight = 0;
-          this.currentProject.videoDisplayWidth = 0;
-          this.currentProject.nodes = [];
-          this.currentProject.models = [];
-          this.currentProject.subtitles = [];
-        }
-        // http/https URL 可能仍然有效，但需要验证
-        // 这里暂时保留，让组件层面去验证
-      }
+      if (!this.currentProject?.videoSrc?.startsWith("blob:")) return;
+      // v2 的视频、模型和字幕均由场景节点持有；废弃的项目级 blob 失效时只清理兼容字段。
+      this.currentProject.videoSrc = null;
+      this.currentProject.videoDuration = 0;
+      this.currentProject.videoWidth = 0;
+      this.currentProject.videoHeight = 0;
+      this.currentProject.videoDisplayWidth = 0;
     }
   },
 
   persist: {
-    ...piniaPersistConfig("movie-model-editor-project", ["currentProject", "projects", "projectIdCounter"]),
+    ...piniaPersistConfig("movie-model-editor-project", ["currentProject", "projects", "projectIdCounter"], {
+      defer: true
+    }),
     serializer: {
       serialize: value => {
-        if (isProjectPersistSuspended()) return getSuspendedPersistSnapshot();
-        return JSON.stringify(sanitizeProjectState(value as Parameters<typeof sanitizeProjectState>[0]));
+        if (isProjectPersistSuspended()) {
+          return lastProjectPersistSnapshot ?? getSuspendedPersistSnapshot();
+        }
+        const state = value as ProjectState;
+        const now = Date.now();
+        // 选中含大量 clips 的动画后，任何字段写入都会 JSON.stringify 整项目；
+        // 转镜头每帧写 camera 时会把主线程打满。限频序列化，交互才转得动。
+        if (lastProjectPersistSnapshot && now - lastProjectSerializeAt < PROJECT_SERIALIZE_MIN_MS) {
+          queuedProjectPersistState = state;
+          if (!projectSerializeTimer) {
+            const wait = PROJECT_SERIALIZE_MIN_MS - (now - lastProjectSerializeAt);
+            projectSerializeTimer = setTimeout(() => {
+              projectSerializeTimer = null;
+              flushQueuedProjectPersist();
+            }, Math.max(250, wait));
+          }
+          return lastProjectPersistSnapshot;
+        }
+        return stringifyProjectState(state);
       },
-      deserialize: value => JSON.parse(value)
+      deserialize: value => {
+        lastProjectPersistSnapshot = value;
+        return deserializeProjectState(value);
+      }
     }
   }
 });

@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 # 构建上下文需为 saas3.0 目录（包含 movie-models-editor 与 movie-models-server）
-# 示例: docker build -f movie-models-editor/docker/Dockerfile --secret id=npmrc,src=$HOME/.npmrc -t movie-models:latest .
+# 示例: docker build -f movie-models-editor/docker/Dockerfile --secret id=npmrc,src=$HOME/.npmrc -t movie-editor-v2:latest .
 
 # ---------- 1. 构建前端 SPA ----------
 FROM node:20-alpine AS frontend-build
@@ -16,9 +16,9 @@ RUN --mount=type=secret,id=npmrc,target=/root/.npmrc \
 COPY movie-models-editor/ .
 
 ARG VITE_API_URL=https://ext.highlands.ltd/light-sass-api/
-ARG VITE_PUBLIC_PATH=/movie-editor/
-ARG VITE_EDITOR_SERVER_URL=/movie-editor
-ARG VITE_EDITOR_FRONTEND_URL=/movie-editor
+ARG VITE_PUBLIC_PATH=/movie-editor-v2/
+ARG VITE_EDITOR_SERVER_URL=/movie-editor-v2
+ARG VITE_EDITOR_FRONTEND_URL=/movie-editor-v2
 ENV VITE_API_URL=${VITE_API_URL} \
     VITE_PUBLIC_PATH=${VITE_PUBLIC_PATH} \
     VITE_EDITOR_SERVER_URL=${VITE_EDITOR_SERVER_URL} \

@@ -138,7 +138,7 @@ import { CirclePlus, Delete, Plus, Upload, VideoPause, VideoPlay } from "@elemen
 import { computed } from "vue";
 
 import { useMovieEditorContext } from "@/composables/useMovieEditorContext";
-import type { SceneAnimationNode, SceneNode } from "@/interface/project";
+import type { SceneAnimationNode, SceneNode, SceneVideoNode } from "@/interface/project";
 
 const props = defineProps<{
   node: SceneNode;
@@ -204,13 +204,19 @@ const rowClasses = computed(() => {
   void editor.presentationUiRevision;
   void editor.presentationPlaybackSession?.navChapterId;
   void editor.presentationPlaybackSession?.requestId;
+  void editor.presentationPlaybackSession?.phase;
   void editor.currentTime;
   void editor.selectedNodeId;
+  void editor.selectedChapterId;
   void editor.activeVideoId;
   void editor.isPlaying;
+  void editor.totalPlaying;
+  void editor.clipPlayElapsed;
+  const active = editor.isSceneNodeSelected(props.node);
   return {
-    active: editor.isSceneNodeSelected(props.node),
-    playing: isAnimPlaying.value,
+    // 高亮只跟当前播放/选中章，禁止 selected||playing 叠出两条绿
+    active,
+    playing: false,
     "is-group": props.node.type === "group",
     "is-video": props.node.type === "video",
     "is-animation": props.node.type === "animation",
@@ -234,7 +240,11 @@ function onRowClick() {
       // Presentation/preview: only emit play → jumpToChapter. Do not highlight first
       // (that used to rewrite UI/session from the current clock before seek).
       emit("play", props.node);
-    } else if (props.node.type === "video" || props.node.type === "group") {
+    } else if (props.node.type === "video") {
+      // 预览/展示：点视频节点也要加载对应视频
+      editor.activatePresentationVideoNode(props.node as SceneVideoNode);
+      toggleExpand();
+    } else if (props.node.type === "group") {
       toggleExpand();
     }
     return;

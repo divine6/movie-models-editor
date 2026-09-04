@@ -8,7 +8,7 @@ set -euo pipefail
 
 TAG="${TAG:-movie-models:latest}"
 VITE_API_URL="${VITE_API_URL:-https://ext.highlands.ltd/light-sass-api/}"
-CONTEXT_PATH="${CONTEXT_PATH:-/movie-editor}"
+CONTEXT_PATH="${CONTEXT_PATH:-/movie-editor-v2}"
 NO_CACHE="${NO_CACHE:-}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -37,6 +37,11 @@ echo "==> Image tag:     ${TAG}"
 echo "==> VITE_API_URL: ${VITE_API_URL}"
 echo "==> Context path: ${CONTEXT_PATH}"
 echo "==> npmrc:        ${NPMRC}"
+
+if [[ "${TAG}" == *"/movie-editor/movie-editor:"* ]]; then
+  echo "Refusing production image tag: ${TAG}. Use movie-editor-v2." >&2
+  exit 1
+fi
 
 cp "${DOCKERIGNORE_SRC}" "${DOCKERIGNORE_DST}"
 trap 'rm -f "${DOCKERIGNORE_DST}"' EXIT

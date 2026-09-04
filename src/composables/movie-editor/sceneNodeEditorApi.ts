@@ -43,11 +43,17 @@ type Deps = {
   applyChapter: (ch: SceneAnimationNode) => void;
   applyVideoNodePlayback: (video: SceneVideoNode) => void;
   syncVideoElementSrc: (src?: string) => void;
+  /** 打开视频窗并绑定片源（同源复用，不阻塞点击） */
+  ensureVideoBound?: (video: SceneVideoNode) => void;
   resetAllModelsToDefault: () => void;
   onClearAnimationSelection: () => void;
+  onBeforeDeleteNodes?: (nodeIds: Set<string>) => void;
   hideVideoPip?: () => void;
   videoOnlyMode: Ref<boolean>;
   chapterFormRevision: Ref<number>;
+  viewOnly?: Ref<boolean>;
+  isPreviewMode?: Ref<boolean>;
+  getActiveChapterIdForUi?: () => string | null;
 };
 
 export function createSceneNodeEditorApi(deps: Deps) {
@@ -56,7 +62,12 @@ export function createSceneNodeEditorApi(deps: Deps) {
   function ensureNodes() {
     if (!deps.currProj.value) return [];
     ensureProjectNodes(deps.currProj.value);
+    nStore.syncCounterFromNodes(deps.currProj.value.nodes);
     return deps.currProj.value.nodes;
+  }
+
+  function existingNodeIds() {
+    return new Set(deps.nodes.value.map(n => n.id));
   }
 
   function getSceneNodeChildren(nodeId: string) {
@@ -151,6 +162,13 @@ export function createSceneNodeEditorApi(deps: Deps) {
   }
 
   function isSceneNodeSelected(node: SceneNode) {
+    if (
+      (deps.viewOnly?.value || deps.isPreviewMode?.value) &&
+      typeof deps.getActiveChapterIdForUi === "function"
+    ) {
+      const id = deps.getActiveChapterIdForUi();
+      if (id) return node.id === id;
+    }
     return deps.selectedNodeId.value === node.id;
   }
 
@@ -171,25 +189,43 @@ export function createSceneNodeEditorApi(deps: Deps) {
     }
   }
 
+  /**
+   * 选中视频或其下动画时：打开视频窗并绑定对应片源。
+   * 同源复用不会 load()；换源才真正加载。
+   */
+  function ensureVideoBoundForSelection(videoId: string | null | undefined) {
+    if (!videoId) return;
+    const video = getNodeById(deps.nodes.value, videoId);
+    if (!video || !isVideoNode(video)) return;
+    if (!video.videoSrc) {
+      toastShow("该视频节点尚未上传视频文件", "warning");
+      return;
+    }
+    setActiveVideo(videoId, { syncElement: false });
+    deps.ensureVideoBound?.(video);
+  }
+
   function selectSceneNode(node: SceneNode) {
+    const alreadySelected = deps.selectedNodeId.value === node.id;
     deps.selectedNodeId.value = node.id;
     expandAncestors(node.id);
 
     if (isAnimationNode(node)) {
-      // 章节 id 由 applyChapter → navigateToChapter 设置，避免提前改 id 导致上一章 live 段落错落到新章
       deps.videoOnlyMode.value = false;
-      if (node.parentId) setActiveVideo(node.parentId, { syncElement: true });
+      // 暂停时即使已选中也要落到该段最后一帧；播放中点同一条则从起点续播
       deps.applyChapter(node);
       return;
     }
 
     deps.selectedChapterId.value = null;
     deps.onClearAnimationSelection();
-    deps.resetAllModelsToDefault();
+    const sameVideo = isVideoNode(node) && deps.activeVideoId.value === node.id;
+    if (!sameVideo) deps.resetAllModelsToDefault();
 
     if (isVideoNode(node)) {
       deps.videoOnlyMode.value = true;
-      setActiveVideo(node.id, { syncElement: false });
+      ensureVideoBoundForSelection(node.id);
+      if (alreadySelected && sameVideo) return;
       deps.applyVideoNodePlayback(node);
       return;
     }
@@ -205,7 +241,7 @@ export function createSceneNodeEditorApi(deps: Deps) {
     ensureNodes();
     const sortOrder = nextSortOrder(proj.nodes, parentId);
     const count = getChildNodes(proj.nodes, parentId).filter(isGroupNode).length + 1;
-    const group = nStore.createGroup(proj.id, `分组 ${count}`, parentId, sortOrder);
+    const group = nStore.createGroup(proj.id, `分组 ${count}`, parentId, sortOrder, existingNodeIds());
     proj.nodes.push(group);
     if (parentId) expandAncestors(parentId);
     addExpandedNode(group.id);
@@ -219,7 +255,7 @@ export function createSceneNodeEditorApi(deps: Deps) {
     ensureNodes();
     const sortOrder = nextSortOrder(proj.nodes, parentId);
     const count = getChildNodes(proj.nodes, parentId).filter(isVideoNode).length + 1;
-    const video = nStore.createVideo(proj.id, `视频 ${count}`, parentId, sortOrder);
+    const video = nStore.createVideo(proj.id, `视频 ${count}`, parentId, sortOrder, existingNodeIds());
     proj.nodes.push(video);
     if (parentId) expandAncestors(parentId);
     addExpandedNode(video.id);
@@ -255,7 +291,8 @@ export function createSceneNodeEditorApi(deps: Deps) {
       videoId,
       nextRange.startTime,
       nextRange.endTime,
-      nextSortOrder(proj.nodes, videoId)
+      nextSortOrder(proj.nodes, videoId),
+      existingNodeIds()
     );
     deps.ensureChapterModelConfigsMap(anim);
     proj.nodes.push(anim);
@@ -273,6 +310,7 @@ export function createSceneNodeEditorApi(deps: Deps) {
         const proj = deps.currProj.value;
         if (!proj) return;
         const deleteIds = new Set([node.id, ...getDescendantNodeIds(proj.nodes, node.id)]);
+        deps.onBeforeDeleteNodes?.(deleteIds);
         proj.nodes = proj.nodes.filter(n => !deleteIds.has(n.id));
         proj.subtitles = proj.subtitles.filter(s => !deleteIds.has(s.parentNodeId));
 

@@ -6,12 +6,17 @@
 param(
     [string]$Tag = "movie-models:latest",
     [string]$ApiUrl = "https://ext.highlands.ltd/light-sass-api/",
-    [string]$ContextPath = "/movie-editor",
+    [string]$ContextPath = "/movie-editor-v2",
+    [string]$ViteMode = "docker.v2",
     [switch]$NoCache,
     [switch]$LocalFrontend
 )
 
 $ErrorActionPreference = "Stop"
+
+if ($Tag -match '/movie-editor/movie-editor:') {
+    throw "Refusing production image tag: $Tag. Use movie-editor-v2."
+}
 
 $EditorRoot = Split-Path $PSScriptRoot -Parent
 $ContextRoot = (Resolve-Path (Join-Path $EditorRoot "..")).Path
@@ -38,6 +43,7 @@ Write-Host "==> Dockerfile:   $Dockerfile"
 Write-Host "==> Image tag:    $Tag"
 Write-Host "==> VITE_API_URL: $ApiUrl"
 Write-Host "==> Context path: $ContextPath"
+Write-Host "==> Vite mode:    $ViteMode"
 if (-not $LocalFrontend) {
     Write-Host "==> npmrc:        $Npmrc"
 } else {
@@ -47,10 +53,10 @@ if (-not $LocalFrontend) {
 Copy-Item $DockerignoreSrc $DockerignoreDst -Force
 
 if ($LocalFrontend) {
-    Write-Host "==> Local frontend build (docker.tenant)..."
+    Write-Host "==> Local frontend build ($ViteMode)..."
     Push-Location $EditorRoot
     try {
-        pnpm run build:docker
+        pnpm exec vite build --mode $ViteMode
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     } finally {
         Pop-Location

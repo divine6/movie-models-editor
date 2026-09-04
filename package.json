@@ -21,7 +21,7 @@
     "build:tenant:dev": "vue-tsc && vite build --mode development.tenant",
     "build:tenant:test": "vue-tsc && vite build --mode test.tenant",
     "build:tenant:prod": "vue-tsc && vite build --mode production.tenant",
-    "build:docker": "vite build --mode docker.tenant",
+    "build:docker": "vite build --mode docker.v2",
     "build:owner:dev": "vue-tsc && vite build --mode development.owner",
     "build:owner:test": "vue-tsc && vite build --mode test.owner",
     "build:owner:prod": "vue-tsc && vite build --mode production.owner",
